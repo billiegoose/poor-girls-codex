@@ -1,64 +1,54 @@
-# Poor Girl's Codex
-
-Poor Girl's Codex is a tiny, deliberately transparent coding-agent harness for the ChatGPT desktop app on macOS.
-
 ![Poor Girl's Codex running in a terminal](screenshot.png)
 
-It started as a joke and a workaround: if a coding model in an ordinary ChatGPT conversation can *describe* a tool call, why should it need a special agent product to actually execute one?
+# Poor Girl's Codex
 
-The first version was almost comically simple. ChatGPT emitted JSON, the user copied it, and a local program named `toolcall` executed the request:
+Poor Girl's Codex is a tiny, semi-ridiculous coding-agent harness for the ChatGPT desktop app on macOS.
+
+It started as a workaround; I'd run out of Codex credits, and needed to keep working. Originally, I switched to Chat mode and said: "You do the thinking and coding, and I will be your "tool call" executor by manually executing code snippets in a terminal and pasting the results".
 
 ```mermaid
 sequenceDiagram
     participant C as ChatGPT
-    participant U as User / Clipboard
-    participant T as toolcall
+    participant U as Human / Clipboard
+    participant T as Terminal
 
-    C->>U: JSON tool request
-    U->>T: pbpaste
-    T->>T: Validate & execute tool
-    T->>U: JSON result via pbcopy
-    U->>C: Paste result
+    C->>U: Copy bash code block
+    U->>T: Paste commands
+    T->>U: Copy results
+    U->>C: Paste results
 ```
 
-The command at the center of that loop was:
+But I quickly realized this was going to be exhausting. I would have to be selecting enormous amounts of text. And ChatGPT would have to edit large code bases via `sed` and `awk`, which is awkward (pun intended).
 
-```sh
-pbpaste | toolcall | pbcopy
+So instead, we made a small Python program called `toolcall` that implemented a handful of standard harness tools (`read`, `write`, `edit`, `run`). By combining that with the existing commands `pbcopy` to read from the Clipboard and `pbpaste` write to to the Clipboard, we were able to build a less tedious, more robust loop:
+
+```mermaid
+sequenceDiagram
+    participant C as ChatGPT
+    participant U as Human / Clipboard
+    participant T as Terminal
+
+    C->>U: Copy JSON code block
+    U->>T: run `pbpaste | toolcall.py | pbcopy`
+    T->>U:
+    U->>C: Paste results
 ```
 
-The user was the transport layer.
+That worked surprisingly well. More importantly, it made the mechanics of an AI coding agent impossible to miss: the model writes structured data, ordinary software validates and executes it, the result is appended to the chat, and the model gets another turn.
 
-That worked surprisingly well. More importantly, it made the mechanics of an AI coding agent impossible to miss: the model writes structured data, ordinary software validates and executes it, the result is serialized, and the model gets another turn.
+From there, it was pretty easy to remove the human-in-the-loop. By using accessibility APIs to watch and operate the ChatGPT app in the background, we're able to react to tool calls without hijacking the mouse, keyboard, or clipboard.
 
-From there, Poor Girl's Codex gradually removed the human copy/paste steps until the same basic protocol could run continuously in the background.
+```mermaid
+sequenceDiagram
+    participant C as ChatGPT
+    participant U as poor_girls_codex.py
 
-## The evolution
-
-The Git history intentionally preserves the project in stages.
-
-1. **`Initial commit`** — an empty root commit.
-2. **`Add clipboard toolcall harness`** — the original standalone `~/bin/toolcall`, unchanged.
-3. **`Add autonomous ChatGPT desktop harness`** — the current Accessibility-driven system.
-4. **This README** — documentation of how and why the experiment evolved.
-
-The standalone `toolcall` program became `toolcall_lib.py`, while `toolcall` itself became a thin command-line wrapper around the same implementation. This means the original clipboard workflow and the autonomous workflow share the exact same tool execution code.
-
-The autonomous layer then grew experimentally around the macOS Accessibility APIs exposed by PyObjC.
-
-Early experiments inspected the ChatGPT desktop application's Accessibility tree and discovered that Chromium exposes enough structure to identify:
-
-- the message composer,
-- the Send button,
-- user and assistant message boundaries,
-- assistant code blocks,
-- and the text nodes inside syntax-highlighted code.
-
-That led to the current design: instead of clicking Copy buttons or reading the clipboard, Poor Girl's Codex walks the Accessibility tree directly, reconstructs candidate JSON from `AXStaticText` nodes, validates it as a supported tool request, executes it locally, and writes the result back into the ChatGPT composer.
-
-Submission is also kept scoped to ChatGPT. The harness focuses the composer through Accessibility and posts a Return event directly to the ChatGPT process rather than globally stealing the user's mouse or keyboard.
-
-The clipboard remains involved only once at startup, as a convenience: the bootstrap prompt is copied so the user can paste it into an ordinary ChatGPT conversation. Normal tool execution after that does not depend on the clipboard.
+    U-->>C: Poll ChatGPT app
+    C->>U: Detected toolcall code block
+    U->>U: 
+    Note right of U: Execute commands
+    U->>C: Inserts results and Send
+```
 
 ## What it does
 
@@ -89,17 +79,17 @@ without a purpose-built agent runtime.
 
 The harness currently exposes these tools:
 
-| Tool | Purpose |
-| --- | --- |
-| `read` | Read UTF-8 files with line ranges and SHA-256 metadata |
-| `find` | Search files with ripgrep |
-| `tree` | Inspect directory structure |
-| `status` | Read Git status |
-| `diff` | Read Git diffs |
-| `edit` | Perform exact, optionally SHA-guarded textual edits |
-| `write` | Create or replace files |
-| `patch` | Apply unified diffs with `git apply --check` first |
-| `run` | Execute commands or Bash scripts with captured output |
+| Tool     | Purpose                                                |
+| -------- | ------------------------------------------------------ |
+| `read`   | Read UTF-8 files with line ranges and SHA-256 metadata |
+| `find`   | Search files with ripgrep                              |
+| `tree`   | Inspect directory structure                            |
+| `status` | Read Git status                                        |
+| `diff`   | Read Git diffs                                         |
+| `edit`   | Perform exact, optionally SHA-guarded textual edits    |
+| `write`  | Create or replace files                                |
+| `patch`  | Apply unified diffs with `git apply --check` first     |
+| `run`    | Execute commands or Bash scripts with captured output  |
 
 Requests may be single calls, arrays of calls, or batches of the form:
 
