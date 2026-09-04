@@ -2,26 +2,23 @@
 
 Poor Girl's Codex is a tiny, deliberately transparent coding-agent harness for the ChatGPT desktop app on macOS.
 
+![Poor Girl's Codex running in a terminal](screenshot.png)
+
 It started as a joke and a workaround: if a coding model in an ordinary ChatGPT conversation can *describe* a tool call, why should it need a special agent product to actually execute one?
 
 The first version was almost comically simple. ChatGPT emitted JSON, the user copied it, and a local program named `toolcall` executed the request:
 
-```text
-ChatGPT
-   |
-   | JSON tool request
-   v
-clipboard
-   |
-   v
-toolcall
-   |
-   | JSON result
-   v
-clipboard
-   |
-   v
-ChatGPT
+```mermaid
+sequenceDiagram
+    participant C as ChatGPT
+    participant U as User / Clipboard
+    participant T as toolcall
+
+    C->>U: JSON tool request
+    U->>T: pbpaste
+    T->>T: Validate & execute tool
+    T->>U: JSON result via pbcopy
+    U->>C: Paste result
 ```
 
 The command at the center of that loop was:
