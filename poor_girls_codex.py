@@ -24,6 +24,7 @@ POLL_SECONDS = 0.5
 SETTLE_SECONDS = 0.35
 SEND_RETRY_INITIAL_SECONDS = 0.25
 SEND_RETRY_MAX_SECONDS = 8.0
+MESSAGE_TOO_LONG_TEXT = "The message you submitted was too long, please edit it and resubmit."
 SUPPORTED_TOOLS = {"read", "find", "tree", "status", "diff", "edit", "write", "patch", "run"}
 
 
@@ -101,6 +102,16 @@ def clipboard_write(text: str) -> None:
     # Clipboard use is intentionally limited to the startup convenience prompt.
     # Toolcall detection and extraction use Accessibility directly.
     subprocess.run(["pbcopy"], input=text, text=True, check=True)
+
+
+def ui_contains_text(root, needle: str) -> bool:
+    wanted = needle.casefold()
+    for node in walk(root):
+        for attr in ("AXValue", "AXTitle", "AXDescription", "AXHelp"):
+            value = probe.ax_attr(node, attr)
+            if value is not None and wanted in str(value).casefold():
+                return True
+    return False
 
 
 def static_text(element) -> str:
@@ -295,6 +306,33 @@ def fenced_result(result: Any) -> str:
     return "```json\n" + json.dumps(result, indent=2, ensure_ascii=False) + "\n```\n"
 
 
+def too_long_fallback(calls: list[Any], results: list[Any]) -> str:
+    summaries = []
+    summary_limit = 12
+
+    for index, call in enumerate(calls[:summary_limit]):
+        if isinstance(call, dict):
+            call_id = str(call.get("id", index))
+            tool = str(call.get("tool", "?"))
+        else:
+            call_id = str(index)
+            tool = "?"
+        item = results[index] if index < len(results) else None
+        status = "ok" if isinstance(item, dict) and item.get("ok") else "error"
+        summaries.append(f"- {call_id}: {tool} ({status})")
+
+    if len(calls) > summary_limit:
+        summaries.append(f"- ... and {len(calls) - summary_limit} more tool calls")
+
+    return (
+        "Poor Girl's Codex delivery error: the full tool results were too large for ChatGPT.\n"
+        "The tools already ran; do not repeat them merely because delivery failed.\n"
+        "Tools run:\n"
+        + "\n".join(summaries)
+        + "\nRetry with smaller chunks, such as narrower reads/finds or lower max_bytes.\n"
+    )
+
+
 def set_composer_text(root, text: str):
     composers = find_elements(
         root,
@@ -425,6 +463,9 @@ def watch_loop() -> None:
     _, root = chatgpt_root()
     existing = latest_valid_request(root)
     last_fingerprint = existing[2] if existing else None
+    too_long_visible = ui_contains_text(root, MESSAGE_TOO_LONG_TEXT)
+    last_executed: tuple[str, list[Any], list[Any]] | None = None
+    handled_too_long_for: str | None = None
 
     while True:
         try:
@@ -432,6 +473,25 @@ def watch_loop() -> None:
             if dismiss_work_prompt(root):
                 time.sleep(0.2)
                 app, root = chatgpt_root()
+
+            # Treat ChatGPT's size error as an edge-triggered delivery failure.
+            # The tools have already run, so recover by sending only a compact
+            # summary and never by executing the request again.
+            current_too_long_visible = ui_contains_text(root, MESSAGE_TOO_LONG_TEXT)
+            if current_too_long_visible and not too_long_visible and last_executed is not None:
+                executed_fingerprint, executed_calls, executed_results = last_executed
+                if handled_too_long_for != executed_fingerprint:
+                    handled_too_long_for = executed_fingerprint
+                    fallback = too_long_fallback(executed_calls, executed_results)
+                    print(
+                        "  watcher warning: ChatGPT rejected tool results as too long; "
+                        "sending a compact summary",
+                        flush=True,
+                    )
+                    app, root = chatgpt_root()
+                    paste_result_into_composer(app, root, fallback, send=True)
+                    print(f"  {color('OK', '1;32')} sent compact retry request\n", flush=True)
+            too_long_visible = current_too_long_visible
 
             candidate = latest_valid_request(root)
             if candidate is None:
@@ -457,6 +517,10 @@ def watch_loop() -> None:
             last_fingerprint = fingerprint
             print(color("tool calls", "1;35") + ":", flush=True)
             result = execute_request(request, announce=True)
+            calls, _, single = request_calls(request)
+            results = [result] if single else list(result)
+            last_executed = (fingerprint, list(calls), results)
+            handled_too_long_for = None
             rendered = fenced_result(result)
             app, root = chatgpt_root()
             paste_result_into_composer(app, root, rendered, send=True)
