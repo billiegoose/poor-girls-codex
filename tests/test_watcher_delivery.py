@@ -45,6 +45,40 @@ class WatcherDeliveryTests(unittest.TestCase):
         self.assertIn("retrying in 0.25s", output)
         self.assertIn("retrying in 0.5s", output)
 
+    def test_pid_targeted_return_retries_with_exponential_backoff(self) -> None:
+        composer = object()
+        app = mock.Mock()
+        app.processIdentifier.return_value = 123
+        # Attempt 1 pre-check, attempt 2 pre-check, then the previous Return is
+        # observed to have finally cleared the composer before attempt 3.
+        values = iter(["payload", "payload", ""])
+        monotonic_values = iter([0.0, 2.1, 3.0, 5.1])
+
+        with (
+            mock.patch.object(pgc, "RETURN_RETRY_INITIAL_SECONDS", 0.25),
+            mock.patch.object(pgc, "RETURN_RETRY_MAX_SECONDS", 8.0),
+            mock.patch.object(pgc, "chatgpt_root", return_value=(app, "root")),
+            mock.patch.object(pgc, "find_elements", return_value=[composer]),
+            mock.patch.object(pgc.probe, "ax_attr", side_effect=lambda element, attr: next(values)),
+            mock.patch.object(pgc.AS, "AXUIElementSetAttributeValue", return_value=0),
+            mock.patch.object(pgc.Quartz, "CGEventCreateKeyboardEvent", return_value=object()),
+            mock.patch.object(pgc.Quartz, "CGEventPostToPid") as post,
+            mock.patch.object(pgc.time, "monotonic", side_effect=lambda: next(monotonic_values)),
+            mock.patch.object(pgc.time, "sleep") as sleep,
+            redirect_stdout(StringIO()) as stdout,
+        ):
+            pgc.submit_composer_to_pid(app, composer, "payload")
+
+        # Two Return keypresses, each consisting of key-down + key-up.
+        self.assertEqual(post.call_count, 4)
+        sleeps = [call.args[0] for call in sleep.call_args_list]
+        self.assertIn(0.25, sleeps)
+        self.assertIn(0.5, sleeps)
+        output = stdout.getvalue()
+        self.assertIn("PID-targeted Return", output)
+        self.assertIn("retrying in 0.25s", output)
+        self.assertIn("retrying in 0.5s", output)
+
     def test_send_button_backoff_caps_and_keeps_retrying(self) -> None:
         send_button = object()
         composer = object()

@@ -24,6 +24,8 @@ POLL_SECONDS = 0.5
 SETTLE_SECONDS = 0.35
 SEND_RETRY_INITIAL_SECONDS = 0.25
 SEND_RETRY_MAX_SECONDS = 8.0
+RETURN_RETRY_INITIAL_SECONDS = 0.25
+RETURN_RETRY_MAX_SECONDS = 8.0
 MESSAGE_TOO_LONG_TEXT = "The message you submitted was too long, please edit it and resubmit."
 SUPPORTED_TOOLS = {"read", "find", "tree", "status", "diff", "edit", "write", "patch", "run"}
 
@@ -353,33 +355,63 @@ def submit_composer_to_pid(app, composer, expected_text: str) -> None:
     # Keep input scoped to ChatGPT rather than the global HID stream. Setting
     # AXFocused on an inactive app does not activate it, and CGEventPostToPid
     # sends Return only to ChatGPT instead of hijacking the user's keyboard.
-    focus_error = AS.AXUIElementSetAttributeValue(composer, "AXFocused", True)
-    if focus_error != 0:
-        raise RuntimeError(f"focusing composer via AX failed with error {focus_error}")
-
     pid = int(app.processIdentifier())
-    down = Quartz.CGEventCreateKeyboardEvent(None, 36, True)
-    up = Quartz.CGEventCreateKeyboardEvent(None, 36, False)
-    Quartz.CGEventPostToPid(pid, down)
-    Quartz.CGEventPostToPid(pid, up)
+    attempt = 0
 
-    # Submission is asynchronous. Confirm that the payload left the composer
-    # rather than assuming the Return event was accepted.
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        _, root = chatgpt_root()
+    while True:
+        # Re-check before every retry. If the previous Return eventually took
+        # effect after our confirmation timeout, do not send another Return.
+        app, root = chatgpt_root()
         composers = find_elements(
             root,
             role="AXTextArea",
             description=COMPOSER_DESCRIPTION,
         )
-        if composers:
+        if not composers:
+            return
+
+        composer = composers[-1]
+        value = str(probe.ax_attr(composer, "AXValue") or "")
+        if expected_text.strip() not in value:
+            return
+
+        focus_error = AS.AXUIElementSetAttributeValue(composer, "AXFocused", True)
+        if focus_error != 0:
+            raise RuntimeError(f"focusing composer via AX failed with error {focus_error}")
+
+        down = Quartz.CGEventCreateKeyboardEvent(None, 36, True)
+        up = Quartz.CGEventCreateKeyboardEvent(None, 36, False)
+        Quartz.CGEventPostToPid(pid, down)
+        Quartz.CGEventPostToPid(pid, up)
+
+        # Submission is asynchronous. Confirm that the payload left the
+        # composer rather than assuming the Return event was accepted.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            _, root = chatgpt_root()
+            composers = find_elements(
+                root,
+                role="AXTextArea",
+                description=COMPOSER_DESCRIPTION,
+            )
+            if not composers:
+                return
             value = str(probe.ax_attr(composers[-1], "AXValue") or "")
             if expected_text.strip() not in value:
                 return
-        time.sleep(0.05)
+            time.sleep(0.05)
 
-    raise RuntimeError("ChatGPT did not submit the composer after PID-targeted Return")
+        delay = min(
+            RETURN_RETRY_INITIAL_SECONDS * (2**attempt),
+            RETURN_RETRY_MAX_SECONDS,
+        )
+        print(
+            "  watcher warning: ChatGPT did not submit the composer after PID-targeted Return; "
+            f"retrying in {delay:g}s",
+            flush=True,
+        )
+        time.sleep(delay)
+        attempt += 1
 
 
 def paste_result_into_composer(app, root, text: str, *, send: bool) -> None:
