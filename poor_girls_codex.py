@@ -220,11 +220,56 @@ def validate_request(request: Any) -> None:
             raise ValueError(f"call {index} has unsupported tool {tool!r}")
 
 
+def tool_call_line(call: Any, index: int, status: str | None = None) -> str:
+    if isinstance(call, dict):
+        tool_name = f"{str(call.get('tool', '?')):<8}"
+        call_id = str(call.get('id', index))
+    else:
+        tool_name = f"{'?':<8}"
+        call_id = str(index)
+
+    line = f"  {color('>', '1;35')} {color(tool_name, '1;36')} {color(call_id, '1')}"
+    if status is not None:
+        status_code = "1;32" if status == "done" else "1;33"
+        line += f" {color(f'[{status}]', status_code)}"
+    return line
+
+
+class ToolCallProgress:
+    def __init__(self, calls: list[Any]) -> None:
+        self.calls = calls
+        self.statuses: list[str | None] = [None] * len(calls)
+        self.rendered = False
+
+    def render(self) -> None:
+        lines = [tool_call_line(call, index, self.statuses[index]) for index, call in enumerate(self.calls)]
+        if self.rendered and sys.stdout.isatty() and lines:
+            sys.stdout.write(f"\033[{len(lines)}A")
+            for line in lines:
+                sys.stdout.write(f"\r\033[2K{line}\n")
+            sys.stdout.flush()
+            return
+
+        for line in lines:
+            print(line, flush=True)
+        self.rendered = True
+
+    def set_status(self, index: int, status: str) -> None:
+        self.statuses[index] = status
+        self.render()
+
+
 def execute_request(request: Any, *, announce: bool = False) -> Any:
     calls, stop_on_error, single = request_calls(request)
+    progress = ToolCallProgress(calls) if announce else None
+    if progress is not None:
+        progress.render()
 
     results = []
     for index, call in enumerate(calls):
+        if progress is not None:
+            progress.set_status(index, "running")
+
         if not isinstance(call, dict):
             result = {
                 "id": str(index),
@@ -233,12 +278,11 @@ def execute_request(request: Any, *, announce: bool = False) -> Any:
                 "error": "call must be an object",
             }
         else:
-            if announce:
-                tool_name = f"{str(call.get('tool', '?')):<8}"
-                call_id = str(call.get('id', index))
-                print(f"  {color('>', '1;35')} {color(tool_name, '1;36')} {color(call_id, '1')}", flush=True)
             result = toolcall_lib.execute(call, index)
+
         results.append(result)
+        if progress is not None:
+            progress.set_status(index, "done")
         if stop_on_error and not result["ok"]:
             break
 
