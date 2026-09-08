@@ -51,7 +51,7 @@ Available tools:
 - patch {patch,cwd?}
 - run {command|script,cwd?,timeout?,env?,max_bytes?}
 
-A single call may be a JSON object. Multiple calls should use {"calls":[...]} and may include "stop_on_error": true. Every call should have a short descriptive "id".
+A single call may be a JSON object. Multiple calls should use {"calls":[...]}. Every call should have a short descriptive "id". To stop later calls when one fails, put "stop_on_error": true on that individual call. Top-level "stop_on_error" is deprecated.
 
 Do not ask me to manually run commands, inspect files, or paste tool results when the harness can do it. Continue using tool calls until the task is complete, then answer normally.'''
 
@@ -203,11 +203,15 @@ def unwrap_json(text: str) -> Any:
 
 
 def request_calls(request: Any):
-    stop_on_error = False
+    top_level_stop_on_error = False
+    top_level_stop_present = False
 
     if isinstance(request, dict) and "calls" in request:
         calls = request["calls"]
-        stop_on_error = bool(request.get("stop_on_error", False))
+        top_level_stop_present = "stop_on_error" in request
+        if top_level_stop_present and not isinstance(request["stop_on_error"], bool):
+            raise ValueError("top-level stop_on_error must be a boolean")
+        top_level_stop_on_error = request.get("stop_on_error", False)
         single = False
     elif isinstance(request, list):
         calls = request
@@ -220,11 +224,11 @@ def request_calls(request: Any):
 
     if not isinstance(calls, list):
         raise ValueError('"calls" must be an array')
-    return calls, stop_on_error, single
+    return calls, top_level_stop_on_error, single, top_level_stop_present
 
 
 def validate_request(request: Any) -> None:
-    calls, _, _ = request_calls(request)
+    calls, _, _, _ = request_calls(request)
     if not calls:
         raise ValueError("toolcall request contains no calls")
     for index, call in enumerate(calls):
@@ -233,6 +237,8 @@ def validate_request(request: Any) -> None:
         tool = call.get("tool")
         if tool not in SUPPORTED_TOOLS:
             raise ValueError(f"call {index} has unsupported tool {tool!r}")
+        if "stop_on_error" in call and not isinstance(call["stop_on_error"], bool):
+            raise ValueError(f"call {index} stop_on_error must be a boolean")
 
 
 def tool_call_line(call: Any, index: int, status: str | None = None) -> str:
@@ -274,14 +280,45 @@ class ToolCallProgress:
         self.render()
 
 
+def skipped_result(call: Any, index: int) -> dict[str, Any]:
+    if isinstance(call, dict):
+        call_id = str(call.get("id", index))
+        tool = call.get("tool")
+    else:
+        call_id = str(index)
+        tool = None
+    return {
+        "id": call_id,
+        "tool": tool,
+        "ok": False,
+        "skipped": True,
+        "error": "skipped because an earlier call failed with stop_on_error enabled",
+    }
+
+
 def execute_request(request: Any, *, announce: bool = False) -> Any:
-    calls, stop_on_error, single = request_calls(request)
+    calls, top_level_stop_on_error, single, top_level_stop_present = request_calls(request)
+    if top_level_stop_present:
+        print(
+            "  deprecation warning: top-level stop_on_error is deprecated; "
+            "put stop_on_error on the individual call instead",
+            flush=True,
+        )
+
     progress = ToolCallProgress(calls) if announce else None
     if progress is not None:
         progress.render()
 
     results = []
+    stopped = False
     for index, call in enumerate(calls):
+        if stopped:
+            result = skipped_result(call, index)
+            results.append(result)
+            if progress is not None:
+                progress.set_status(index, "skipped")
+            continue
+
         if progress is not None:
             progress.set_status(index, "running")
 
@@ -292,14 +329,18 @@ def execute_request(request: Any, *, announce: bool = False) -> Any:
                 "ok": False,
                 "error": "call must be an object",
             }
+            call_stop_on_error = False
         else:
-            result = toolcall_lib.execute(call, index)
+            call_stop_on_error = bool(call.get("stop_on_error", False))
+            tool_input = dict(call)
+            tool_input.pop("stop_on_error", None)
+            result = toolcall_lib.execute(tool_input, index)
 
         results.append(result)
         if progress is not None:
             progress.set_status(index, "done")
-        if stop_on_error and not result["ok"]:
-            break
+        if not result["ok"] and (call_stop_on_error or top_level_stop_on_error):
+            stopped = True
 
     return results[0] if single else results
 
@@ -549,7 +590,7 @@ def watch_loop() -> None:
             last_fingerprint = fingerprint
             print(color("tool calls", "1;35") + ":", flush=True)
             result = execute_request(request, announce=True)
-            calls, _, single = request_calls(request)
+            calls, _, single, _ = request_calls(request)
             results = [result] if single else list(result)
             last_executed = (fingerprint, list(calls), results)
             handled_too_long_for = None
