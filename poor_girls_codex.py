@@ -22,6 +22,8 @@ COMPOSER_DESCRIPTION = "Message ChatGPT"
 SEND_DESCRIPTION = "Send"
 POLL_SECONDS = 0.5
 SETTLE_SECONDS = 0.35
+SEND_RETRY_INITIAL_SECONDS = 0.25
+SEND_RETRY_MAX_SECONDS = 8.0
 SUPPORTED_TOOLS = {"read", "find", "tree", "status", "diff", "edit", "write", "patch", "run"}
 
 
@@ -343,23 +345,41 @@ def submit_composer_to_pid(app, composer, expected_text: str) -> None:
 
 
 def paste_result_into_composer(app, root, text: str, *, send: bool) -> None:
-    composer = set_composer_text(root, text)
-    time.sleep(0.1)
-
     if not send:
+        set_composer_text(root, text)
         return
 
-    # Ensure React noticed the AXValue mutation before attempting submission.
-    app, root = chatgpt_root()
-    send_buttons = find_elements(root, role="AXButton", description=SEND_DESCRIPTION)
-    enabled = [b for b in send_buttons if probe.ax_attr(b, "AXEnabled") is not False]
-    if not enabled:
-        raise RuntimeError("enabled Send button not found after setting composer AXValue")
+    # AXValue reaches Chromium/React asynchronously. If the enabled Send button
+    # is not visible yet, the tool results have already been computed and must
+    # not be re-executed; retry only this UI-delivery step. Cap the exponential
+    # delay so a slow UI remains responsive while still backing off indefinitely.
+    attempt = 0
+    while True:
+        set_composer_text(root, text)
+        time.sleep(0.1)
 
-    composers = find_elements(root, role="AXTextArea", description=COMPOSER_DESCRIPTION)
-    if not composers:
-        raise RuntimeError("ChatGPT composer disappeared before submission")
-    submit_composer_to_pid(app, composers[-1], text)
+        app, root = chatgpt_root()
+        send_buttons = find_elements(root, role="AXButton", description=SEND_DESCRIPTION)
+        enabled = [b for b in send_buttons if probe.ax_attr(b, "AXEnabled") is not False]
+        if enabled:
+            composers = find_elements(root, role="AXTextArea", description=COMPOSER_DESCRIPTION)
+            if not composers:
+                raise RuntimeError("ChatGPT composer disappeared before submission")
+            submit_composer_to_pid(app, composers[-1], text)
+            return
+
+        delay = min(
+            SEND_RETRY_INITIAL_SECONDS * (2**attempt),
+            SEND_RETRY_MAX_SECONDS,
+        )
+        print(
+            "  watcher warning: enabled Send button not found after setting composer AXValue; "
+            f"retrying in {delay:g}s",
+            flush=True,
+        )
+        time.sleep(delay)
+        attempt += 1
+        app, root = chatgpt_root()
 
 
 def dismiss_work_prompt(root) -> bool:
@@ -431,12 +451,15 @@ def watch_loop() -> None:
             if settled is None or settled[2] != fingerprint:
                 continue
 
+            # Claim the request before running it. Tool calls may have side
+            # effects, so any later watcher/delivery error must never cause this
+            # same assistant request to execute a second time.
+            last_fingerprint = fingerprint
             print(color("tool calls", "1;35") + ":", flush=True)
             result = execute_request(request, announce=True)
             rendered = fenced_result(result)
             app, root = chatgpt_root()
             paste_result_into_composer(app, root, rendered, send=True)
-            last_fingerprint = fingerprint
             print(f"  {color('OK', '1;32')} sent results\n", flush=True)
         except KeyboardInterrupt:
             print("\nPoor Girl's Codex stopped.")
