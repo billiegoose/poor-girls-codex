@@ -12,6 +12,8 @@ import sys
 import termios
 import time
 import tty
+from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import Any
 
 import ApplicationServices as AS
@@ -32,6 +34,79 @@ RETURN_RETRY_INITIAL_SECONDS = 0.25
 RETURN_RETRY_MAX_SECONDS = 8.0
 MESSAGE_TOO_LONG_TEXT = "The message you submitted was too long, please edit it and resubmit."
 SUPPORTED_TOOLS = {"read", "find", "tree", "status", "diff", "edit", "write", "patch", "run"}
+
+
+class WatcherPhase(Enum):
+    SCANNING = auto()
+    EXECUTING = auto()
+    DELIVERING = auto()
+
+
+class DeliveryOutcome(Enum):
+    SENT = auto()
+    INTERRUPTED = auto()
+
+
+@dataclass
+class CompletedBatch:
+    fingerprint: str
+    calls: list[Any]
+    results: list[Any]
+    single: bool
+    compact: bool = False
+
+    def render(self) -> str:
+        if self.compact:
+            return too_long_fallback(self.calls, self.results)
+        payload = self.results[0] if self.single else self.results
+        return fenced_result(payload)
+
+
+@dataclass
+class WatcherState:
+    phase: WatcherPhase = WatcherPhase.SCANNING
+    seen_fingerprints: set[str] = field(default_factory=set)
+    pending_batches: list[CompletedBatch] = field(default_factory=list)
+    last_submitted_batches: list[CompletedBatch] = field(default_factory=list)
+
+    def record_completed(self, fingerprint: str, request: Any, result: Any) -> None:
+        calls, _, single, _ = request_calls(request)
+        results = [result] if single else list(result)
+        self.pending_batches.append(
+            CompletedBatch(
+                fingerprint=fingerprint,
+                calls=list(calls),
+                results=results,
+                single=single,
+            )
+        )
+
+    def has_pending_results(self) -> bool:
+        return bool(self.pending_batches)
+
+    def render_pending(self) -> str:
+        return "\n".join(batch.render().rstrip("\n") for batch in self.pending_batches) + "\n"
+
+    def mark_submitted(self) -> None:
+        self.last_submitted_batches = self.pending_batches
+        self.pending_batches = []
+
+    def acknowledge_last_submission(self) -> None:
+        self.last_submitted_batches = []
+
+    def restore_last_submission_compact(self) -> None:
+        if not self.last_submitted_batches:
+            return
+        restored = self.last_submitted_batches
+        self.last_submitted_batches = []
+        for batch in restored:
+            batch.compact = True
+        self.pending_batches = restored + self.pending_batches
+
+    def last_submission_key(self) -> str | None:
+        if not self.last_submitted_batches:
+            return None
+        return ":".join(batch.fingerprint for batch in self.last_submitted_batches)
 
 
 def color(text: str, code: str) -> str:
@@ -520,21 +595,48 @@ def submit_composer_to_pid(app, composer, expected_text: str) -> None:
         attempt += 1
 
 
-def paste_result_into_composer(app, root, text: str, *, send: bool) -> None:
+def paste_result_into_composer(
+    app,
+    root,
+    text: str,
+    *,
+    send: bool,
+    known_fingerprints: set[str] | None = None,
+) -> DeliveryOutcome:
     if not send:
         set_composer_text(root, text)
-        return
+        return DeliveryOutcome.SENT
 
-    # AXValue reaches Chromium/React asynchronously. If the enabled Send button
-    # is not visible yet, the tool results have already been computed and must
-    # not be re-executed; retry only this UI-delivery step. Cap the exponential
-    # delay so a slow UI remains responsive while still backing off indefinitely.
+    def interrupted(current_root) -> bool:
+        if known_fingerprints is None:
+            return False
+        candidate = latest_valid_request(current_root)
+        if candidate is None or candidate[2] in known_fingerprints:
+            return False
+        # The completed results remain durable in WatcherState. Clear only this
+        # obsolete composer snapshot; the watcher will execute the newly visible
+        # calls and rebuild a delivery containing every still-undelivered result.
+        try:
+            set_composer_text(current_root, "")
+        except RuntimeError:
+            pass
+        return True
+
+    # AXValue reaches Chromium/React asynchronously. Delivery retries are
+    # interruptible: while Send is unavailable, a newly visible tool call wins
+    # control immediately, but the completed results themselves are retained.
     attempt = 0
     while True:
+        if interrupted(root):
+            return DeliveryOutcome.INTERRUPTED
+
         set_composer_text(root, text)
         time.sleep(0.1)
 
         app, root = chatgpt_root()
+        if interrupted(root):
+            return DeliveryOutcome.INTERRUPTED
+
         send_buttons = find_elements(root, role="AXButton", description=SEND_DESCRIPTION)
         enabled = [b for b in send_buttons if probe.ax_attr(b, "AXEnabled") is not False]
         if enabled:
@@ -542,7 +644,7 @@ def paste_result_into_composer(app, root, text: str, *, send: bool) -> None:
             if not composers:
                 raise RuntimeError("ChatGPT composer disappeared before submission")
             submit_composer_to_pid(app, composers[-1], text)
-            return
+            return DeliveryOutcome.SENT
 
         delay = min(
             SEND_RETRY_INITIAL_SECONDS * (2**attempt),
@@ -553,7 +655,19 @@ def paste_result_into_composer(app, root, text: str, *, send: bool) -> None:
             f"retrying in {delay:g}s",
             flush=True,
         )
-        time.sleep(delay)
+
+        if known_fingerprints is None:
+            time.sleep(delay)
+        else:
+            remaining = delay
+            while remaining > 0:
+                step = min(0.1, remaining)
+                time.sleep(step)
+                remaining -= step
+                app, root = chatgpt_root()
+                if interrupted(root):
+                    return DeliveryOutcome.INTERRUPTED
+
         attempt += 1
         app, root = chatgpt_root()
 
@@ -597,12 +711,17 @@ def watch_loop() -> None:
 
     clipboard_write(BOOTSTRAP_PROMPT)
 
-    # Ignore any valid harness call already visible when the watcher starts.
+    state = WatcherState()
+
+    # Preserve the current startup behavior for now: a request already visible
+    # when PGC launches is considered pre-existing. A later recovery slice can
+    # reconstruct unanswered calls from conversation history explicitly.
     _, root = chatgpt_root()
     existing = latest_valid_request(root)
-    last_fingerprint = existing[2] if existing else None
+    if existing is not None:
+        state.seen_fingerprints.add(existing[2])
+
     too_long_visible = ui_contains_text(root, MESSAGE_TOO_LONG_TEXT)
-    last_executed: tuple[str, list[Any], list[Any]] | None = None
     handled_too_long_for: str | None = None
 
     print("  Press Ctrl-X to save the ChatGPT accessibility tree.", flush=True)
@@ -611,62 +730,84 @@ def watch_loop() -> None:
             try:
                 if hotkeys.read() == "\x18":
                     print(f"  accessibility dump: {save_accessibility_dump()}", flush=True)
+
+                state.phase = WatcherPhase.SCANNING
                 app, root = chatgpt_root()
                 if dismiss_work_prompt(root):
                     time.sleep(0.2)
                     app, root = chatgpt_root()
 
-                # Treat ChatGPT's size error as an edge-triggered delivery failure.
-                # The tools have already run, so recover by sending only a compact
-                # summary and never by executing the request again.
+                # A too-large submission was not actually delivered. Restore the
+                # corresponding completed batches as compact pending deliveries;
+                # any newly discovered calls will be executed before resubmission.
                 current_too_long_visible = ui_contains_text(root, MESSAGE_TOO_LONG_TEXT)
-                if current_too_long_visible and not too_long_visible and last_executed is not None:
-                    executed_fingerprint, executed_calls, executed_results = last_executed
-                    if handled_too_long_for != executed_fingerprint:
-                        handled_too_long_for = executed_fingerprint
-                        fallback = too_long_fallback(executed_calls, executed_results)
+                if current_too_long_visible and not too_long_visible:
+                    submission_key = state.last_submission_key()
+                    if submission_key is not None and handled_too_long_for != submission_key:
+                        handled_too_long_for = submission_key
+                        state.restore_last_submission_compact()
                         print(
                             "  watcher warning: ChatGPT rejected tool results as too long; "
-                            "sending a compact summary",
+                            "queued a compact retry while retaining completed results",
                             flush=True,
                         )
-                        app, root = chatgpt_root()
-                        paste_result_into_composer(app, root, fallback, send=True)
-                        print(f"  {color('OK', '1;32')} sent compact retry request\n", flush=True)
                 too_long_visible = current_too_long_visible
 
                 candidate = latest_valid_request(root)
-                if candidate is None:
-                    time.sleep(POLL_SECONDS)
+                if candidate is not None:
+                    source, request, fingerprint = candidate
+                    if fingerprint not in state.seen_fingerprints:
+                        # A streaming code block can briefly become parseable before
+                        # the assistant is done. Require the same request after the
+                        # settling delay before treating it as conversation progress.
+                        time.sleep(SETTLE_SECONDS)
+                        _, settled_root = chatgpt_root()
+                        settled = latest_valid_request(settled_root)
+                        if settled is None or settled[2] != fingerprint:
+                            continue
+
+                        # A genuinely newer settled assistant tool-call turn means
+                        # ChatGPT accepted the previous submission. It can no longer
+                        # be the subject of a future delivery-error recovery.
+                        state.acknowledge_last_submission()
+
+                        # Claim before execution. Side-effecting calls are never run
+                        # twice merely because delivery later fails or is interrupted.
+                        state.seen_fingerprints.add(fingerprint)
+                        state.phase = WatcherPhase.EXECUTING
+                        print(color("tool calls", "1;35") + ":", flush=True)
+                        result = execute_request(request, announce=True)
+                        state.record_completed(fingerprint, request, result)
+                        handled_too_long_for = None
+
+                        # Rescan before delivery. If another request appeared while
+                        # tools were running, execute it first and grow the pending
+                        # delivery snapshot rather than sending a partial snapshot.
+                        continue
+
+                if state.has_pending_results():
+                    state.phase = WatcherPhase.DELIVERING
+                    rendered = state.render_pending()
+                    app, root = chatgpt_root()
+                    outcome = paste_result_into_composer(
+                        app,
+                        root,
+                        rendered,
+                        send=True,
+                        known_fingerprints=state.seen_fingerprints,
+                    )
+                    if outcome is DeliveryOutcome.INTERRUPTED:
+                        print(
+                            "  delivery interrupted by new tool calls; retaining completed results",
+                            flush=True,
+                        )
+                        continue
+
+                    state.mark_submitted()
+                    print(f"  {color('OK', '1;32')} sent results\n", flush=True)
                     continue
 
-                source, request, fingerprint = candidate
-                if fingerprint == last_fingerprint:
-                    time.sleep(POLL_SECONDS)
-                    continue
-
-                # A streaming code block can briefly become parseable before the
-                # assistant is done. Require the same call after a settling delay.
-                time.sleep(SETTLE_SECONDS)
-                _, settled_root = chatgpt_root()
-                settled = latest_valid_request(settled_root)
-                if settled is None or settled[2] != fingerprint:
-                    continue
-
-                # Claim the request before running it. Tool calls may have side
-                # effects, so any later watcher/delivery error must never cause this
-                # same assistant request to execute a second time.
-                last_fingerprint = fingerprint
-                print(color("tool calls", "1;35") + ":", flush=True)
-                result = execute_request(request, announce=True)
-                calls, _, single, _ = request_calls(request)
-                results = [result] if single else list(result)
-                last_executed = (fingerprint, list(calls), results)
-                handled_too_long_for = None
-                rendered = fenced_result(result)
-                app, root = chatgpt_root()
-                paste_result_into_composer(app, root, rendered, send=True)
-                print(f"  {color('OK', '1;32')} sent results\n", flush=True)
+                time.sleep(POLL_SECONDS)
             except KeyboardInterrupt:
                 print("\nPoor Girl's Codex stopped.")
                 return

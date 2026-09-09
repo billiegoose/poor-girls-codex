@@ -45,6 +45,32 @@ class WatcherDeliveryTests(unittest.TestCase):
         self.assertIn("retrying in 0.25s", output)
         self.assertIn("retrying in 0.5s", output)
 
+    def test_send_wait_is_interrupted_by_new_tool_call(self) -> None:
+        candidate_a = ('{"id":"a","tool":"read"}', {"id": "a", "tool": "read"}, "fingerprint-a")
+        candidate_b = ('{"id":"b","tool":"read"}', {"id": "b", "tool": "read"}, "fingerprint-b")
+
+        with (
+            mock.patch.object(pgc, "latest_valid_request", side_effect=[candidate_a, candidate_b]),
+            mock.patch.object(pgc, "set_composer_text") as set_text,
+            mock.patch.object(pgc, "chatgpt_root", return_value=("app", "refreshed-root")),
+            mock.patch.object(pgc, "submit_composer_to_pid") as submit,
+            mock.patch.object(pgc.time, "sleep"),
+        ):
+            outcome = pgc.paste_result_into_composer(
+                "app",
+                "initial-root",
+                "payload",
+                send=True,
+                known_fingerprints={"fingerprint-a"},
+            )
+
+        self.assertIs(outcome, pgc.DeliveryOutcome.INTERRUPTED)
+        self.assertEqual(
+            set_text.call_args_list,
+            [mock.call("initial-root", "payload"), mock.call("refreshed-root", "")],
+        )
+        submit.assert_not_called()
+
     def test_pid_targeted_return_retries_with_exponential_backoff(self) -> None:
         composer = object()
         app = mock.Mock()
@@ -161,7 +187,7 @@ class WatcherDeliveryTests(unittest.TestCase):
             latest_calls += 1
             if latest_calls == 1:
                 return None
-            if latest_calls <= 4:
+            if latest_calls <= 5:
                 return candidate
             raise KeyboardInterrupt
 
@@ -175,7 +201,7 @@ class WatcherDeliveryTests(unittest.TestCase):
                 "content": "x" * 100_000,
             }
 
-        def fake_paste(app, root, text, *, send):
+        def fake_paste(app, root, text, *, send, **kwargs):
             deliveries.append(text)
 
         with (
@@ -200,8 +226,8 @@ class WatcherDeliveryTests(unittest.TestCase):
         self.assertIn("The tools already ran; do not repeat them", deliveries[1])
         self.assertLess(len(deliveries[1]), 2000)
         output = stdout.getvalue()
-        self.assertIn("sending a compact summary", output)
-        self.assertIn("sent compact retry request", output)
+        self.assertIn("queued a compact retry while retaining completed results", output)
+        self.assertGreaterEqual(output.count("sent results"), 2)
 
     def test_manual_accessibility_dump_records_reason_and_tree(self) -> None:
         output = mock.mock_open()
@@ -269,6 +295,64 @@ class WatcherDeliveryTests(unittest.TestCase):
         setcbreak.assert_called_once_with(7)
         restore.assert_called_once_with(7, pgc.termios.TCSADRAIN, saved)
 
+    def test_new_tool_call_interrupts_delivery_and_combines_completed_results(self) -> None:
+        request_a = {"id": "call-a", "tool": "read", "path": "a.txt"}
+        request_b = {"id": "call-b", "tool": "read", "path": "b.txt"}
+        candidate_a = ('{"id":"call-a","tool":"read","path":"a.txt"}', request_a, "fingerprint-a")
+        candidate_b = ('{"id":"call-b","tool":"read","path":"b.txt"}', request_b, "fingerprint-b")
+        candidates = iter([
+            None,          # startup scan
+            candidate_a,   # discover A
+            candidate_a,   # settle A
+            candidate_a,   # A remains latest while first delivery begins
+            candidate_b,   # after interrupted delivery, discover B
+            candidate_b,   # settle B
+            candidate_b,   # B remains latest while combined delivery begins
+        ])
+        executions: list[str] = []
+        deliveries: list[str] = []
+        delivery_outcomes = iter([
+            pgc.DeliveryOutcome.INTERRUPTED,
+            pgc.DeliveryOutcome.SENT,
+        ])
+
+        def fake_latest(root):
+            try:
+                return next(candidates)
+            except StopIteration:
+                raise KeyboardInterrupt
+
+        def fake_execute(request, *, announce=False):
+            executions.append(request["id"])
+            return {"id": request["id"], "tool": request["tool"], "ok": True}
+
+        def fake_paste(app, root, text, *, send, **kwargs):
+            deliveries.append(text)
+            return next(delivery_outcomes)
+
+        with (
+            mock.patch.object(pgc, "clipboard_write"),
+            mock.patch.object(pgc, "chatgpt_root", return_value=("app", "root")),
+            mock.patch.object(pgc, "dismiss_work_prompt", return_value=False),
+            mock.patch.object(pgc, "latest_valid_request", side_effect=fake_latest),
+            mock.patch.object(pgc, "ui_contains_text", return_value=False),
+            mock.patch.object(pgc, "execute_request", side_effect=fake_execute),
+            mock.patch.object(pgc, "paste_result_into_composer", side_effect=fake_paste),
+            mock.patch.object(pgc, "SETTLE_SECONDS", 0.0),
+            mock.patch.object(pgc, "POLL_SECONDS", 0.0),
+            mock.patch.object(pgc.time, "sleep"),
+            redirect_stdout(StringIO()) as stdout,
+        ):
+            pgc.watch_loop()
+
+        self.assertEqual(executions, ["call-a", "call-b"])
+        self.assertEqual(len(deliveries), 2)
+        self.assertIn('"id": "call-a"', deliveries[0])
+        self.assertNotIn('"id": "call-b"', deliveries[0])
+        self.assertEqual(deliveries[1].count('"id": "call-a"'), 1)
+        self.assertEqual(deliveries[1].count('"id": "call-b"'), 1)
+        self.assertIn("delivery interrupted by new tool calls", stdout.getvalue())
+
     def test_delivery_error_does_not_reexecute_same_toolcall(self) -> None:
         request = {"id": "side-effect", "tool": "run", "script": "echo hi"}
         candidate = ('{"id":"side-effect","tool":"run","script":"echo hi"}', request, "fingerprint")
@@ -291,7 +375,7 @@ class WatcherDeliveryTests(unittest.TestCase):
             executions += 1
             return {"id": "side-effect", "tool": "run", "ok": True}
 
-        def fake_paste(app, root, text, *, send):
+        def fake_paste(app, root, text, *, send, **kwargs):
             nonlocal deliveries
             deliveries += 1
             raise RuntimeError("synthetic delivery failure")
