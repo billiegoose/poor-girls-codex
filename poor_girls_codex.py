@@ -267,7 +267,7 @@ def ui_contains_text_outside_conversation(root, needle: str) -> bool:
     stack = [root]
     while stack:
         node = stack.pop()
-        if conversation is not None and node is conversation:
+        if conversation is not None and node == conversation:
             continue
         for attr in ("AXValue", "AXTitle", "AXDescription", "AXHelp"):
             value = probe.ax_attr(node, attr)

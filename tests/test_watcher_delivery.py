@@ -175,19 +175,33 @@ class WatcherDeliveryTests(unittest.TestCase):
             self.assertFalse(pgc.ui_contains_text(root, "definitely absent"))
 
     def test_too_long_detector_ignores_verbatim_text_inside_conversation(self) -> None:
-        root = object()
-        conversation = object()
-        transcript_text = object()
-        banner = object()
+        class AxProxy:
+            def __init__(self, identity: str) -> None:
+                self.identity = identity
+
+            def __eq__(self, other) -> bool:
+                return isinstance(other, AxProxy) and self.identity == other.identity
+
+            def __hash__(self) -> int:
+                return hash(self.identity)
+
+        root = AxProxy("root")
+        conversation_from_selector = AxProxy("conversation")
+        conversation_from_tree = AxProxy("conversation")
+        transcript_text = AxProxy("transcript")
+        banner = AxProxy("banner")
         values = {
-            (root, "AXChildren"): [conversation],
-            (conversation, "AXChildren"): [transcript_text],
+            (root, "AXChildren"): [conversation_from_tree],
+            (conversation_from_tree, "AXChildren"): [transcript_text],
             (transcript_text, "AXChildren"): [],
             (transcript_text, "AXValue"): pgc.MESSAGE_TOO_LONG_TEXT,
         }
 
+        self.assertIsNot(conversation_from_selector, conversation_from_tree)
+        self.assertEqual(conversation_from_selector, conversation_from_tree)
+
         with (
-            mock.patch.object(pgc, "conversation_group", return_value=conversation),
+            mock.patch.object(pgc, "conversation_group", return_value=conversation_from_selector),
             mock.patch.object(
                 pgc.probe,
                 "ax_attr",
@@ -198,11 +212,11 @@ class WatcherDeliveryTests(unittest.TestCase):
                 pgc.ui_contains_text_outside_conversation(root, pgc.MESSAGE_TOO_LONG_TEXT)
             )
 
-        values[(root, "AXChildren")] = [conversation, banner]
+        values[(root, "AXChildren")] = [conversation_from_tree, banner]
         values[(banner, "AXChildren")] = []
         values[(banner, "AXValue")] = pgc.MESSAGE_TOO_LONG_TEXT
         with (
-            mock.patch.object(pgc, "conversation_group", return_value=conversation),
+            mock.patch.object(pgc, "conversation_group", return_value=conversation_from_selector),
             mock.patch.object(
                 pgc.probe,
                 "ax_attr",
