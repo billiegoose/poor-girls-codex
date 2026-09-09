@@ -5,9 +5,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import select
 import subprocess
 import sys
+import termios
 import time
+import tty
 from typing import Any
 
 import ApplicationServices as AS
@@ -34,6 +38,45 @@ def color(text: str, code: str) -> str:
     if not sys.stdout.isatty():
         return text
     return f"\033[{code}m{text}\033[0m"
+
+
+class TerminalHotkeys:
+    """Read single-key watcher commands without blocking the AX polling loop."""
+
+    def __init__(self) -> None:
+        self.fd: int | None = None
+        self.saved: list[Any] | None = None
+
+    def __enter__(self):
+        if not sys.stdin.isatty():
+            return self
+        try:
+            self.fd = sys.stdin.fileno()
+            self.saved = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        except (OSError, termios.error):
+            self.fd = None
+            self.saved = None
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self.fd is not None and self.saved is not None:
+            try:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+            except (OSError, termios.error):
+                pass
+        return False
+
+    def read(self) -> str | None:
+        if self.fd is None:
+            return None
+        try:
+            readable, _, _ = select.select([self.fd], [], [], 0)
+            if not readable:
+                return None
+            return os.read(self.fd, 1).decode("utf-8", errors="ignore")
+        except OSError:
+            return None
 
 
 BOOTSTRAP_PROMPT = r'''You are operating as a coding agent through Poor Girl's Codex, a local tool harness.
@@ -104,6 +147,28 @@ def clipboard_write(text: str) -> None:
     # Clipboard use is intentionally limited to the startup convenience prompt.
     # Toolcall detection and extraction use Accessibility directly.
     subprocess.run(["pbcopy"], input=text, text=True, check=True)
+
+
+def save_accessibility_dump(exc: BaseException | None = None) -> str:
+    """Save the current ChatGPT accessibility tree manually or after an error."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    suffix = time.time_ns() % 1_000_000_000
+    filename = f"poor-girls-codex-ax-dump-{stamp}-{suffix:09d}.txt"
+    lines = [
+        "Poor Girl's Codex watcher accessibility dump",
+        f"error: {type(exc).__name__}: {exc}" if exc is not None else "reason: manual Ctrl-X dump",
+        "",
+        "=== Full accessibility tree ===",
+    ]
+    try:
+        _, root = chatgpt_root()
+        lines.extend(probe.dump_tree(root))
+    except Exception as dump_exc:
+        lines.append(f"<unable to dump ChatGPT accessibility tree: {dump_exc}>")
+
+    with open(filename, "w", encoding="utf-8") as output_file:
+        output_file.write("\n".join(lines) + "\n")
+    return filename
 
 
 def ui_contains_text(root, needle: str) -> bool:
@@ -540,70 +605,74 @@ def watch_loop() -> None:
     last_executed: tuple[str, list[Any], list[Any]] | None = None
     handled_too_long_for: str | None = None
 
-    while True:
-        try:
-            app, root = chatgpt_root()
-            if dismiss_work_prompt(root):
-                time.sleep(0.2)
+    print("  Press Ctrl-X to save the ChatGPT accessibility tree.", flush=True)
+    with TerminalHotkeys() as hotkeys:
+        while True:
+            try:
+                if hotkeys.read() == "\x18":
+                    print(f"  accessibility dump: {save_accessibility_dump()}", flush=True)
                 app, root = chatgpt_root()
-
-            # Treat ChatGPT's size error as an edge-triggered delivery failure.
-            # The tools have already run, so recover by sending only a compact
-            # summary and never by executing the request again.
-            current_too_long_visible = ui_contains_text(root, MESSAGE_TOO_LONG_TEXT)
-            if current_too_long_visible and not too_long_visible and last_executed is not None:
-                executed_fingerprint, executed_calls, executed_results = last_executed
-                if handled_too_long_for != executed_fingerprint:
-                    handled_too_long_for = executed_fingerprint
-                    fallback = too_long_fallback(executed_calls, executed_results)
-                    print(
-                        "  watcher warning: ChatGPT rejected tool results as too long; "
-                        "sending a compact summary",
-                        flush=True,
-                    )
+                if dismiss_work_prompt(root):
+                    time.sleep(0.2)
                     app, root = chatgpt_root()
-                    paste_result_into_composer(app, root, fallback, send=True)
-                    print(f"  {color('OK', '1;32')} sent compact retry request\n", flush=True)
-            too_long_visible = current_too_long_visible
 
-            candidate = latest_valid_request(root)
-            if candidate is None:
-                time.sleep(POLL_SECONDS)
-                continue
+                # Treat ChatGPT's size error as an edge-triggered delivery failure.
+                # The tools have already run, so recover by sending only a compact
+                # summary and never by executing the request again.
+                current_too_long_visible = ui_contains_text(root, MESSAGE_TOO_LONG_TEXT)
+                if current_too_long_visible and not too_long_visible and last_executed is not None:
+                    executed_fingerprint, executed_calls, executed_results = last_executed
+                    if handled_too_long_for != executed_fingerprint:
+                        handled_too_long_for = executed_fingerprint
+                        fallback = too_long_fallback(executed_calls, executed_results)
+                        print(
+                            "  watcher warning: ChatGPT rejected tool results as too long; "
+                            "sending a compact summary",
+                            flush=True,
+                        )
+                        app, root = chatgpt_root()
+                        paste_result_into_composer(app, root, fallback, send=True)
+                        print(f"  {color('OK', '1;32')} sent compact retry request\n", flush=True)
+                too_long_visible = current_too_long_visible
 
-            source, request, fingerprint = candidate
-            if fingerprint == last_fingerprint:
-                time.sleep(POLL_SECONDS)
-                continue
+                candidate = latest_valid_request(root)
+                if candidate is None:
+                    time.sleep(POLL_SECONDS)
+                    continue
 
-            # A streaming code block can briefly become parseable before the
-            # assistant is done. Require the same call after a settling delay.
-            time.sleep(SETTLE_SECONDS)
-            _, settled_root = chatgpt_root()
-            settled = latest_valid_request(settled_root)
-            if settled is None or settled[2] != fingerprint:
-                continue
+                source, request, fingerprint = candidate
+                if fingerprint == last_fingerprint:
+                    time.sleep(POLL_SECONDS)
+                    continue
 
-            # Claim the request before running it. Tool calls may have side
-            # effects, so any later watcher/delivery error must never cause this
-            # same assistant request to execute a second time.
-            last_fingerprint = fingerprint
-            print(color("tool calls", "1;35") + ":", flush=True)
-            result = execute_request(request, announce=True)
-            calls, _, single, _ = request_calls(request)
-            results = [result] if single else list(result)
-            last_executed = (fingerprint, list(calls), results)
-            handled_too_long_for = None
-            rendered = fenced_result(result)
-            app, root = chatgpt_root()
-            paste_result_into_composer(app, root, rendered, send=True)
-            print(f"  {color('OK', '1;32')} sent results\n", flush=True)
-        except KeyboardInterrupt:
-            print("\nPoor Girl's Codex stopped.")
-            return
-        except Exception as exc:
-            print(f"  watcher error: {exc}", flush=True)
-            time.sleep(1.0)
+                # A streaming code block can briefly become parseable before the
+                # assistant is done. Require the same call after a settling delay.
+                time.sleep(SETTLE_SECONDS)
+                _, settled_root = chatgpt_root()
+                settled = latest_valid_request(settled_root)
+                if settled is None or settled[2] != fingerprint:
+                    continue
+
+                # Claim the request before running it. Tool calls may have side
+                # effects, so any later watcher/delivery error must never cause this
+                # same assistant request to execute a second time.
+                last_fingerprint = fingerprint
+                print(color("tool calls", "1;35") + ":", flush=True)
+                result = execute_request(request, announce=True)
+                calls, _, single, _ = request_calls(request)
+                results = [result] if single else list(result)
+                last_executed = (fingerprint, list(calls), results)
+                handled_too_long_for = None
+                rendered = fenced_result(result)
+                app, root = chatgpt_root()
+                paste_result_into_composer(app, root, rendered, send=True)
+                print(f"  {color('OK', '1;32')} sent results\n", flush=True)
+            except KeyboardInterrupt:
+                print("\nPoor Girl's Codex stopped.")
+                return
+            except Exception as exc:
+                print(f"  watcher error: {exc}", flush=True)
+                time.sleep(1.0)
 
 
 def main() -> None:

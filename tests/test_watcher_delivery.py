@@ -203,6 +203,72 @@ class WatcherDeliveryTests(unittest.TestCase):
         self.assertIn("sending a compact summary", output)
         self.assertIn("sent compact retry request", output)
 
+    def test_manual_accessibility_dump_records_reason_and_tree(self) -> None:
+        output = mock.mock_open()
+        with (
+            mock.patch.object(pgc, "chatgpt_root", return_value=("app", "root")),
+            mock.patch.object(
+                pgc.probe,
+                "dump_tree",
+                return_value=["APP: Role='AXApplication'", "AX nodes dumped: 1"],
+            ),
+            mock.patch.object(pgc.time, "strftime", return_value="20260908-202500"),
+            mock.patch.object(pgc.time, "time_ns", return_value=123456789),
+            mock.patch("builtins.open", output),
+        ):
+            path = pgc.save_accessibility_dump()
+
+        self.assertEqual(path, "poor-girls-codex-ax-dump-20260908-202500-123456789.txt")
+        contents = output().write.call_args.args[0]
+        self.assertIn("reason: manual Ctrl-X dump", contents)
+        self.assertIn("=== Full accessibility tree ===", contents)
+        self.assertIn("AXApplication", contents)
+
+    def test_ctrl_x_dumps_while_watcher_waits(self) -> None:
+        hotkeys = mock.MagicMock()
+        hotkeys.__enter__.return_value = hotkeys
+        hotkeys.read.return_value = "\x18"
+
+        with (
+            mock.patch.object(pgc, "clipboard_write"),
+            mock.patch.object(
+                pgc,
+                "chatgpt_root",
+                side_effect=[("app", "root"), KeyboardInterrupt()],
+            ),
+            mock.patch.object(pgc, "latest_valid_request", return_value=None),
+            mock.patch.object(pgc, "ui_contains_text", return_value=False),
+            mock.patch.object(pgc, "TerminalHotkeys", return_value=hotkeys),
+            mock.patch.object(pgc, "save_accessibility_dump", return_value="dump.txt") as dump,
+            redirect_stdout(StringIO()) as stdout,
+        ):
+            pgc.watch_loop()
+
+        dump.assert_called_once_with()
+        hotkeys.__exit__.assert_called_once()
+        self.assertIn("Press Ctrl-X", stdout.getvalue())
+        self.assertIn("accessibility dump: dump.txt", stdout.getvalue())
+
+    def test_terminal_hotkeys_reads_ctrl_x_and_restores_terminal(self) -> None:
+        stdin = mock.Mock()
+        stdin.isatty.return_value = True
+        stdin.fileno.return_value = 7
+        saved = ["terminal-state"]
+
+        with (
+            mock.patch.object(pgc.sys, "stdin", stdin),
+            mock.patch.object(pgc.termios, "tcgetattr", return_value=saved),
+            mock.patch.object(pgc.tty, "setcbreak") as setcbreak,
+            mock.patch.object(pgc.select, "select", return_value=([7], [], [])),
+            mock.patch.object(pgc.os, "read", return_value=b"\x18"),
+            mock.patch.object(pgc.termios, "tcsetattr") as restore,
+        ):
+            with pgc.TerminalHotkeys() as hotkeys:
+                self.assertEqual(hotkeys.read(), "\x18")
+
+        setcbreak.assert_called_once_with(7)
+        restore.assert_called_once_with(7, pgc.termios.TCSADRAIN, saved)
+
     def test_delivery_error_does_not_reexecute_same_toolcall(self) -> None:
         request = {"id": "side-effect", "tool": "run", "script": "echo hi"}
         candidate = ('{"id":"side-effect","tool":"run","script":"echo hi"}', request, "fingerprint")
