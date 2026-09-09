@@ -256,6 +256,27 @@ def ui_contains_text(root, needle: str) -> bool:
     return False
 
 
+def ui_contains_text_outside_conversation(root, needle: str) -> bool:
+    """Find UI text while ignoring transcript content that may quote it verbatim."""
+    wanted = needle.casefold()
+    try:
+        conversation = conversation_group(root)
+    except RuntimeError:
+        conversation = None
+
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if conversation is not None and node is conversation:
+            continue
+        for attr in ("AXValue", "AXTitle", "AXDescription", "AXHelp"):
+            value = probe.ax_attr(node, attr)
+            if value is not None and wanted in str(value).casefold():
+                return True
+        stack.extend(reversed(children_of(node)))
+    return False
+
+
 def static_text(element) -> str:
     pieces = []
     for node in walk(element):
@@ -721,7 +742,7 @@ def watch_loop() -> None:
     if existing is not None:
         state.seen_fingerprints.add(existing[2])
 
-    too_long_visible = ui_contains_text(root, MESSAGE_TOO_LONG_TEXT)
+    too_long_visible = ui_contains_text_outside_conversation(root, MESSAGE_TOO_LONG_TEXT)
     handled_too_long_for: str | None = None
 
     print("  Press Ctrl-X to save the ChatGPT accessibility tree.", flush=True)
@@ -740,7 +761,7 @@ def watch_loop() -> None:
                 # A too-large submission was not actually delivered. Restore the
                 # corresponding completed batches as compact pending deliveries;
                 # any newly discovered calls will be executed before resubmission.
-                current_too_long_visible = ui_contains_text(root, MESSAGE_TOO_LONG_TEXT)
+                current_too_long_visible = ui_contains_text_outside_conversation(root, MESSAGE_TOO_LONG_TEXT)
                 if current_too_long_visible and not too_long_visible:
                     submission_key = state.last_submission_key()
                     if submission_key is not None and handled_too_long_for != submission_key:

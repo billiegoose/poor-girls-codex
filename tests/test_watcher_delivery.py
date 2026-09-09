@@ -174,6 +174,45 @@ class WatcherDeliveryTests(unittest.TestCase):
             self.assertTrue(pgc.ui_contains_text(root, pgc.MESSAGE_TOO_LONG_TEXT))
             self.assertFalse(pgc.ui_contains_text(root, "definitely absent"))
 
+    def test_too_long_detector_ignores_verbatim_text_inside_conversation(self) -> None:
+        root = object()
+        conversation = object()
+        transcript_text = object()
+        banner = object()
+        values = {
+            (root, "AXChildren"): [conversation],
+            (conversation, "AXChildren"): [transcript_text],
+            (transcript_text, "AXChildren"): [],
+            (transcript_text, "AXValue"): pgc.MESSAGE_TOO_LONG_TEXT,
+        }
+
+        with (
+            mock.patch.object(pgc, "conversation_group", return_value=conversation),
+            mock.patch.object(
+                pgc.probe,
+                "ax_attr",
+                side_effect=lambda element, attr: values.get((element, attr)),
+            ),
+        ):
+            self.assertFalse(
+                pgc.ui_contains_text_outside_conversation(root, pgc.MESSAGE_TOO_LONG_TEXT)
+            )
+
+        values[(root, "AXChildren")] = [conversation, banner]
+        values[(banner, "AXChildren")] = []
+        values[(banner, "AXValue")] = pgc.MESSAGE_TOO_LONG_TEXT
+        with (
+            mock.patch.object(pgc, "conversation_group", return_value=conversation),
+            mock.patch.object(
+                pgc.probe,
+                "ax_attr",
+                side_effect=lambda element, attr: values.get((element, attr)),
+            ),
+        ):
+            self.assertTrue(
+                pgc.ui_contains_text_outside_conversation(root, pgc.MESSAGE_TOO_LONG_TEXT)
+            )
+
     def test_too_long_error_sends_compact_summary_without_reexecuting_tools(self) -> None:
         request = {"id": "large-read", "tool": "read", "path": "huge.txt"}
         candidate = ('{"id":"large-read","tool":"read","path":"huge.txt"}', request, "fingerprint")
@@ -209,7 +248,7 @@ class WatcherDeliveryTests(unittest.TestCase):
             mock.patch.object(pgc, "chatgpt_root", return_value=("app", "root")),
             mock.patch.object(pgc, "dismiss_work_prompt", return_value=False),
             mock.patch.object(pgc, "latest_valid_request", side_effect=fake_latest),
-            mock.patch.object(pgc, "ui_contains_text", side_effect=lambda root, needle: next(too_long_scans)),
+            mock.patch.object(pgc, "ui_contains_text_outside_conversation", side_effect=lambda root, needle: next(too_long_scans)),
             mock.patch.object(pgc, "execute_request", side_effect=fake_execute),
             mock.patch.object(pgc, "paste_result_into_composer", side_effect=fake_paste),
             mock.patch.object(pgc, "SETTLE_SECONDS", 0.0),
