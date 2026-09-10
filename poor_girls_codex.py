@@ -7,31 +7,22 @@ import hashlib
 import json
 import os
 import select
-import subprocess
 import sys
 import termios
 import time
 import tty
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any
+from typing import Any, Protocol
 
-import ApplicationServices as AS
-import Quartz
-
-import probe_chatgpt as probe
+from macos_desktop_app import MacOSDesktopApp
 import toolcall_lib
 
 
-CHATGPT_BUNDLE_ID = "com.openai.codex"
-COMPOSER_DESCRIPTION = "Message ChatGPT"
-SEND_DESCRIPTION = "Send"
 POLL_SECONDS = 0.5
 SETTLE_SECONDS = 0.35
 SEND_RETRY_INITIAL_SECONDS = 0.25
 SEND_RETRY_MAX_SECONDS = 8.0
-RETURN_RETRY_INITIAL_SECONDS = 0.25
-RETURN_RETRY_MAX_SECONDS = 8.0
 MESSAGE_TOO_LONG_TEXT = "The message you submitted was too long, please edit it and resubmit."
 SUPPORTED_TOOLS = {"read", "find", "tree", "status", "diff", "edit", "write", "patch", "run"}
 
@@ -45,6 +36,26 @@ class WatcherPhase(Enum):
 class DeliveryOutcome(Enum):
     SENT = auto()
     INTERRUPTED = auto()
+
+
+class ChatFrontend(Protocol):
+    """Host UI boundary used by the protocol/watcher core."""
+
+    name: str
+
+    def trusted(self) -> bool: ...
+    def root(self): ...
+    def clipboard_write(self, text: str) -> None: ...
+    def save_debug_dump(self, exc: BaseException | None = None) -> str: ...
+    def ui_contains_text_outside_conversation(self, root, needle: str) -> bool: ...
+    def latest_assistant_json_candidates(self, root) -> list[str]: ...
+    def set_composer_text(self, root, text: str): ...
+    def can_submit(self, root) -> bool: ...
+    def submit_composer(self, app, root, expected_text: str) -> None: ...
+    def dismiss_work_prompt(self, root) -> bool: ...
+
+
+FRONTEND: ChatFrontend = MacOSDesktopApp()
 
 
 @dataclass
@@ -116,7 +127,7 @@ def color(text: str, code: str) -> str:
 
 
 class TerminalHotkeys:
-    """Read single-key watcher commands without blocking the AX polling loop."""
+    """Read single-key watcher commands without blocking the frontend polling loop."""
 
     def __init__(self) -> None:
         self.fd: int | None = None
@@ -174,169 +185,10 @@ A single call may be a JSON object. Multiple calls should use {"calls":[...]}. E
 Do not ask me to manually run commands, inspect files, or paste tool results when the harness can do it. Continue using tool calls until the task is complete, then answer normally.'''
 
 
-def children_of(element):
-    children = probe.ax_attr(element, "AXChildren")
-    if not children:
-        return []
-    try:
-        return list(children)
-    except Exception:
-        return []
-
-
-def walk(root):
-    stack = [root]
-    while stack:
-        element = stack.pop()
-        yield element
-        children = children_of(element)
-        stack.extend(reversed(children))
-
-
-def find_elements(root, *, role: str | None = None, description: str | None = None):
-    matches = []
-    for element in walk(root):
-        if role is not None and str(probe.ax_attr(element, "AXRole") or "") != role:
-            continue
-        if description is not None and str(probe.ax_attr(element, "AXDescription") or "") != description:
-            continue
-        matches.append(element)
-    return matches
-
-
-def chatgpt_root():
-    app, _ = probe.find_chatgpt_app()
-    if app is None:
-        raise RuntimeError("ChatGPT is not running")
-    pid = int(app.processIdentifier())
-    return app, AS.AXUIElementCreateApplication(pid)
-
-
-def press(element) -> None:
-    error = AS.AXUIElementPerformAction(element, AS.kAXPressAction)
-    if error != 0:
-        raise RuntimeError(f"AXPress failed with error {error}")
-
-
-def clipboard_write(text: str) -> None:
-    # Clipboard use is intentionally limited to the startup convenience prompt.
-    # Toolcall detection and extraction use Accessibility directly.
-    subprocess.run(["pbcopy"], input=text, text=True, check=True)
-
-
-def save_accessibility_dump(exc: BaseException | None = None) -> str:
-    """Save the current ChatGPT accessibility tree manually or after an error."""
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    suffix = time.time_ns() % 1_000_000_000
-    filename = f"poor-girls-codex-ax-dump-{stamp}-{suffix:09d}.txt"
-    lines = [
-        "Poor Girl's Codex watcher accessibility dump",
-        f"error: {type(exc).__name__}: {exc}" if exc is not None else "reason: manual Ctrl-X dump",
-        "",
-        "=== Full accessibility tree ===",
-    ]
-    try:
-        _, root = chatgpt_root()
-        lines.extend(probe.dump_tree(root))
-    except Exception as dump_exc:
-        lines.append(f"<unable to dump ChatGPT accessibility tree: {dump_exc}>")
-
-    with open(filename, "w", encoding="utf-8") as output_file:
-        output_file.write("\n".join(lines) + "\n")
-    return filename
-
-
-def ui_contains_text(root, needle: str) -> bool:
-    wanted = needle.casefold()
-    for node in walk(root):
-        for attr in ("AXValue", "AXTitle", "AXDescription", "AXHelp"):
-            value = probe.ax_attr(node, attr)
-            if value is not None and wanted in str(value).casefold():
-                return True
-    return False
-
-
-def ui_contains_text_outside_conversation(root, needle: str) -> bool:
-    """Find UI text while ignoring transcript content that may quote it verbatim."""
-    wanted = needle.casefold()
-    try:
-        conversation = conversation_group(root)
-    except RuntimeError:
-        conversation = None
-
-    stack = [root]
-    while stack:
-        node = stack.pop()
-        if conversation is not None and node == conversation:
-            continue
-        for attr in ("AXValue", "AXTitle", "AXDescription", "AXHelp"):
-            value = probe.ax_attr(node, attr)
-            if value is not None and wanted in str(value).casefold():
-                return True
-        stack.extend(reversed(children_of(node)))
-    return False
-
-
-def static_text(element) -> str:
-    pieces = []
-    for node in walk(element):
-        if str(probe.ax_attr(node, "AXRole") or "") != "AXStaticText":
-            continue
-        value = probe.ax_attr(node, "AXValue")
-        if value is not None:
-            pieces.append(str(value))
-    return "".join(pieces)
-
-
-def conversation_group(root):
-    best = None
-    best_score = 0
-    for node in walk(root):
-        children = children_of(node)
-        if not children:
-            continue
-        headings = [
-            str(probe.ax_attr(child, "AXTitle") or probe.ax_attr(child, "AXValue") or "")
-            for child in children
-            if str(probe.ax_attr(child, "AXRole") or "") == "AXHeading"
-        ]
-        chatgpt = headings.count("ChatGPT said:")
-        user = headings.count("You said:")
-        score = chatgpt + user
-        if chatgpt and user and score > best_score:
-            best = node
-            best_score = score
-    if best is None:
-        raise RuntimeError("ChatGPT conversation group not found")
-    return best
-
-
-def latest_assistant_content(root):
-    children = children_of(conversation_group(root))
-    latest = None
-    for index, child in enumerate(children[:-1]):
-        if str(probe.ax_attr(child, "AXRole") or "") != "AXHeading":
-            continue
-        heading = str(probe.ax_attr(child, "AXTitle") or probe.ax_attr(child, "AXValue") or "")
-        if heading == "ChatGPT said:":
-            latest = children[index + 1]
-    if latest is None:
-        raise RuntimeError("latest ChatGPT response not found")
-    return latest
-
-
 def latest_assistant_toolcall(root):
-    content = latest_assistant_content(root)
     candidates = []
-
-    # Chromium exposes syntax-highlighted code as many AXStaticText tokens.
-    # Find the smallest descendant group whose concatenated text is a valid
-    # Poor Girl's Codex request. This avoids pressing Copy or touching the
-    # clipboard and naturally ignores surrounding assistant prose/controls.
-    for node in walk(content):
-        if str(probe.ax_attr(node, "AXRole") or "") != "AXGroup":
-            continue
-        source = static_text(node).strip()
+    for source in FRONTEND.latest_assistant_json_candidates(root):
+        source = source.strip()
         if not source:
             continue
         try:
@@ -537,85 +389,6 @@ def too_long_fallback(calls: list[Any], results: list[Any]) -> str:
     )
 
 
-def set_composer_text(root, text: str):
-    composers = find_elements(
-        root,
-        role="AXTextArea",
-        description=COMPOSER_DESCRIPTION,
-    )
-    if not composers:
-        raise RuntimeError("ChatGPT composer not found")
-
-    composer = composers[-1]
-    error = AS.AXUIElementSetAttributeValue(composer, "AXValue", text)
-    if error != 0:
-        raise RuntimeError(f"setting composer AXValue failed with error {error}")
-    return composer
-
-
-def submit_composer_to_pid(app, composer, expected_text: str) -> None:
-    # Keep input scoped to ChatGPT rather than the global HID stream. Setting
-    # AXFocused on an inactive app does not activate it, and CGEventPostToPid
-    # sends Return only to ChatGPT instead of hijacking the user's keyboard.
-    pid = int(app.processIdentifier())
-    attempt = 0
-
-    while True:
-        # Re-check before every retry. If the previous Return eventually took
-        # effect after our confirmation timeout, do not send another Return.
-        app, root = chatgpt_root()
-        composers = find_elements(
-            root,
-            role="AXTextArea",
-            description=COMPOSER_DESCRIPTION,
-        )
-        if not composers:
-            return
-
-        composer = composers[-1]
-        value = str(probe.ax_attr(composer, "AXValue") or "")
-        if expected_text.strip() not in value:
-            return
-
-        focus_error = AS.AXUIElementSetAttributeValue(composer, "AXFocused", True)
-        if focus_error != 0:
-            raise RuntimeError(f"focusing composer via AX failed with error {focus_error}")
-
-        down = Quartz.CGEventCreateKeyboardEvent(None, 36, True)
-        up = Quartz.CGEventCreateKeyboardEvent(None, 36, False)
-        Quartz.CGEventPostToPid(pid, down)
-        Quartz.CGEventPostToPid(pid, up)
-
-        # Submission is asynchronous. Confirm that the payload left the
-        # composer rather than assuming the Return event was accepted.
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            _, root = chatgpt_root()
-            composers = find_elements(
-                root,
-                role="AXTextArea",
-                description=COMPOSER_DESCRIPTION,
-            )
-            if not composers:
-                return
-            value = str(probe.ax_attr(composers[-1], "AXValue") or "")
-            if expected_text.strip() not in value:
-                return
-            time.sleep(0.05)
-
-        delay = min(
-            RETURN_RETRY_INITIAL_SECONDS * (2**attempt),
-            RETURN_RETRY_MAX_SECONDS,
-        )
-        print(
-            "  watcher warning: ChatGPT did not submit the composer after PID-targeted Return; "
-            f"retrying in {delay:g}s",
-            flush=True,
-        )
-        time.sleep(delay)
-        attempt += 1
-
-
 def paste_result_into_composer(
     app,
     root,
@@ -625,7 +398,7 @@ def paste_result_into_composer(
     known_fingerprints: set[str] | None = None,
 ) -> DeliveryOutcome:
     if not send:
-        set_composer_text(root, text)
+        FRONTEND.set_composer_text(root, text)
         return DeliveryOutcome.SENT
 
     def interrupted(current_root) -> bool:
@@ -638,33 +411,28 @@ def paste_result_into_composer(
         # obsolete composer snapshot; the watcher will execute the newly visible
         # calls and rebuild a delivery containing every still-undelivered result.
         try:
-            set_composer_text(current_root, "")
+            FRONTEND.set_composer_text(current_root, "")
         except RuntimeError:
             pass
         return True
 
-    # AXValue reaches Chromium/React asynchronously. Delivery retries are
-    # interruptible: while Send is unavailable, a newly visible tool call wins
-    # control immediately, but the completed results themselves are retained.
+    # Frontend updates may become visible asynchronously. Delivery retries are
+    # interruptible: while submission is unavailable, a newly visible tool call
+    # wins control immediately, but the completed results themselves are retained.
     attempt = 0
     while True:
         if interrupted(root):
             return DeliveryOutcome.INTERRUPTED
 
-        set_composer_text(root, text)
+        FRONTEND.set_composer_text(root, text)
         time.sleep(0.1)
 
-        app, root = chatgpt_root()
+        app, root = FRONTEND.root()
         if interrupted(root):
             return DeliveryOutcome.INTERRUPTED
 
-        send_buttons = find_elements(root, role="AXButton", description=SEND_DESCRIPTION)
-        enabled = [b for b in send_buttons if probe.ax_attr(b, "AXEnabled") is not False]
-        if enabled:
-            composers = find_elements(root, role="AXTextArea", description=COMPOSER_DESCRIPTION)
-            if not composers:
-                raise RuntimeError("ChatGPT composer disappeared before submission")
-            submit_composer_to_pid(app, composers[-1], text)
+        if FRONTEND.can_submit(root):
+            FRONTEND.submit_composer(app, root, text)
             return DeliveryOutcome.SENT
 
         delay = min(
@@ -672,7 +440,7 @@ def paste_result_into_composer(
             SEND_RETRY_MAX_SECONDS,
         )
         print(
-            "  watcher warning: enabled Send button not found after setting composer AXValue; "
+            "  watcher warning: frontend is not ready to submit the result; "
             f"retrying in {delay:g}s",
             flush=True,
         )
@@ -685,26 +453,12 @@ def paste_result_into_composer(
                 step = min(0.1, remaining)
                 time.sleep(step)
                 remaining -= step
-                app, root = chatgpt_root()
+                app, root = FRONTEND.root()
                 if interrupted(root):
                     return DeliveryOutcome.INTERRUPTED
 
         attempt += 1
-        app, root = chatgpt_root()
-
-
-def dismiss_work_prompt(root) -> bool:
-    for node in walk(root):
-        if str(probe.ax_attr(node, "AXRole") or "") != "AXButton":
-            continue
-        text = " ".join(
-            str(probe.ax_attr(node, attr) or "")
-            for attr in ("AXDescription", "AXTitle", "AXValue")
-        ).strip().lower()
-        if "stay in chat" in text:
-            press(node)
-            return True
-    return False
+        app, root = FRONTEND.root()
 
 
 def latest_valid_request(root):
@@ -723,26 +477,26 @@ def watch_loop() -> None:
     print(color("|                the hacky ChatGPT coding harness                |", "36"))
     print(color(border, "1;36"))
     print()
-    print(f"  {color('[1]', '1;35')} Open a regular chat in the ChatGPT desktop app.")
+    print(f"  {color('[1]', '1;35')} Open a regular ChatGPT conversation in the configured frontend.")
     print(f"  {color('[2]', '1;35')} Paste the bootstrap prompt already on your clipboard.")
     print(f"  {color('[3]', '1;35')} Leave me running; I'll handle tool calls in the background.")
     print()
     print(f"  {color('[ready]', '1;32')} Waiting for ChatGPT tool calls...", flush=True)
     print()
 
-    clipboard_write(BOOTSTRAP_PROMPT)
+    FRONTEND.clipboard_write(BOOTSTRAP_PROMPT)
 
     state = WatcherState()
 
     # Preserve the current startup behavior for now: a request already visible
     # when PGC launches is considered pre-existing. A later recovery slice can
     # reconstruct unanswered calls from conversation history explicitly.
-    _, root = chatgpt_root()
+    _, root = FRONTEND.root()
     existing = latest_valid_request(root)
     if existing is not None:
         state.seen_fingerprints.add(existing[2])
 
-    too_long_visible = ui_contains_text_outside_conversation(root, MESSAGE_TOO_LONG_TEXT)
+    too_long_visible = FRONTEND.ui_contains_text_outside_conversation(root, MESSAGE_TOO_LONG_TEXT)
     handled_too_long_for: str | None = None
 
     print("  Press Ctrl-X to save the ChatGPT accessibility tree.", flush=True)
@@ -750,18 +504,18 @@ def watch_loop() -> None:
         while True:
             try:
                 if hotkeys.read() == "\x18":
-                    print(f"  accessibility dump: {save_accessibility_dump()}", flush=True)
+                    print(f"  accessibility dump: {FRONTEND.save_debug_dump()}", flush=True)
 
                 state.phase = WatcherPhase.SCANNING
-                app, root = chatgpt_root()
-                if dismiss_work_prompt(root):
+                app, root = FRONTEND.root()
+                if FRONTEND.dismiss_work_prompt(root):
                     time.sleep(0.2)
-                    app, root = chatgpt_root()
+                    app, root = FRONTEND.root()
 
                 # A too-large submission was not actually delivered. Restore the
                 # corresponding completed batches as compact pending deliveries;
                 # any newly discovered calls will be executed before resubmission.
-                current_too_long_visible = ui_contains_text_outside_conversation(root, MESSAGE_TOO_LONG_TEXT)
+                current_too_long_visible = FRONTEND.ui_contains_text_outside_conversation(root, MESSAGE_TOO_LONG_TEXT)
                 if current_too_long_visible and not too_long_visible:
                     submission_key = state.last_submission_key()
                     if submission_key is not None and handled_too_long_for != submission_key:
@@ -782,7 +536,7 @@ def watch_loop() -> None:
                         # the assistant is done. Require the same request after the
                         # settling delay before treating it as conversation progress.
                         time.sleep(SETTLE_SECONDS)
-                        _, settled_root = chatgpt_root()
+                        _, settled_root = FRONTEND.root()
                         settled = latest_valid_request(settled_root)
                         if settled is None or settled[2] != fingerprint:
                             continue
@@ -809,7 +563,7 @@ def watch_loop() -> None:
                 if state.has_pending_results():
                     state.phase = WatcherPhase.DELIVERING
                     rendered = state.render_pending()
-                    app, root = chatgpt_root()
+                    app, root = FRONTEND.root()
                     outcome = paste_result_into_composer(
                         app,
                         root,
@@ -838,7 +592,7 @@ def watch_loop() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Clipboard/Accessibility bridge for Poor Girl's Codex")
+    parser = argparse.ArgumentParser(description="ChatGPT frontend bridge for Poor Girl's Codex")
     parser.add_argument(
         "mode",
         nargs="?",
@@ -852,14 +606,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not probe.trusted():
-        raise SystemExit("Accessibility permission is required")
+    if not FRONTEND.trusted():
+        raise SystemExit("The configured ChatGPT frontend is not available or authorized")
 
     if args.mode == "watch":
         watch_loop()
         return
 
-    app, root = chatgpt_root()
+    app, root = FRONTEND.root()
     if args.source_file:
         with open(args.source_file, encoding="utf-8") as source_file:
             source = source_file.read()

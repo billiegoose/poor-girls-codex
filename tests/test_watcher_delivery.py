@@ -10,32 +10,21 @@ import poor_girls_codex as pgc
 
 class WatcherDeliveryTests(unittest.TestCase):
     def test_send_button_retries_with_exponential_backoff(self) -> None:
-        send_button = object()
-        composer = object()
-        send_scans = iter([[], [], [send_button]])
-
-        def fake_find_elements(root, *, role=None, description=None):
-            if role == "AXButton":
-                return next(send_scans)
-            if role == "AXTextArea":
-                return [composer]
-            self.fail(f"unexpected selector: role={role!r} description={description!r}")
+        frontend = mock.Mock()
+        frontend.root.return_value = ("app", "root")
+        frontend.can_submit.side_effect = [False, False, True]
 
         with (
+            mock.patch.object(pgc, "FRONTEND", frontend),
             mock.patch.object(pgc, "SEND_RETRY_INITIAL_SECONDS", 0.25),
             mock.patch.object(pgc, "SEND_RETRY_MAX_SECONDS", 8.0),
-            mock.patch.object(pgc, "set_composer_text") as set_text,
-            mock.patch.object(pgc, "chatgpt_root", return_value=("app", "root")),
-            mock.patch.object(pgc, "find_elements", side_effect=fake_find_elements),
-            mock.patch.object(pgc.probe, "ax_attr", return_value=True),
-            mock.patch.object(pgc, "submit_composer_to_pid") as submit,
             mock.patch.object(pgc.time, "sleep") as sleep,
             redirect_stdout(StringIO()) as stdout,
         ):
             pgc.paste_result_into_composer("app", "root", "payload", send=True)
 
-        self.assertEqual(set_text.call_count, 3)
-        submit.assert_called_once_with("app", composer, "payload")
+        self.assertEqual(frontend.set_composer_text.call_count, 3)
+        frontend.submit_composer.assert_called_once_with("app", "root", "payload")
         self.assertEqual(
             [call.args[0] for call in sleep.call_args_list],
             [0.1, 0.25, 0.1, 0.5, 0.1],
@@ -48,12 +37,12 @@ class WatcherDeliveryTests(unittest.TestCase):
     def test_send_wait_is_interrupted_by_new_tool_call(self) -> None:
         candidate_a = ('{"id":"a","tool":"read"}', {"id": "a", "tool": "read"}, "fingerprint-a")
         candidate_b = ('{"id":"b","tool":"read"}', {"id": "b", "tool": "read"}, "fingerprint-b")
+        frontend = mock.Mock()
+        frontend.root.return_value = ("app", "refreshed-root")
 
         with (
+            mock.patch.object(pgc, "FRONTEND", frontend),
             mock.patch.object(pgc, "latest_valid_request", side_effect=[candidate_a, candidate_b]),
-            mock.patch.object(pgc, "set_composer_text") as set_text,
-            mock.patch.object(pgc, "chatgpt_root", return_value=("app", "refreshed-root")),
-            mock.patch.object(pgc, "submit_composer_to_pid") as submit,
             mock.patch.object(pgc.time, "sleep"),
         ):
             outcome = pgc.paste_result_into_composer(
@@ -66,71 +55,26 @@ class WatcherDeliveryTests(unittest.TestCase):
 
         self.assertIs(outcome, pgc.DeliveryOutcome.INTERRUPTED)
         self.assertEqual(
-            set_text.call_args_list,
+            frontend.set_composer_text.call_args_list,
             [mock.call("initial-root", "payload"), mock.call("refreshed-root", "")],
         )
-        submit.assert_not_called()
-
-    def test_pid_targeted_return_retries_with_exponential_backoff(self) -> None:
-        composer = object()
-        app = mock.Mock()
-        app.processIdentifier.return_value = 123
-        # Attempt 1 pre-check, attempt 2 pre-check, then the previous Return is
-        # observed to have finally cleared the composer before attempt 3.
-        values = iter(["payload", "payload", ""])
-        monotonic_values = iter([0.0, 2.1, 3.0, 5.1])
-
-        with (
-            mock.patch.object(pgc, "RETURN_RETRY_INITIAL_SECONDS", 0.25),
-            mock.patch.object(pgc, "RETURN_RETRY_MAX_SECONDS", 8.0),
-            mock.patch.object(pgc, "chatgpt_root", return_value=(app, "root")),
-            mock.patch.object(pgc, "find_elements", return_value=[composer]),
-            mock.patch.object(pgc.probe, "ax_attr", side_effect=lambda element, attr: next(values)),
-            mock.patch.object(pgc.AS, "AXUIElementSetAttributeValue", return_value=0),
-            mock.patch.object(pgc.Quartz, "CGEventCreateKeyboardEvent", return_value=object()),
-            mock.patch.object(pgc.Quartz, "CGEventPostToPid") as post,
-            mock.patch.object(pgc.time, "monotonic", side_effect=lambda: next(monotonic_values)),
-            mock.patch.object(pgc.time, "sleep") as sleep,
-            redirect_stdout(StringIO()) as stdout,
-        ):
-            pgc.submit_composer_to_pid(app, composer, "payload")
-
-        # Two Return keypresses, each consisting of key-down + key-up.
-        self.assertEqual(post.call_count, 4)
-        sleeps = [call.args[0] for call in sleep.call_args_list]
-        self.assertIn(0.25, sleeps)
-        self.assertIn(0.5, sleeps)
-        output = stdout.getvalue()
-        self.assertIn("PID-targeted Return", output)
-        self.assertIn("retrying in 0.25s", output)
-        self.assertIn("retrying in 0.5s", output)
+        frontend.submit_composer.assert_not_called()
 
     def test_send_button_backoff_caps_and_keeps_retrying(self) -> None:
-        send_button = object()
-        composer = object()
-        send_scans = iter([[], [], [], [], [send_button]])
-
-        def fake_find_elements(root, *, role=None, description=None):
-            if role == "AXButton":
-                return next(send_scans)
-            if role == "AXTextArea":
-                return [composer]
-            self.fail(f"unexpected selector: role={role!r} description={description!r}")
+        frontend = mock.Mock()
+        frontend.root.return_value = ("app", "root")
+        frontend.can_submit.side_effect = [False, False, False, False, True]
 
         with (
+            mock.patch.object(pgc, "FRONTEND", frontend),
             mock.patch.object(pgc, "SEND_RETRY_INITIAL_SECONDS", 1.0),
             mock.patch.object(pgc, "SEND_RETRY_MAX_SECONDS", 2.0),
-            mock.patch.object(pgc, "set_composer_text"),
-            mock.patch.object(pgc, "chatgpt_root", return_value=("app", "root")),
-            mock.patch.object(pgc, "find_elements", side_effect=fake_find_elements),
-            mock.patch.object(pgc.probe, "ax_attr", return_value=True),
-            mock.patch.object(pgc, "submit_composer_to_pid") as submit,
             mock.patch.object(pgc.time, "sleep") as sleep,
             redirect_stdout(StringIO()),
         ):
             pgc.paste_result_into_composer("app", "root", "payload", send=True)
 
-        submit.assert_called_once_with("app", composer, "payload")
+        frontend.submit_composer.assert_called_once_with("app", "root", "payload")
         self.assertEqual(
             [call.args[0] for call in sleep.call_args_list],
             [0.1, 1.0, 0.1, 2.0, 0.1, 2.0, 0.1, 2.0, 0.1],
@@ -156,76 +100,6 @@ class WatcherDeliveryTests(unittest.TestCase):
         self.assertIn("Retry with smaller chunks", message)
         self.assertNotIn("call-14: read", message)
         self.assertLess(len(message), 2000)
-
-    def test_ui_contains_text_scans_accessibility_attributes(self) -> None:
-        root = object()
-        child = object()
-        values = {
-            (root, "AXChildren"): [child],
-            (child, "AXChildren"): [],
-            (child, "AXValue"): pgc.MESSAGE_TOO_LONG_TEXT,
-        }
-
-        with mock.patch.object(
-            pgc.probe,
-            "ax_attr",
-            side_effect=lambda element, attr: values.get((element, attr)),
-        ):
-            self.assertTrue(pgc.ui_contains_text(root, pgc.MESSAGE_TOO_LONG_TEXT))
-            self.assertFalse(pgc.ui_contains_text(root, "definitely absent"))
-
-    def test_too_long_detector_ignores_verbatim_text_inside_conversation(self) -> None:
-        class AxProxy:
-            def __init__(self, identity: str) -> None:
-                self.identity = identity
-
-            def __eq__(self, other) -> bool:
-                return isinstance(other, AxProxy) and self.identity == other.identity
-
-            def __hash__(self) -> int:
-                return hash(self.identity)
-
-        root = AxProxy("root")
-        conversation_from_selector = AxProxy("conversation")
-        conversation_from_tree = AxProxy("conversation")
-        transcript_text = AxProxy("transcript")
-        banner = AxProxy("banner")
-        values = {
-            (root, "AXChildren"): [conversation_from_tree],
-            (conversation_from_tree, "AXChildren"): [transcript_text],
-            (transcript_text, "AXChildren"): [],
-            (transcript_text, "AXValue"): pgc.MESSAGE_TOO_LONG_TEXT,
-        }
-
-        self.assertIsNot(conversation_from_selector, conversation_from_tree)
-        self.assertEqual(conversation_from_selector, conversation_from_tree)
-
-        with (
-            mock.patch.object(pgc, "conversation_group", return_value=conversation_from_selector),
-            mock.patch.object(
-                pgc.probe,
-                "ax_attr",
-                side_effect=lambda element, attr: values.get((element, attr)),
-            ),
-        ):
-            self.assertFalse(
-                pgc.ui_contains_text_outside_conversation(root, pgc.MESSAGE_TOO_LONG_TEXT)
-            )
-
-        values[(root, "AXChildren")] = [conversation_from_tree, banner]
-        values[(banner, "AXChildren")] = []
-        values[(banner, "AXValue")] = pgc.MESSAGE_TOO_LONG_TEXT
-        with (
-            mock.patch.object(pgc, "conversation_group", return_value=conversation_from_selector),
-            mock.patch.object(
-                pgc.probe,
-                "ax_attr",
-                side_effect=lambda element, attr: values.get((element, attr)),
-            ),
-        ):
-            self.assertTrue(
-                pgc.ui_contains_text_outside_conversation(root, pgc.MESSAGE_TOO_LONG_TEXT)
-            )
 
     def test_too_long_error_sends_compact_summary_without_reexecuting_tools(self) -> None:
         request = {"id": "large-read", "tool": "read", "path": "huge.txt"}
@@ -257,12 +131,13 @@ class WatcherDeliveryTests(unittest.TestCase):
         def fake_paste(app, root, text, *, send, **kwargs):
             deliveries.append(text)
 
+        frontend = mock.Mock()
+        frontend.root.return_value = ("app", "root")
+        frontend.dismiss_work_prompt.return_value = False
+        frontend.ui_contains_text_outside_conversation.side_effect = lambda root, needle: next(too_long_scans)
         with (
-            mock.patch.object(pgc, "clipboard_write"),
-            mock.patch.object(pgc, "chatgpt_root", return_value=("app", "root")),
-            mock.patch.object(pgc, "dismiss_work_prompt", return_value=False),
+            mock.patch.object(pgc, "FRONTEND", frontend),
             mock.patch.object(pgc, "latest_valid_request", side_effect=fake_latest),
-            mock.patch.object(pgc, "ui_contains_text_outside_conversation", side_effect=lambda root, needle: next(too_long_scans)),
             mock.patch.object(pgc, "execute_request", side_effect=fake_execute),
             mock.patch.object(pgc, "paste_result_into_composer", side_effect=fake_paste),
             mock.patch.object(pgc, "SETTLE_SECONDS", 0.0),
@@ -282,48 +157,24 @@ class WatcherDeliveryTests(unittest.TestCase):
         self.assertIn("queued a compact retry while retaining completed results", output)
         self.assertGreaterEqual(output.count("sent results"), 2)
 
-    def test_manual_accessibility_dump_records_reason_and_tree(self) -> None:
-        output = mock.mock_open()
-        with (
-            mock.patch.object(pgc, "chatgpt_root", return_value=("app", "root")),
-            mock.patch.object(
-                pgc.probe,
-                "dump_tree",
-                return_value=["APP: Role='AXApplication'", "AX nodes dumped: 1"],
-            ),
-            mock.patch.object(pgc.time, "strftime", return_value="20260908-202500"),
-            mock.patch.object(pgc.time, "time_ns", return_value=123456789),
-            mock.patch("builtins.open", output),
-        ):
-            path = pgc.save_accessibility_dump()
-
-        self.assertEqual(path, "poor-girls-codex-ax-dump-20260908-202500-123456789.txt")
-        contents = output().write.call_args.args[0]
-        self.assertIn("reason: manual Ctrl-X dump", contents)
-        self.assertIn("=== Full accessibility tree ===", contents)
-        self.assertIn("AXApplication", contents)
-
     def test_ctrl_x_dumps_while_watcher_waits(self) -> None:
         hotkeys = mock.MagicMock()
         hotkeys.__enter__.return_value = hotkeys
         hotkeys.read.return_value = "\x18"
 
+        frontend = mock.Mock()
+        frontend.root.side_effect = [("app", "root"), KeyboardInterrupt()]
+        frontend.ui_contains_text_outside_conversation.return_value = False
+        frontend.save_debug_dump.return_value = "dump.txt"
         with (
-            mock.patch.object(pgc, "clipboard_write"),
-            mock.patch.object(
-                pgc,
-                "chatgpt_root",
-                side_effect=[("app", "root"), KeyboardInterrupt()],
-            ),
+            mock.patch.object(pgc, "FRONTEND", frontend),
             mock.patch.object(pgc, "latest_valid_request", return_value=None),
-            mock.patch.object(pgc, "ui_contains_text", return_value=False),
             mock.patch.object(pgc, "TerminalHotkeys", return_value=hotkeys),
-            mock.patch.object(pgc, "save_accessibility_dump", return_value="dump.txt") as dump,
             redirect_stdout(StringIO()) as stdout,
         ):
             pgc.watch_loop()
 
-        dump.assert_called_once_with()
+        frontend.save_debug_dump.assert_called_once_with()
         hotkeys.__exit__.assert_called_once()
         self.assertIn("Press Ctrl-X", stdout.getvalue())
         self.assertIn("accessibility dump: dump.txt", stdout.getvalue())
@@ -383,12 +234,13 @@ class WatcherDeliveryTests(unittest.TestCase):
             deliveries.append(text)
             return next(delivery_outcomes)
 
+        frontend = mock.Mock()
+        frontend.root.return_value = ("app", "root")
+        frontend.dismiss_work_prompt.return_value = False
+        frontend.ui_contains_text_outside_conversation.return_value = False
         with (
-            mock.patch.object(pgc, "clipboard_write"),
-            mock.patch.object(pgc, "chatgpt_root", return_value=("app", "root")),
-            mock.patch.object(pgc, "dismiss_work_prompt", return_value=False),
+            mock.patch.object(pgc, "FRONTEND", frontend),
             mock.patch.object(pgc, "latest_valid_request", side_effect=fake_latest),
-            mock.patch.object(pgc, "ui_contains_text", return_value=False),
             mock.patch.object(pgc, "execute_request", side_effect=fake_execute),
             mock.patch.object(pgc, "paste_result_into_composer", side_effect=fake_paste),
             mock.patch.object(pgc, "SETTLE_SECONDS", 0.0),
@@ -433,10 +285,12 @@ class WatcherDeliveryTests(unittest.TestCase):
             deliveries += 1
             raise RuntimeError("synthetic delivery failure")
 
+        frontend = mock.Mock()
+        frontend.root.return_value = ("app", "root")
+        frontend.dismiss_work_prompt.return_value = False
+        frontend.ui_contains_text_outside_conversation.return_value = False
         with (
-            mock.patch.object(pgc, "clipboard_write"),
-            mock.patch.object(pgc, "chatgpt_root", return_value=("app", "root")),
-            mock.patch.object(pgc, "dismiss_work_prompt", return_value=False),
+            mock.patch.object(pgc, "FRONTEND", frontend),
             mock.patch.object(pgc, "latest_valid_request", side_effect=fake_latest),
             mock.patch.object(pgc, "execute_request", side_effect=fake_execute),
             mock.patch.object(pgc, "paste_result_into_composer", side_effect=fake_paste),
