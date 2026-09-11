@@ -322,6 +322,8 @@ def inspect_web_sessions(*, cdp_url: str) -> list[tuple[str, str, str]]:
 def run_web_watcher(
     *,
     cdp_url: str,
+    session_id: str,
+    bootstrap_prompt: str,
     validate_request: Callable[[Any], None],
     execute_request: Callable[..., Any],
     fenced_result: Callable[[Any], str],
@@ -329,6 +331,9 @@ def run_web_watcher(
     interface = ChatGPTWeb(cdp_url)
     interface.connect()
     try:
+        print(f'chatgpt-web session: {session_id}', flush=True)
+        print('Paste this bootstrap prompt into conversations owned by this project:', flush=True)
+        print(bootstrap_prompt, flush=True)
         WebSessionWatcher(
             interface,
             validate_request=validate_request,

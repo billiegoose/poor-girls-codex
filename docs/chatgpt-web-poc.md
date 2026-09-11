@@ -86,6 +86,11 @@ The current live ChatGPT DOM exposes the composer as a contenteditable `DIV` wit
 
 ## Safety properties
 
+- Each working directory has a persistent opaque routing id in `.pgc/session`.
+- Every executable web request must repeat that id in its top-level `session` field.
+- Sessionless requests and requests for another watcher are ignored before execution.
+- Routing does not depend on an old bootstrap turn remaining mounted in the DOM.
+- PGC adds `.pgc/session` to the checkout's local Git `info/exclude` rather than committing the id.
 - Non-conversation ChatGPT pages are ignored.
 - Host matching is exact (`chatgpt.com`), not a substring test.
 - Existing visible tool calls are marked seen when a tab is first attached.

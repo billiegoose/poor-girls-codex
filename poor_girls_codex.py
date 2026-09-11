@@ -6,7 +6,9 @@ import argparse
 import hashlib
 import json
 import os
+import secrets
 import select
+import subprocess
 import sys
 import termios
 import time
@@ -24,6 +26,8 @@ SEND_RETRY_INITIAL_SECONDS = 0.25
 SEND_RETRY_MAX_SECONDS = 8.0
 MESSAGE_TOO_LONG_TEXT = "The message you submitted was too long, please edit it and resubmit."
 SUPPORTED_TOOLS = {"read", "find", "tree", "status", "diff", "edit", "write", "patch", "run"}
+SESSION_DIR = ".pgc"
+SESSION_FILE = os.path.join(SESSION_DIR, "session")
 
 
 class WatcherPhase(Enum):
@@ -196,6 +200,73 @@ Available tools:
 A single call may be a JSON object. Multiple calls should use {"calls":[...]}. Every call should have a short descriptive "id". To stop later calls when one fails, put "stop_on_error": true on that individual call. Top-level "stop_on_error" is deprecated.
 
 Do not ask me to manually run commands, inspect files, or paste tool results when the harness can do it. Continue using tool calls until the task is complete, then answer normally.'''
+
+
+def ensure_session_ignored(cwd: str = ".") -> None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--git-path", "info/exclude"],
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return
+
+    exclude_path = completed.stdout.strip()
+    if not exclude_path:
+        return
+    if not os.path.isabs(exclude_path):
+        exclude_path = os.path.join(cwd, exclude_path)
+    os.makedirs(os.path.dirname(exclude_path), exist_ok=True)
+    try:
+        with open(exclude_path, encoding="utf-8") as exclude_file:
+            lines = {line.strip() for line in exclude_file}
+    except FileNotFoundError:
+        lines = set()
+    if SESSION_FILE in lines:
+        return
+    with open(exclude_path, "a", encoding="utf-8") as exclude_file:
+        if os.path.exists(exclude_path) and os.path.getsize(exclude_path) > 0:
+            exclude_file.write("\n")
+        exclude_file.write(SESSION_FILE + "\n")
+
+
+def load_or_create_session_id(cwd: str = ".") -> str:
+    session_dir = os.path.join(cwd, SESSION_DIR)
+    session_path = os.path.join(cwd, SESSION_FILE)
+    try:
+        with open(session_path, encoding="utf-8") as session_file:
+            session_id = session_file.read().strip()
+    except FileNotFoundError:
+        os.makedirs(session_dir, exist_ok=True)
+        session_id = secrets.token_hex(8)
+        with open(session_path, "x", encoding="utf-8") as session_file:
+            session_file.write(session_id + "\n")
+    if not session_id:
+        raise RuntimeError(f"empty PGC session id: {session_path}")
+    ensure_session_ignored(cwd)
+    return session_id
+
+
+def web_bootstrap_prompt(session_id: str) -> str:
+    return BOOTSTRAP_PROMPT + f'''\n\nWeb session routing:\nEvery executable Poor Girl's Codex request MUST include the exact top-level field \"session\": \"{session_id}\". This applies to both single-call objects and {{\"calls\":[...]}} batches. Requests without this exact session value are inert and will be ignored by this watcher. When merely discussing or showing example JSON, do not include this session value unless you intend the example to execute.'''
+
+
+def validate_web_session_request(request: Any, session_id: str) -> None:
+    if not isinstance(request, dict):
+        raise ValueError("web tool request must be an object with a session id")
+    if request.get("session") != session_id:
+        raise ValueError("web tool request is for a different PGC session")
+    validate_request(request)
+
+
+def execute_web_session_request(request: Any, session_id: str, *, announce: bool = False) -> Any:
+    validate_web_session_request(request, session_id)
+    executable = dict(request)
+    executable.pop("session", None)
+    return execute_request(executable, announce=announce)
 
 
 def latest_assistant_toolcall(root):
@@ -640,10 +711,17 @@ def main() -> None:
             raise SystemExit("chatgpt-web currently supports watch mode only")
         from chatgpt_web import DEFAULT_CDP_URL, run_web_watcher
 
+        session_id = load_or_create_session_id()
         run_web_watcher(
             cdp_url=args.cdp_url or DEFAULT_CDP_URL,
-            validate_request=validate_request,
-            execute_request=execute_request,
+            session_id=session_id,
+            bootstrap_prompt=web_bootstrap_prompt(session_id),
+            validate_request=lambda request: validate_web_session_request(request, session_id),
+            execute_request=lambda request, announce=False: execute_web_session_request(
+                request,
+                session_id,
+                announce=announce,
+            ),
             fenced_result=fenced_result,
         )
         return

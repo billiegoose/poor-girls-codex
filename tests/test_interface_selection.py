@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -49,6 +51,65 @@ class InterfaceSelectionTests(unittest.TestCase):
             pgc.main()
 
         interface.root.assert_called_once_with()
+
+    def test_session_id_is_persistent_and_locally_git_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as cwd:
+            subprocess.run(['git', 'init', '-q'], cwd=cwd, check=True)
+            first = pgc.load_or_create_session_id(cwd)
+            second = pgc.load_or_create_session_id(cwd)
+            self.assertEqual(first, second)
+            self.assertTrue(first)
+            with open(os.path.join(cwd, '.pgc', 'session'), encoding='utf-8') as session_file:
+                self.assertEqual(session_file.read().strip(), first)
+            ignored = subprocess.run(
+                ['git', 'check-ignore', '-q', '.pgc/session'],
+                cwd=cwd,
+                check=False,
+            )
+            self.assertEqual(ignored.returncode, 0)
+
+    def test_web_session_validation_requires_exact_session(self) -> None:
+        pgc.validate_web_session_request({'session': 'abc', 'id': 'x', 'tool': 'status'}, 'abc')
+        with self.assertRaisesRegex(ValueError, 'different PGC session'):
+            pgc.validate_web_session_request({'session': 'other', 'id': 'x', 'tool': 'status'}, 'abc')
+        with self.assertRaisesRegex(ValueError, 'different PGC session'):
+            pgc.validate_web_session_request({'id': 'x', 'tool': 'status'}, 'abc')
+
+    def test_web_bootstrap_requires_session_on_every_executable_request(self) -> None:
+        prompt = pgc.web_bootstrap_prompt('abc123')
+        self.assertIn('"session": "abc123"', prompt)
+        self.assertIn('Requests without this exact session value are inert', prompt)
+
+    def test_web_execution_strips_session_from_single_call(self) -> None:
+        with mock.patch.object(pgc.toolcall_lib, 'execute', return_value={'ok': True}) as execute:
+            result = pgc.execute_web_session_request(
+                {'session': 'abc', 'id': 'x', 'tool': 'status'},
+                'abc',
+            )
+        self.assertEqual(result, {'ok': True})
+        execute.assert_called_once_with({'id': 'x', 'tool': 'status'}, 0)
+
+    def test_web_execution_strips_session_from_batch_wrapper(self) -> None:
+        request = {
+            'session': 'abc',
+            'calls': [
+                {'id': 'x', 'tool': 'status'},
+                {'id': 'y', 'tool': 'tree'},
+            ],
+        }
+        with mock.patch.object(
+            pgc.toolcall_lib,
+            'execute',
+            side_effect=[{'ok': True}, {'ok': True}],
+        ) as execute:
+            pgc.execute_web_session_request(request, 'abc')
+        self.assertEqual(
+            execute.call_args_list,
+            [
+                mock.call({'id': 'x', 'tool': 'status'}, 0),
+                mock.call({'id': 'y', 'tool': 'tree'}, 1),
+            ],
+        )
 
 
 if __name__ == '__main__':
