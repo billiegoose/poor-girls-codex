@@ -262,3 +262,15 @@ The name came from the project's origin as a low-budget, slightly ridiculous sub
 It turns out we can.
 
 And because the result exposes the machinery so directly, the cheap workaround became a useful teaching tool in its own right.
+
+## ChatGPT web interface
+
+PGC can also watch multiple existing ChatGPT browser conversations concurrently using Playwright over Chrome DevTools Protocol:
+
+```bash
+poor_girls_codex --interface chatgpt-web
+```
+
+Chrome must already be running with a remote-debugging endpoint. The default is `http://127.0.0.1:9222`; use `--cdp-url` to override it. Each open `chatgpt.com/c/...` tab becomes an independent session with its own tool-call fingerprints, pending results, and delivery retries. New conversation tabs are discovered automatically. PGC does not foreground, focus, launch, or close the browser.
+
+See `docs/chatgpt-web-poc.md` for architecture, browser requirements, DOM assumptions, and the live POC results.

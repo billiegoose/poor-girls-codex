@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Protocol
 
-from macos_desktop_app import MacOSDesktopApp
 import toolcall_lib
 
 
@@ -38,8 +37,8 @@ class DeliveryOutcome(Enum):
     INTERRUPTED = auto()
 
 
-class ChatFrontend(Protocol):
-    """Host UI boundary used by the protocol/watcher core."""
+class ModelInterface(Protocol):
+    """Boundary between the PGC protocol core and a model-facing interface."""
 
     name: str
 
@@ -55,7 +54,21 @@ class ChatFrontend(Protocol):
     def dismiss_work_prompt(self, root) -> bool: ...
 
 
-FRONTEND: ChatFrontend = MacOSDesktopApp()
+INTERFACE: ModelInterface | None = None
+
+
+def create_interface(name: str) -> ModelInterface:
+    if name == "chatgpt-macos":
+        from macos_desktop_app import MacOSDesktopApp
+
+        return MacOSDesktopApp()
+    raise ValueError(f"unknown interface: {name}")
+
+
+def current_interface() -> ModelInterface:
+    if INTERFACE is None:
+        raise RuntimeError("model interface has not been configured")
+    return INTERFACE
 
 
 @dataclass
@@ -186,8 +199,9 @@ Do not ask me to manually run commands, inspect files, or paste tool results whe
 
 
 def latest_assistant_toolcall(root):
+    interface = current_interface()
     candidates = []
-    for source in FRONTEND.latest_assistant_json_candidates(root):
+    for source in interface.latest_assistant_json_candidates(root):
         source = source.strip()
         if not source:
             continue
@@ -397,8 +411,9 @@ def paste_result_into_composer(
     send: bool,
     known_fingerprints: set[str] | None = None,
 ) -> DeliveryOutcome:
+    interface = current_interface()
     if not send:
-        FRONTEND.set_composer_text(root, text)
+        interface.set_composer_text(root, text)
         return DeliveryOutcome.SENT
 
     def interrupted(current_root) -> bool:
@@ -411,7 +426,7 @@ def paste_result_into_composer(
         # obsolete composer snapshot; the watcher will execute the newly visible
         # calls and rebuild a delivery containing every still-undelivered result.
         try:
-            FRONTEND.set_composer_text(current_root, "")
+            interface.set_composer_text(current_root, "")
         except RuntimeError:
             pass
         return True
@@ -424,15 +439,15 @@ def paste_result_into_composer(
         if interrupted(root):
             return DeliveryOutcome.INTERRUPTED
 
-        FRONTEND.set_composer_text(root, text)
+        interface.set_composer_text(root, text)
         time.sleep(0.1)
 
-        app, root = FRONTEND.root()
+        app, root = interface.root()
         if interrupted(root):
             return DeliveryOutcome.INTERRUPTED
 
-        if FRONTEND.can_submit(root):
-            FRONTEND.submit_composer(app, root, text)
+        if interface.can_submit(root):
+            interface.submit_composer(app, root, text)
             return DeliveryOutcome.SENT
 
         delay = min(
@@ -453,12 +468,12 @@ def paste_result_into_composer(
                 step = min(0.1, remaining)
                 time.sleep(step)
                 remaining -= step
-                app, root = FRONTEND.root()
+                app, root = interface.root()
                 if interrupted(root):
                     return DeliveryOutcome.INTERRUPTED
 
         attempt += 1
-        app, root = FRONTEND.root()
+        app, root = interface.root()
 
 
 def latest_valid_request(root):
@@ -471,6 +486,7 @@ def latest_valid_request(root):
 
 
 def watch_loop() -> None:
+    interface = current_interface()
     border = "+================================================================+"
     print(color(border, "1;36"))
     print(color("|                     POOR GIRL'S CODEX                          |", "1;35"))
@@ -484,19 +500,19 @@ def watch_loop() -> None:
     print(f"  {color('[ready]', '1;32')} Waiting for ChatGPT tool calls...", flush=True)
     print()
 
-    FRONTEND.clipboard_write(BOOTSTRAP_PROMPT)
+    interface.clipboard_write(BOOTSTRAP_PROMPT)
 
     state = WatcherState()
 
     # Preserve the current startup behavior for now: a request already visible
     # when PGC launches is considered pre-existing. A later recovery slice can
     # reconstruct unanswered calls from conversation history explicitly.
-    _, root = FRONTEND.root()
+    _, root = interface.root()
     existing = latest_valid_request(root)
     if existing is not None:
         state.seen_fingerprints.add(existing[2])
 
-    too_long_visible = FRONTEND.ui_contains_text_outside_conversation(root, MESSAGE_TOO_LONG_TEXT)
+    too_long_visible = interface.ui_contains_text_outside_conversation(root, MESSAGE_TOO_LONG_TEXT)
     handled_too_long_for: str | None = None
 
     print("  Press Ctrl-X to save the ChatGPT accessibility tree.", flush=True)
@@ -504,18 +520,18 @@ def watch_loop() -> None:
         while True:
             try:
                 if hotkeys.read() == "\x18":
-                    print(f"  accessibility dump: {FRONTEND.save_debug_dump()}", flush=True)
+                    print(f"  accessibility dump: {interface.save_debug_dump()}", flush=True)
 
                 state.phase = WatcherPhase.SCANNING
-                app, root = FRONTEND.root()
-                if FRONTEND.dismiss_work_prompt(root):
+                app, root = interface.root()
+                if interface.dismiss_work_prompt(root):
                     time.sleep(0.2)
-                    app, root = FRONTEND.root()
+                    app, root = interface.root()
 
                 # A too-large submission was not actually delivered. Restore the
                 # corresponding completed batches as compact pending deliveries;
                 # any newly discovered calls will be executed before resubmission.
-                current_too_long_visible = FRONTEND.ui_contains_text_outside_conversation(root, MESSAGE_TOO_LONG_TEXT)
+                current_too_long_visible = interface.ui_contains_text_outside_conversation(root, MESSAGE_TOO_LONG_TEXT)
                 if current_too_long_visible and not too_long_visible:
                     submission_key = state.last_submission_key()
                     if submission_key is not None and handled_too_long_for != submission_key:
@@ -536,7 +552,7 @@ def watch_loop() -> None:
                         # the assistant is done. Require the same request after the
                         # settling delay before treating it as conversation progress.
                         time.sleep(SETTLE_SECONDS)
-                        _, settled_root = FRONTEND.root()
+                        _, settled_root = interface.root()
                         settled = latest_valid_request(settled_root)
                         if settled is None or settled[2] != fingerprint:
                             continue
@@ -563,7 +579,7 @@ def watch_loop() -> None:
                 if state.has_pending_results():
                     state.phase = WatcherPhase.DELIVERING
                     rendered = state.render_pending()
-                    app, root = FRONTEND.root()
+                    app, root = interface.root()
                     outcome = paste_result_into_composer(
                         app,
                         root,
@@ -592,7 +608,9 @@ def watch_loop() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ChatGPT frontend bridge for Poor Girl's Codex")
+    global INTERFACE
+
+    parser = argparse.ArgumentParser(description="Model interface bridge for Poor Girl's Codex")
     parser.add_argument(
         "mode",
         nargs="?",
@@ -604,16 +622,41 @@ def main() -> None:
         "--source-file",
         help="read toolcall JSON from a file instead of copying the latest ChatGPT code block",
     )
+    parser.add_argument(
+        "--interface",
+        choices=("chatgpt-macos", "chatgpt-web"),
+        default="chatgpt-macos",
+        help="model-facing interface to use (default: chatgpt-macos)",
+    )
+    parser.add_argument(
+        "--cdp-url",
+        default=None,
+        help="Chromium CDP endpoint for --interface chatgpt-web",
+    )
     args = parser.parse_args()
 
-    if not FRONTEND.trusted():
-        raise SystemExit("The configured ChatGPT frontend is not available or authorized")
+    if args.interface == "chatgpt-web":
+        if args.mode != "watch":
+            raise SystemExit("chatgpt-web currently supports watch mode only")
+        from chatgpt_web import DEFAULT_CDP_URL, run_web_watcher
+
+        run_web_watcher(
+            cdp_url=args.cdp_url or DEFAULT_CDP_URL,
+            validate_request=validate_request,
+            execute_request=execute_request,
+            fenced_result=fenced_result,
+        )
+        return
+
+    INTERFACE = create_interface(args.interface)
+    if not current_interface().trusted():
+        raise SystemExit("The configured ChatGPT interface is not available or authorized")
 
     if args.mode == "watch":
         watch_loop()
         return
 
-    app, root = FRONTEND.root()
+    app, root = current_interface().root()
     if args.source_file:
         with open(args.source_file, encoding="utf-8") as source_file:
             source = source_file.read()

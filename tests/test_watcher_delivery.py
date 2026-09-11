@@ -15,7 +15,7 @@ class WatcherDeliveryTests(unittest.TestCase):
         frontend.can_submit.side_effect = [False, False, True]
 
         with (
-            mock.patch.object(pgc, "FRONTEND", frontend),
+            mock.patch.object(pgc, "INTERFACE", frontend),
             mock.patch.object(pgc, "SEND_RETRY_INITIAL_SECONDS", 0.25),
             mock.patch.object(pgc, "SEND_RETRY_MAX_SECONDS", 8.0),
             mock.patch.object(pgc.time, "sleep") as sleep,
@@ -41,7 +41,7 @@ class WatcherDeliveryTests(unittest.TestCase):
         frontend.root.return_value = ("app", "refreshed-root")
 
         with (
-            mock.patch.object(pgc, "FRONTEND", frontend),
+            mock.patch.object(pgc, "INTERFACE", frontend),
             mock.patch.object(pgc, "latest_valid_request", side_effect=[candidate_a, candidate_b]),
             mock.patch.object(pgc.time, "sleep"),
         ):
@@ -66,7 +66,7 @@ class WatcherDeliveryTests(unittest.TestCase):
         frontend.can_submit.side_effect = [False, False, False, False, True]
 
         with (
-            mock.patch.object(pgc, "FRONTEND", frontend),
+            mock.patch.object(pgc, "INTERFACE", frontend),
             mock.patch.object(pgc, "SEND_RETRY_INITIAL_SECONDS", 1.0),
             mock.patch.object(pgc, "SEND_RETRY_MAX_SECONDS", 2.0),
             mock.patch.object(pgc.time, "sleep") as sleep,
@@ -136,7 +136,7 @@ class WatcherDeliveryTests(unittest.TestCase):
         frontend.dismiss_work_prompt.return_value = False
         frontend.ui_contains_text_outside_conversation.side_effect = lambda root, needle: next(too_long_scans)
         with (
-            mock.patch.object(pgc, "FRONTEND", frontend),
+            mock.patch.object(pgc, "INTERFACE", frontend),
             mock.patch.object(pgc, "latest_valid_request", side_effect=fake_latest),
             mock.patch.object(pgc, "execute_request", side_effect=fake_execute),
             mock.patch.object(pgc, "paste_result_into_composer", side_effect=fake_paste),
@@ -167,7 +167,7 @@ class WatcherDeliveryTests(unittest.TestCase):
         frontend.ui_contains_text_outside_conversation.return_value = False
         frontend.save_debug_dump.return_value = "dump.txt"
         with (
-            mock.patch.object(pgc, "FRONTEND", frontend),
+            mock.patch.object(pgc, "INTERFACE", frontend),
             mock.patch.object(pgc, "latest_valid_request", return_value=None),
             mock.patch.object(pgc, "TerminalHotkeys", return_value=hotkeys),
             redirect_stdout(StringIO()) as stdout,
@@ -239,7 +239,7 @@ class WatcherDeliveryTests(unittest.TestCase):
         frontend.dismiss_work_prompt.return_value = False
         frontend.ui_contains_text_outside_conversation.return_value = False
         with (
-            mock.patch.object(pgc, "FRONTEND", frontend),
+            mock.patch.object(pgc, "INTERFACE", frontend),
             mock.patch.object(pgc, "latest_valid_request", side_effect=fake_latest),
             mock.patch.object(pgc, "execute_request", side_effect=fake_execute),
             mock.patch.object(pgc, "paste_result_into_composer", side_effect=fake_paste),
@@ -290,7 +290,7 @@ class WatcherDeliveryTests(unittest.TestCase):
         frontend.dismiss_work_prompt.return_value = False
         frontend.ui_contains_text_outside_conversation.return_value = False
         with (
-            mock.patch.object(pgc, "FRONTEND", frontend),
+            mock.patch.object(pgc, "INTERFACE", frontend),
             mock.patch.object(pgc, "latest_valid_request", side_effect=fake_latest),
             mock.patch.object(pgc, "execute_request", side_effect=fake_execute),
             mock.patch.object(pgc, "paste_result_into_composer", side_effect=fake_paste),
