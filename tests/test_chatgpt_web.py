@@ -97,6 +97,7 @@ class ChatGPTWebTests(unittest.TestCase):
             validate_request=lambda request: None,
             execute_request=mock.Mock(),
             fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
         )
         watcher.refresh_sessions()
         self.assertEqual(set(watcher.sessions), {'a', 'b'})
@@ -115,6 +116,7 @@ class ChatGPTWebTests(unittest.TestCase):
             validate_request=lambda request: None,
             execute_request=execute,
             fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
         )
         watcher.refresh_sessions()
         self.assertEqual(watcher.sessions['a'].seen_fingerprints, {'already-visible'})
@@ -134,6 +136,7 @@ class ChatGPTWebTests(unittest.TestCase):
             validate_request=lambda request: None,
             execute_request=execute,
             fenced_result=lambda result: 'RESULT',
+            too_long_fallback=lambda request, result: 'FALLBACK',
             settle_seconds=0.35,
         )
         self.assertFalse(watcher.scan_session(session, 0.0))
@@ -160,6 +163,7 @@ class ChatGPTWebTests(unittest.TestCase):
             validate_request=lambda request: None,
             execute_request=execute,
             fenced_result=lambda result: 'RESULT-' + result['id'],
+            too_long_fallback=lambda request, result: 'FALLBACK-' + result['id'],
             settle_seconds=0.0,
             clock=lambda: 1.0,
         )
@@ -193,6 +197,7 @@ class ChatGPTWebTests(unittest.TestCase):
             validate_request=lambda request: None,
             execute_request=mock.Mock(),
             fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
         )
         self.assertFalse(watcher.deliver_session(a, 0.0))
         self.assertEqual(a.pending_results, ['RESULT'])
@@ -200,6 +205,42 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertTrue(watcher.deliver_session(a, 0.25))
         self.assertEqual(a.pending_results, [])
         self.assertEqual(a.delivered, 1)
+
+    def test_too_long_delivery_sends_compact_fallback_without_reexecution(self) -> None:
+        interface = mock.Mock()
+        interface.submit.side_effect = [web.MessageTooLongError('too long'), None]
+        execute = mock.Mock(return_value={'id': 'x', 'tool': 'status', 'ok': True})
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=execute,
+            fenced_result=lambda result: 'FULL',
+            too_long_fallback=lambda request, result: 'COMPACT',
+            settle_seconds=0.0,
+        )
+        session = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            settling_fingerprint='fp',
+            settle_deadline=0.0,
+        )
+        interface.valid_request.return_value = (
+            '{}',
+            {'id': 'x', 'tool': 'status'},
+            'fp',
+        )
+
+        self.assertTrue(watcher.scan_session(session, 0.0))
+        self.assertTrue(watcher.deliver_session(session, 0.0))
+        execute.assert_called_once_with({'id': 'x', 'tool': 'status'}, announce=True)
+        self.assertEqual(
+            interface.submit.call_args_list,
+            [mock.call(session, 'FULL\n'), mock.call(session, 'COMPACT\n')],
+        )
+        self.assertEqual(session.pending_results, [])
+        self.assertEqual(session.pending_fallbacks, [])
+        self.assertEqual(session.delivered, 1)
 
 
 if __name__ == '__main__':

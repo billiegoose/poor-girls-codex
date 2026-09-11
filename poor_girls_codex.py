@@ -474,6 +474,14 @@ def too_long_fallback(calls: list[Any], results: list[Any]) -> str:
     )
 
 
+def too_long_fallback_for_request(request: Any, result: Any) -> str:
+    calls, _, single, _ = request_calls(request)
+    results = [result] if single else result
+    if not isinstance(results, list):
+        results = [results]
+    return too_long_fallback(calls, results)
+
+
 def paste_result_into_composer(
     app,
     root,
@@ -556,8 +564,7 @@ def latest_valid_request(root):
     return source, request, fingerprint
 
 
-def watch_loop() -> None:
-    interface = current_interface()
+def show_startup_ui(bootstrap_prompt: str, *, clipboard_write) -> None:
     border = "+================================================================+"
     print(color(border, "1;36"))
     print(color("|                     POOR GIRL'S CODEX                          |", "1;35"))
@@ -570,8 +577,12 @@ def watch_loop() -> None:
     print()
     print(f"  {color('[ready]', '1;32')} Waiting for ChatGPT tool calls...", flush=True)
     print()
+    clipboard_write(bootstrap_prompt)
 
-    interface.clipboard_write(BOOTSTRAP_PROMPT)
+
+def watch_loop() -> None:
+    interface = current_interface()
+    show_startup_ui(BOOTSTRAP_PROMPT, clipboard_write=interface.clipboard_write)
 
     state = WatcherState()
 
@@ -712,10 +723,17 @@ def main() -> None:
         from chatgpt_web import DEFAULT_CDP_URL, run_web_watcher
 
         session_id = load_or_create_session_id()
+        bootstrap_prompt = web_bootstrap_prompt(session_id)
+        show_startup_ui(
+            bootstrap_prompt,
+            clipboard_write=lambda text: subprocess.run(
+                ["pbcopy"], input=text, text=True, check=True
+            ),
+        )
         run_web_watcher(
             cdp_url=args.cdp_url or DEFAULT_CDP_URL,
             session_id=session_id,
-            bootstrap_prompt=web_bootstrap_prompt(session_id),
+            bootstrap_prompt=bootstrap_prompt,
             validate_request=lambda request: validate_web_session_request(request, session_id),
             execute_request=lambda request, announce=False: execute_web_session_request(
                 request,
@@ -723,6 +741,7 @@ def main() -> None:
                 announce=announce,
             ),
             fenced_result=fenced_result,
+            too_long_fallback=too_long_fallback_for_request,
         )
         return
 

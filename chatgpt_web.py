@@ -18,6 +18,10 @@ DELIVERY_RETRY_INITIAL_SECONDS = 0.25
 DELIVERY_RETRY_MAX_SECONDS = 8.0
 
 
+class MessageTooLongError(RuntimeError):
+    pass
+
+
 @dataclass
 class WebSession:
     conversation_id: str
@@ -25,6 +29,7 @@ class WebSession:
     page: Any
     seen_fingerprints: set[str] = field(default_factory=set)
     pending_results: list[str] = field(default_factory=list)
+    pending_fallbacks: list[str] = field(default_factory=list)
     settling_fingerprint: str | None = None
     settle_deadline: float = 0.0
     delivery_attempt: int = 0
@@ -56,7 +61,10 @@ class ChatGPTWeb:
 
         self._playwright = sync_playwright().start()
         try:
-            self._browser = self._playwright.chromium.connect_over_cdp(self.cdp_url)
+            self._browser = self._playwright.chromium.connect_over_cdp(
+                self.cdp_url,
+                no_defaults=True,
+            )
         except Exception:
             self._playwright.stop()
             self._playwright = None
@@ -162,7 +170,11 @@ class ChatGPTWeb:
         button = session.page.locator(SEND_SELECTOR)
         if button.count() == 0:
             button = session.page.get_by_role('button', name='Send prompt')
-        if button.count() == 0 or not button.last.is_enabled():
+        if button.count() == 0:
+            raise RuntimeError(f'{session.label}: ChatGPT send button is not available')
+        if not button.last.is_enabled():
+            if button.last.get_attribute('aria-disabled') == 'true' and text:
+                raise MessageTooLongError(f'{session.label}: ChatGPT message is too long')
             raise RuntimeError(f'{session.label}: ChatGPT send button is not available')
         button.last.click()
 
@@ -177,6 +189,7 @@ class WebSessionWatcher:
         validate_request: Callable[[Any], None],
         execute_request: Callable[..., Any],
         fenced_result: Callable[[Any], str],
+        too_long_fallback: Callable[[Any, Any], str],
         settle_seconds: float = DEFAULT_SETTLE_SECONDS,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
@@ -185,6 +198,7 @@ class WebSessionWatcher:
         self.validate_request = validate_request
         self.execute_request = execute_request
         self.fenced_result = fenced_result
+        self.too_long_fallback = too_long_fallback
         self.settle_seconds = settle_seconds
         self.poll_seconds = poll_seconds
         self.clock = clock
@@ -238,6 +252,7 @@ class WebSessionWatcher:
         print(f'  [web:{session.label}] tool calls:', flush=True)
         result = self.execute_request(request, announce=True)
         session.pending_results.append(self.fenced_result(result))
+        session.pending_fallbacks.append(self.too_long_fallback(request, result))
         return True
 
     def deliver_session(self, session: WebSession, now: float) -> bool:
@@ -246,6 +261,26 @@ class WebSessionWatcher:
         rendered = '\n'.join(part.rstrip('\n') for part in session.pending_results) + '\n'
         try:
             self.interface.submit(session, rendered)
+        except MessageTooLongError:
+            fallback = '\n'.join(part.rstrip('\n') for part in session.pending_fallbacks) + '\n'
+            print(
+                f'  [web:{session.label}] full results too large; sending compact summary',
+                flush=True,
+            )
+            try:
+                self.interface.submit(session, fallback)
+            except RuntimeError as exc:
+                delay = min(
+                    DELIVERY_RETRY_INITIAL_SECONDS * (2**session.delivery_attempt),
+                    DELIVERY_RETRY_MAX_SECONDS,
+                )
+                session.delivery_attempt += 1
+                session.next_delivery_at = now + delay
+                print(
+                    f'  [web:{session.label}] compact delivery deferred ({exc}); retrying in {delay:g}s',
+                    flush=True,
+                )
+                return False
         except RuntimeError as exc:
             delay = min(
                 DELIVERY_RETRY_INITIAL_SECONDS * (2**session.delivery_attempt),
@@ -260,6 +295,7 @@ class WebSessionWatcher:
             return False
 
         session.pending_results.clear()
+        session.pending_fallbacks.clear()
         session.delivery_attempt = 0
         session.next_delivery_at = 0.0
         session.delivered += 1
@@ -327,18 +363,17 @@ def run_web_watcher(
     validate_request: Callable[[Any], None],
     execute_request: Callable[..., Any],
     fenced_result: Callable[[Any], str],
+    too_long_fallback: Callable[[Any, Any], str],
 ) -> None:
     interface = ChatGPTWeb(cdp_url)
     interface.connect()
     try:
-        print(f'chatgpt-web session: {session_id}', flush=True)
-        print('Paste this bootstrap prompt into conversations owned by this project:', flush=True)
-        print(bootstrap_prompt, flush=True)
         WebSessionWatcher(
             interface,
             validate_request=validate_request,
             execute_request=execute_request,
             fenced_result=fenced_result,
+            too_long_fallback=too_long_fallback,
         ).run()
     finally:
         interface.close()
@@ -351,6 +386,7 @@ def run_two_tab_poc(
     validate_request: Callable[[Any], None],
     execute_request: Callable[..., Any],
     fenced_result: Callable[[Any], str],
+    too_long_fallback: Callable[[Any, Any], str],
 ) -> None:
     """Retained smoke test: drive two existing tabs through the real scheduler."""
     interface = ChatGPTWeb(cdp_url)
@@ -361,6 +397,7 @@ def run_two_tab_poc(
             validate_request=validate_request,
             execute_request=execute_request,
             fenced_result=fenced_result,
+            too_long_fallback=too_long_fallback,
             settle_seconds=0.0,
         )
         watcher.refresh_sessions()
