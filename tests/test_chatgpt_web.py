@@ -95,6 +95,24 @@ class ChatGPTWebTests(unittest.TestCase):
         page.goto.assert_called_once_with('https' + '://chatgpt.com/', wait_until='domcontentloaded')
         self.assertEqual(child.conversation_id, 'child')
 
+    def test_submit_uses_dom_click_without_playwright_actionability(self) -> None:
+        interface = web.ChatGPTWeb()
+        button = mock.Mock()
+        button.is_enabled.return_value = True
+        locator = mock.Mock()
+        locator.count.return_value = 1
+        locator.last = button
+        page = mock.Mock()
+        page.locator.return_value = locator
+        session = web.WebSession('a', 'Background', page)
+        interface.set_composer_text = mock.Mock()
+
+        interface.submit(session, 'result')
+
+        interface.set_composer_text.assert_called_once_with(session, 'result')
+        button.evaluate.assert_called_once_with('element => element.click()')
+        button.click.assert_not_called()
+
     def test_fingerprint_includes_assistant_message_identity(self) -> None:
         interface = web.ChatGPTWeb()
         source = '{"id":"same","tool":"status"}'

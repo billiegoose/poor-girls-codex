@@ -191,7 +191,11 @@ class ChatGPTWeb:
             if button.last.get_attribute('aria-disabled') == 'true' and text:
                 raise MessageTooLongError(f'{session.label}: ChatGPT message is too long')
             raise RuntimeError(f'{session.label}: ChatGPT send button is not available')
-        button.last.click()
+        # Playwright's normal click waits for the element to be visible and stable.
+        # ChatGPT can leave the enabled send button perpetually "unstable" in a
+        # background tab, so invoke the DOM click directly instead of requiring
+        # foreground-tab actionability.
+        button.last.evaluate('element => element.click()')
 
     def create_conversation(
         self,
