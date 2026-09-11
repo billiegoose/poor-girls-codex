@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import select
 import subprocess
@@ -25,7 +26,9 @@ SETTLE_SECONDS = 0.35
 SEND_RETRY_INITIAL_SECONDS = 0.25
 SEND_RETRY_MAX_SECONDS = 8.0
 MESSAGE_TOO_LONG_TEXT = "The message you submitted was too long, please edit it and resubmit."
-SUPPORTED_TOOLS = {"read", "find", "tree", "status", "diff", "edit", "write", "patch", "run"}
+LOCAL_TOOLS = {"read", "find", "tree", "status", "diff", "edit", "write", "patch", "run"}
+WEB_ORCHESTRATION_TOOLS = {"subagent", "handoff"}
+SUPPORTED_TOOLS = LOCAL_TOOLS | WEB_ORCHESTRATION_TOOLS
 SESSION_DIR = ".pgc"
 SESSION_FILE = os.path.join(SESSION_DIR, "session")
 
@@ -251,22 +254,34 @@ def load_or_create_session_id(cwd: str = ".") -> str:
 
 
 def web_bootstrap_prompt(session_id: str) -> str:
-    return BOOTSTRAP_PROMPT + f'''\n\nWeb session routing:\nEvery executable Poor Girl's Codex request MUST include the exact top-level field \"session\": \"{session_id}\". This applies to both single-call objects and {{\"calls\":[...]}} batches. Requests without this exact session value are inert and will be ignored by this watcher. When merely discussing or showing example JSON, do not include this session value unless you intend the example to execute.'''
+    return BOOTSTRAP_PROMPT + f'''\n\nAdditional chatgpt-web tools:\n- subagent {{name,prompt}} - create a fresh ChatGPT subagent conversation; name must be alphanumeric.\n- handoff {{result}} - send a completed subagent result back to the immediate parent conversation.\n\nWeb session routing:\nEvery executable Poor Girl's Codex request MUST include the exact top-level field \"session\": \"{session_id}\". This applies to both single-call objects and {{\"calls\":[...]}} batches. This watcher accepts this session and descendant sessions beginning with \"{session_id}::\". Requests outside that session tree are inert and will be ignored. When merely discussing or showing example JSON, do not include this session value unless you intend the example to execute.'''
+
+
+def web_session_matches(session: Any, session_id: str) -> bool:
+    return isinstance(session, str) and (
+        session == session_id or session.startswith(session_id + "::")
+    )
 
 
 def validate_web_session_request(request: Any, session_id: str) -> None:
     if not isinstance(request, dict):
         raise ValueError("web tool request must be an object with a session id")
-    if request.get("session") != session_id:
+    if not web_session_matches(request.get("session"), session_id):
         raise ValueError("web tool request is for a different PGC session")
-    validate_request(request)
+    validate_request(request, supported_tools=SUPPORTED_TOOLS)
 
 
-def execute_web_session_request(request: Any, session_id: str, *, announce: bool = False) -> Any:
+def execute_web_session_request(
+    request: Any,
+    session_id: str,
+    *,
+    announce: bool = False,
+    tool_executor=None,
+) -> Any:
     validate_web_session_request(request, session_id)
     executable = dict(request)
     executable.pop("session", None)
-    return execute_request(executable, announce=announce)
+    return execute_request(executable, announce=announce, tool_executor=tool_executor)
 
 
 def latest_assistant_toolcall(root):
@@ -325,7 +340,7 @@ def request_calls(request: Any):
     return calls, top_level_stop_on_error, single, top_level_stop_present
 
 
-def validate_request(request: Any) -> None:
+def validate_request(request: Any, *, supported_tools: set[str] = LOCAL_TOOLS) -> None:
     calls, _, _, _ = request_calls(request)
     if not calls:
         raise ValueError("toolcall request contains no calls")
@@ -333,8 +348,19 @@ def validate_request(request: Any) -> None:
         if not isinstance(call, dict):
             raise ValueError(f"call {index} must be an object")
         tool = call.get("tool")
-        if tool not in SUPPORTED_TOOLS:
+        if tool not in supported_tools:
             raise ValueError(f"call {index} has unsupported tool {tool!r}")
+        if tool == "subagent":
+            name = call.get("name")
+            prompt = call.get("prompt")
+            if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9]+", name) is None:
+                raise ValueError(f"call {index} subagent name must be alphanumeric")
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise ValueError(f"call {index} subagent prompt must be a non-empty string")
+        if tool == "handoff":
+            result = call.get("result")
+            if not isinstance(result, str) or not result.strip():
+                raise ValueError(f"call {index} handoff result must be a non-empty string")
         if "stop_on_error" in call and not isinstance(call["stop_on_error"], bool):
             raise ValueError(f"call {index} stop_on_error must be a boolean")
 
@@ -394,7 +420,7 @@ def skipped_result(call: Any, index: int) -> dict[str, Any]:
     }
 
 
-def execute_request(request: Any, *, announce: bool = False) -> Any:
+def execute_request(request: Any, *, announce: bool = False, tool_executor=None) -> Any:
     calls, top_level_stop_on_error, single, top_level_stop_present = request_calls(request)
     if top_level_stop_present:
         print(
@@ -432,7 +458,8 @@ def execute_request(request: Any, *, announce: bool = False) -> Any:
             call_stop_on_error = bool(call.get("stop_on_error", False))
             tool_input = dict(call)
             tool_input.pop("stop_on_error", None)
-            result = toolcall_lib.execute(tool_input, index)
+            executor = tool_executor or toolcall_lib.execute
+            result = executor(tool_input, index)
 
         results.append(result)
         if progress is not None:
@@ -735,13 +762,15 @@ def main() -> None:
             session_id=session_id,
             bootstrap_prompt=bootstrap_prompt,
             validate_request=lambda request: validate_web_session_request(request, session_id),
-            execute_request=lambda request, announce=False: execute_web_session_request(
+            execute_request=lambda request, announce=False, tool_executor=None: execute_web_session_request(
                 request,
                 session_id,
                 announce=announce,
+                tool_executor=tool_executor,
             ),
             fenced_result=fenced_result,
             too_long_fallback=too_long_fallback_for_request,
+            bootstrap_prompt_for_session=web_bootstrap_prompt,
         )
         return
 

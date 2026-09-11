@@ -275,4 +275,12 @@ Chrome must already be running with a remote-debugging endpoint. The default is 
 
 Each working directory gets a persistent opaque routing id in `.pgc/session`. Every executable web tool request must repeat that id in a top-level `"session"` field. This lets multiple PGC processes watch the same browser while only executing requests for their own project. PGC automatically adds `.pgc/session` to that Git checkout's local `info/exclude`, so the routing id stays local and uncommitted.
 
+### Web subagents
+
+In `chatgpt-web` mode, a conversation can create a fresh ChatGPT subagent tab with the `subagent {name,prompt}` orchestration tool. Subagent names are alphanumeric, and the child receives a derived routing id of `<parent-session>::<name>`. Because routing matches the current session tree, children can create nested subagents using the same convention.
+
+The new tab receives the requested subagent prompt followed by the normal PGC bootstrap for its derived session. When ChatGPT replaces the temporary `WEB:...` conversation id used by a newly created tab with its permanent conversation id, the watcher rekeys the existing session instead of detaching it, so pending state and the child's first tool call are preserved.
+
+A subagent returns completed work with `handoff {result}`. PGC queues that result onto the immediate parent conversation; nested subagents therefore hand off one level at a time. The root conversation has no parent and cannot use `handoff`.
+
 See `docs/chatgpt-web-poc.md` for architecture, browser requirements, DOM assumptions, and the live POC results.

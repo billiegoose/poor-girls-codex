@@ -72,6 +72,29 @@ class ChatGPTWebTests(unittest.TestCase):
         interface._browser = browser
         self.assertEqual([page.url for page in interface.pages()], ['https' + '://chatgpt.com/c/a'])
 
+    def test_create_conversation_uses_plain_chatgpt_root_url(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        page.url = 'https' + '://chatgpt.com/c/child'
+        page.locator.return_value.last.wait_for.return_value = None
+        page.wait_for_url.return_value = None
+        context = mock.Mock()
+        context.new_page.return_value = page
+        origin_page = mock.Mock()
+        origin_page.context = context
+        origin = web.WebSession('parent', 'Parent', origin_page)
+        interface.submit = mock.Mock()
+        interface.describe_page = mock.Mock(return_value=('child', 'Child'))
+
+        child = interface.create_conversation(
+            origin=origin,
+            label='subagent:worker',
+            prompt='Do work',
+        )
+
+        page.goto.assert_called_once_with('https' + '://chatgpt.com/', wait_until='domcontentloaded')
+        self.assertEqual(child.conversation_id, 'child')
+
     def test_fingerprint_includes_assistant_message_identity(self) -> None:
         interface = web.ChatGPTWeb()
         source = '{"id":"same","tool":"status"}'
@@ -92,6 +115,7 @@ class ChatGPTWebTests(unittest.TestCase):
         interface.pages.return_value = pages
         interface.describe_page.side_effect = [('a', 'Cats'), ('b', 'Dogs')]
         interface.valid_request.return_value = None
+        interface.latest_too_long_error_id.return_value = None
         watcher = web.WebSessionWatcher(
             interface,
             validate_request=lambda request: None,
@@ -103,6 +127,153 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertEqual(set(watcher.sessions), {'a', 'b'})
         self.assertIsNot(watcher.sessions['a'].seen_fingerprints, watcher.sessions['b'].seen_fingerprints)
         self.assertIsNot(watcher.sessions['a'].pending_results, watcher.sessions['b'].pending_results)
+
+    def test_refresh_rekeys_same_page_when_temporary_conversation_id_changes(self) -> None:
+        interface = mock.Mock()
+        original_page = mock.Mock()
+        rediscovered_page = mock.Mock()
+        original_page.__eq__ = mock.Mock(return_value=True)
+        rediscovered_page.__eq__ = mock.Mock(return_value=True)
+        interface.pages.return_value = [rediscovered_page]
+        interface.describe_page.return_value = ('real-child', 'Child')
+        interface.valid_request.return_value = ('{}', {'tool': 'status'}, 'visible-toolcall')
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+        child = web.WebSession(
+            'WEB:temporary',
+            'subagent:worker',
+            original_page,
+            routing_session_id='root::worker',
+        )
+        child.pending_results.append('pending')
+        watcher.sessions['WEB:temporary'] = child
+        watcher.sessions_by_routing_id['root::worker'] = child
+
+        watcher.refresh_sessions()
+
+        self.assertNotIn('WEB:temporary', watcher.sessions)
+        self.assertIs(watcher.sessions['real-child'], child)
+        self.assertEqual(child.conversation_id, 'real-child')
+        self.assertEqual(child.routing_session_id, 'root::worker')
+        self.assertEqual(child.pending_results, ['pending'])
+        self.assertEqual(child.seen_fingerprints, set())
+        self.assertIs(watcher.sessions_by_routing_id['root::worker'], child)
+        interface.valid_request.assert_not_called()
+
+    def test_subagent_uses_derived_session_and_composed_prompt(self) -> None:
+        interface = mock.Mock()
+        child = web.WebSession(
+            'child-conversation',
+            'subagent:worker2',
+            FakePage('https' + '://chatgpt.com/c/child-conversation'),
+        )
+        interface.create_conversation.return_value = child
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            bootstrap_prompt_for_session=lambda session: f'BOOTSTRAP {session}',
+        )
+        parent = web.WebSession(
+            'parent-conversation',
+            'Parent',
+            mock.Mock(),
+            routing_session_id='root',
+        )
+        watcher.sessions[parent.conversation_id] = parent
+        watcher.sessions_by_routing_id['root'] = parent
+
+        result = watcher.execute_orchestration_tool(
+            parent,
+            'root',
+            {'id': 's', 'tool': 'subagent', 'name': 'worker2', 'prompt': 'Investigate this'},
+            0,
+        )
+
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['session'], 'root::worker2')
+        self.assertIs(watcher.sessions_by_routing_id['root::worker2'], child)
+        interface.create_conversation.assert_called_once_with(
+            origin=parent,
+            label='subagent:worker2',
+            prompt='Investigate this\n\n---\n\nBOOTSTRAP root::worker2',
+        )
+
+    def test_duplicate_subagent_session_is_rejected(self) -> None:
+        interface = mock.Mock()
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            bootstrap_prompt_for_session=lambda session: f'BOOTSTRAP {session}',
+        )
+        existing = web.WebSession('child', 'Child', mock.Mock(), routing_session_id='root::worker2')
+        watcher.sessions_by_routing_id['root::worker2'] = existing
+        result = watcher.execute_orchestration_tool(
+            web.WebSession('parent', 'Parent', mock.Mock(), routing_session_id='root'),
+            'root',
+            {'id': 's', 'tool': 'subagent', 'name': 'worker2', 'prompt': 'Again'},
+            0,
+        )
+        self.assertFalse(result['ok'])
+        self.assertIn('already exists', result['error'])
+        interface.create_conversation.assert_not_called()
+
+    def test_handoff_queues_result_on_immediate_parent(self) -> None:
+        watcher = web.WebSessionWatcher(
+            mock.Mock(),
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+        root = web.WebSession('root-c', 'Root', mock.Mock(), routing_session_id='root')
+        parent = web.WebSession('parent-c', 'Parent', mock.Mock(), routing_session_id='root::a')
+        child = web.WebSession('child-c', 'Child', mock.Mock(), routing_session_id='root::a::b')
+        watcher.sessions_by_routing_id = {
+            'root': root,
+            'root::a': parent,
+            'root::a::b': child,
+        }
+
+        result = watcher.execute_orchestration_tool(
+            child,
+            'root::a::b',
+            {'id': 'h', 'tool': 'handoff', 'result': 'nested result'},
+            0,
+        )
+
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['parent_session'], 'root::a')
+        self.assertEqual(root.pending_results, [])
+        self.assertEqual(len(parent.pending_results), 1)
+        self.assertIn('nested result', parent.pending_results[0])
+
+    def test_root_handoff_is_rejected(self) -> None:
+        watcher = web.WebSessionWatcher(
+            mock.Mock(),
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+        result = watcher.execute_orchestration_tool(
+            web.WebSession('root-c', 'Root', mock.Mock(), routing_session_id='root'),
+            'root',
+            {'id': 'h', 'tool': 'handoff', 'result': 'no parent'},
+            0,
+        )
+        self.assertFalse(result['ok'])
+        self.assertIn('no parent', result['error'])
 
     def test_new_session_primes_existing_request_without_executing_it(self) -> None:
         interface = mock.Mock()
@@ -241,6 +412,65 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertEqual(session.pending_results, [])
         self.assertEqual(session.pending_fallbacks, [])
         self.assertEqual(session.delivered, 1)
+
+    def test_post_submit_too_long_error_queues_compact_retry_without_reexecution(self) -> None:
+        interface = mock.Mock()
+        interface.latest_too_long_error_id.return_value = 'error-1'
+        execute = mock.Mock(return_value={'id': 'x', 'tool': 'status', 'ok': True})
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=execute,
+            fenced_result=lambda result: 'FULL',
+            too_long_fallback=lambda request, result: 'COMPACT',
+            settle_seconds=0.0,
+        )
+        session = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            settling_fingerprint='fp',
+            settle_deadline=0.0,
+        )
+        interface.valid_request.return_value = ('{}', {'id': 'x', 'tool': 'status'}, 'fp')
+
+        self.assertTrue(watcher.scan_session(session, 0.0))
+        self.assertTrue(watcher.deliver_session(session, 0.0))
+        self.assertEqual(session.last_submitted_fallbacks, ['COMPACT'])
+        self.assertTrue(watcher.recover_rejected_submission(session))
+        self.assertEqual(session.pending_results, ['COMPACT'])
+        self.assertEqual(session.pending_fallbacks, ['COMPACT'])
+        execute.assert_called_once_with({'id': 'x', 'tool': 'status'}, announce=True)
+
+        # The same rendered error must not enqueue the compact result repeatedly.
+        session.pending_results.clear()
+        session.pending_fallbacks.clear()
+        session.last_submitted_fallbacks = ['COMPACT']
+        self.assertFalse(watcher.recover_rejected_submission(session))
+        self.assertEqual(session.pending_results, [])
+        self.assertEqual(session.pending_fallbacks, [])
+
+    def test_existing_too_long_error_is_baselined_when_tab_attaches(self) -> None:
+        interface = mock.Mock()
+        page = FakePage('https' + '://chatgpt.com/c/a', title='Cats')
+        interface.pages.return_value = [page]
+        interface.describe_page.return_value = ('a', 'Cats')
+        interface.valid_request.return_value = None
+        interface.latest_too_long_error_id.return_value = 'existing-error'
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+
+        watcher.refresh_sessions()
+        session = watcher.sessions['a']
+        session.last_submitted_fallbacks = ['COMPACT']
+        self.assertEqual(session.last_too_long_error_id, 'existing-error')
+        self.assertFalse(watcher.recover_rejected_submission(session))
+        self.assertEqual(session.pending_results, [])
 
 
 if __name__ == '__main__':

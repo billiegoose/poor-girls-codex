@@ -16,6 +16,7 @@ DEFAULT_SETTLE_SECONDS = 0.35
 DEFAULT_POLL_SECONDS = 0.25
 DELIVERY_RETRY_INITIAL_SECONDS = 0.25
 DELIVERY_RETRY_MAX_SECONDS = 8.0
+MESSAGE_TOO_LONG_TEXT = 'The message you submitted was too long, please edit it and resubmit.'
 
 
 class MessageTooLongError(RuntimeError):
@@ -30,11 +31,14 @@ class WebSession:
     seen_fingerprints: set[str] = field(default_factory=set)
     pending_results: list[str] = field(default_factory=list)
     pending_fallbacks: list[str] = field(default_factory=list)
+    last_submitted_fallbacks: list[str] = field(default_factory=list)
+    last_too_long_error_id: str | None = None
     settling_fingerprint: str | None = None
     settle_deadline: float = 0.0
     delivery_attempt: int = 0
     next_delivery_at: float = 0.0
     delivered: int = 0
+    routing_session_id: str | None = None
 
     @property
     def url(self) -> str:
@@ -165,6 +169,17 @@ class ChatGPTWeb:
             button = session.page.get_by_role('button', name='Send prompt')
         return button.count() > 0 and button.last.is_enabled()
 
+    def latest_too_long_error_id(self, session: WebSession) -> str | None:
+        matches = session.page.get_by_text(MESSAGE_TOO_LONG_TEXT, exact=True)
+        for index in range(matches.count() - 1, -1, -1):
+            match = matches.nth(index)
+            if not match.is_visible():
+                continue
+            return match.evaluate(
+                "e => e.closest('[data-message-author-role=\\\"assistant\\\"]')?.getAttribute('data-message-id') || null"
+            )
+        return None
+
     def submit(self, session: WebSession, text: str) -> None:
         self.set_composer_text(session, text)
         button = session.page.locator(SEND_SELECTOR)
@@ -178,6 +193,29 @@ class ChatGPTWeb:
             raise RuntimeError(f'{session.label}: ChatGPT send button is not available')
         button.last.click()
 
+    def create_conversation(
+        self,
+        *,
+        origin: WebSession,
+        label: str,
+        prompt: str,
+    ) -> WebSession:
+        page = origin.page.context.new_page()
+        try:
+            page.goto('https' + '://chatgpt.com/', wait_until='domcontentloaded')
+            page.locator(COMPOSER_SELECTOR).last.wait_for(state='visible', timeout=15_000)
+            pending = WebSession('', label, page)
+            self.submit(pending, prompt)
+            page.wait_for_url(
+                lambda url: self.conversation_id_for_url(str(url)) is not None,
+                timeout=30_000,
+            )
+            conversation_id, _ = self.describe_page(page)
+            return WebSession(conversation_id, label, page)
+        except Exception:
+            page.close()
+            raise
+
 
 class WebSessionWatcher:
     """Round-robin scheduler with isolated durable state for each ChatGPT tab."""
@@ -190,6 +228,8 @@ class WebSessionWatcher:
         execute_request: Callable[..., Any],
         fenced_result: Callable[[Any], str],
         too_long_fallback: Callable[[Any, Any], str],
+        root_session_id: str | None = None,
+        bootstrap_prompt_for_session: Callable[[str], str] | None = None,
         settle_seconds: float = DEFAULT_SETTLE_SECONDS,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
@@ -199,10 +239,107 @@ class WebSessionWatcher:
         self.execute_request = execute_request
         self.fenced_result = fenced_result
         self.too_long_fallback = too_long_fallback
+        self.root_session_id = root_session_id
+        self.bootstrap_prompt_for_session = bootstrap_prompt_for_session
         self.settle_seconds = settle_seconds
         self.poll_seconds = poll_seconds
         self.clock = clock
         self.sessions: dict[str, WebSession] = {}
+        self.sessions_by_routing_id: dict[str, WebSession] = {}
+
+    @staticmethod
+    def request_session_id(request: Any) -> str | None:
+        if isinstance(request, dict) and isinstance(request.get('session'), str):
+            return request['session']
+        return None
+
+    @staticmethod
+    def request_calls(request: Any) -> list[Any]:
+        if isinstance(request, dict) and isinstance(request.get('calls'), list):
+            return request['calls']
+        return [request]
+
+    def bind_routing_session(self, session: WebSession, routing_session_id: str) -> None:
+        existing = self.sessions_by_routing_id.get(routing_session_id)
+        if existing is not None and existing is not session:
+            raise RuntimeError(
+                f'PGC session {routing_session_id!r} is already bound to another conversation'
+            )
+        if session.routing_session_id not in (None, routing_session_id):
+            raise RuntimeError(
+                f'{session.label} changed PGC session from {session.routing_session_id!r} '
+                f'to {routing_session_id!r}'
+            )
+        session.routing_session_id = routing_session_id
+        self.sessions_by_routing_id[routing_session_id] = session
+
+    def execute_orchestration_tool(
+        self,
+        origin: WebSession,
+        routing_session_id: str,
+        call: dict[str, Any],
+        index: int,
+    ) -> dict[str, Any]:
+        tool = call.get('tool')
+        call_id = call.get('id', str(index))
+        base = {'id': call_id, 'tool': tool}
+
+        if tool == 'subagent':
+            if self.bootstrap_prompt_for_session is None:
+                return {**base, 'ok': False, 'error': 'subagents are unavailable in this watcher'}
+            name = call['name']
+            child_session_id = f'{routing_session_id}::{name}'
+            if child_session_id in self.sessions_by_routing_id:
+                return {
+                    **base,
+                    'ok': False,
+                    'error': f'subagent session already exists: {child_session_id}',
+                }
+            prompt = (
+                call['prompt']
+                + '\n\n---\n\n'
+                + self.bootstrap_prompt_for_session(child_session_id)
+            )
+            child = self.interface.create_conversation(
+                origin=origin,
+                label=f'subagent:{name}',
+                prompt=prompt,
+            )
+            child.routing_session_id = child_session_id
+            self.sessions[child.conversation_id] = child
+            self.sessions_by_routing_id[child_session_id] = child
+            return {
+                **base,
+                'ok': True,
+                'name': name,
+                'session': child_session_id,
+                'conversation_id': child.conversation_id,
+                'url': child.url,
+            }
+
+        if tool == 'handoff':
+            if '::' not in routing_session_id:
+                return {**base, 'ok': False, 'error': 'root session has no parent to hand off to'}
+            parent_session_id = routing_session_id.rsplit('::', 1)[0]
+            parent = self.sessions_by_routing_id.get(parent_session_id)
+            if parent is None:
+                return {
+                    **base,
+                    'ok': False,
+                    'error': f'parent session is not attached: {parent_session_id}',
+                }
+            message = (
+                f'Subagent {routing_session_id} handed off its result:\n\n'
+                + call['result'].rstrip()
+                + '\n'
+            )
+            parent.pending_results.append(message)
+            parent.pending_fallbacks.append(message)
+            return {**base, 'ok': True, 'parent_session': parent_session_id}
+
+        from toolcall_lib import execute
+
+        return execute(call, index)
 
     def refresh_sessions(self, *, prime_new: bool = True) -> None:
         live: set[str] = set()
@@ -211,13 +348,34 @@ class WebSessionWatcher:
             live.add(conversation_id)
             session = self.sessions.get(conversation_id)
             if session is None:
-                session = WebSession(conversation_id=conversation_id, label=label, page=page)
-                self.sessions[conversation_id] = session
-                if prime_new:
-                    existing = self.interface.valid_request(session, self.validate_request)
-                    if existing is not None:
-                        session.seen_fingerprints.add(existing[2])
-                print(f'  [web] attached {session.label} ({conversation_id[:8]})', flush=True)
+                previous_id = next(
+                    (
+                        existing_id
+                        for existing_id, existing_session in self.sessions.items()
+                        if existing_session.page == page
+                    ),
+                    None,
+                )
+                if previous_id is not None:
+                    session = self.sessions.pop(previous_id)
+                    session.conversation_id = conversation_id
+                    session.page = page
+                    session.label = label
+                    self.sessions[conversation_id] = session
+                    print(
+                        f'  [web] rekeyed {session.label} '
+                        f'({previous_id[:8]} -> {conversation_id[:8]})',
+                        flush=True,
+                    )
+                else:
+                    session = WebSession(conversation_id=conversation_id, label=label, page=page)
+                    session.last_too_long_error_id = self.interface.latest_too_long_error_id(session)
+                    self.sessions[conversation_id] = session
+                    if prime_new:
+                        existing = self.interface.valid_request(session, self.validate_request)
+                        if existing is not None:
+                            session.seen_fingerprints.add(existing[2])
+                    print(f'  [web] attached {session.label} ({conversation_id[:8]})', flush=True)
             else:
                 session.page = page
                 session.label = label
@@ -225,6 +383,8 @@ class WebSessionWatcher:
         for conversation_id in list(self.sessions):
             if conversation_id not in live:
                 session = self.sessions.pop(conversation_id)
+                if session.routing_session_id is not None:
+                    self.sessions_by_routing_id.pop(session.routing_session_id, None)
                 print(f'  [web] detached {session.label} ({conversation_id[:8]})', flush=True)
 
     def scan_session(self, session: WebSession, now: float) -> bool:
@@ -234,6 +394,12 @@ class WebSessionWatcher:
             return False
 
         _, request, fingerprint = candidate
+        routing_session_id = self.request_session_id(request)
+        if routing_session_id is None:
+            if self.root_session_id is not None:
+                return False
+        else:
+            self.bind_routing_session(session, routing_session_id)
         if fingerprint in session.seen_fingerprints:
             session.settling_fingerprint = None
             return False
@@ -250,9 +416,47 @@ class WebSessionWatcher:
         session.seen_fingerprints.add(fingerprint)
         session.settling_fingerprint = None
         print(f'  [web:{session.label}] tool calls:', flush=True)
-        result = self.execute_request(request, announce=True)
+        calls = self.request_calls(request)
+        has_orchestration = any(
+            isinstance(call, dict) and call.get('tool') in {'subagent', 'handoff'}
+            for call in calls
+        )
+        if has_orchestration:
+            if routing_session_id is None:
+                raise RuntimeError('web orchestration tool call is missing its PGC session id')
+            result = self.execute_request(
+                request,
+                announce=True,
+                tool_executor=lambda call, index: self.execute_orchestration_tool(
+                    session,
+                    routing_session_id,
+                    call,
+                    index,
+                ),
+            )
+        else:
+            result = self.execute_request(request, announce=True)
         session.pending_results.append(self.fenced_result(result))
         session.pending_fallbacks.append(self.too_long_fallback(request, result))
+        return True
+
+    def recover_rejected_submission(self, session: WebSession) -> bool:
+        error_id = self.interface.latest_too_long_error_id(session)
+        if error_id is None or error_id == session.last_too_long_error_id:
+            return False
+        session.last_too_long_error_id = error_id
+        if not session.last_submitted_fallbacks:
+            return False
+
+        compact = list(session.last_submitted_fallbacks)
+        session.last_submitted_fallbacks.clear()
+        session.pending_results = compact + session.pending_results
+        session.pending_fallbacks = compact + session.pending_fallbacks
+        print(
+            f'  [web:{session.label}] ChatGPT rejected submitted results as too long; '
+            'queued compact retry',
+            flush=True,
+        )
         return True
 
     def deliver_session(self, session: WebSession, now: float) -> bool:
@@ -281,6 +485,7 @@ class WebSessionWatcher:
                     flush=True,
                 )
                 return False
+            session.last_submitted_fallbacks.clear()
         except RuntimeError as exc:
             delay = min(
                 DELIVERY_RETRY_INITIAL_SECONDS * (2**session.delivery_attempt),
@@ -293,6 +498,8 @@ class WebSessionWatcher:
                 flush=True,
             )
             return False
+        else:
+            session.last_submitted_fallbacks = list(session.pending_fallbacks)
 
         session.pending_results.clear()
         session.pending_fallbacks.clear()
@@ -311,6 +518,7 @@ class WebSessionWatcher:
         # redirect another tab's state, and simultaneous model turns are observed fairly.
         for session in list(self.sessions.values()):
             try:
+                progressed = self.recover_rejected_submission(session) or progressed
                 progressed = self.scan_session(session, now) or progressed
             except Exception as exc:
                 print(f'  [web:{session.label}] scan error: {exc}', flush=True)
@@ -364,6 +572,7 @@ def run_web_watcher(
     execute_request: Callable[..., Any],
     fenced_result: Callable[[Any], str],
     too_long_fallback: Callable[[Any, Any], str],
+    bootstrap_prompt_for_session: Callable[[str], str] | None = None,
 ) -> None:
     interface = ChatGPTWeb(cdp_url)
     interface.connect()
@@ -374,6 +583,8 @@ def run_web_watcher(
             execute_request=execute_request,
             fenced_result=fenced_result,
             too_long_fallback=too_long_fallback,
+            root_session_id=session_id,
+            bootstrap_prompt_for_session=bootstrap_prompt_for_session,
         ).run()
     finally:
         interface.close()

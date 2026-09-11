@@ -68,17 +68,52 @@ class InterfaceSelectionTests(unittest.TestCase):
             )
             self.assertEqual(ignored.returncode, 0)
 
-    def test_web_session_validation_requires_exact_session(self) -> None:
+    def test_web_session_validation_accepts_current_session_and_descendants(self) -> None:
         pgc.validate_web_session_request({'session': 'abc', 'id': 'x', 'tool': 'status'}, 'abc')
+        pgc.validate_web_session_request({'session': 'abc::child', 'id': 'x', 'tool': 'status'}, 'abc')
+        pgc.validate_web_session_request({'session': 'abc::child::grandchild', 'id': 'x', 'tool': 'status'}, 'abc')
         with self.assertRaisesRegex(ValueError, 'different PGC session'):
             pgc.validate_web_session_request({'session': 'other', 'id': 'x', 'tool': 'status'}, 'abc')
         with self.assertRaisesRegex(ValueError, 'different PGC session'):
+            pgc.validate_web_session_request({'session': 'abcd', 'id': 'x', 'tool': 'status'}, 'abc')
+        with self.assertRaisesRegex(ValueError, 'different PGC session'):
             pgc.validate_web_session_request({'id': 'x', 'tool': 'status'}, 'abc')
 
-    def test_web_bootstrap_requires_session_on_every_executable_request(self) -> None:
+    def test_web_bootstrap_describes_session_tree_routing(self) -> None:
         prompt = pgc.web_bootstrap_prompt('abc123')
         self.assertIn('"session": "abc123"', prompt)
-        self.assertIn('Requests without this exact session value are inert', prompt)
+        self.assertIn('abc123::', prompt)
+        self.assertIn('subagent {name,prompt}', prompt)
+        self.assertIn('handoff {result}', prompt)
+        self.assertIn('Requests outside that session tree are inert', prompt)
+        self.assertNotIn('subagent {name,prompt}', pgc.BOOTSTRAP_PROMPT)
+
+    def test_subagent_and_handoff_validation(self) -> None:
+        pgc.validate_web_session_request(
+            {'session': 'abc', 'id': 's', 'tool': 'subagent', 'name': 'worker2', 'prompt': 'Do work'},
+            'abc',
+        )
+        pgc.validate_web_session_request(
+            {'session': 'abc', 'id': 'h', 'tool': 'handoff', 'result': 'Done'},
+            'abc',
+        )
+        with self.assertRaisesRegex(ValueError, 'unsupported tool'):
+            pgc.validate_request({'id': 's', 'tool': 'subagent', 'name': 'worker2', 'prompt': 'Do work'})
+        with self.assertRaisesRegex(ValueError, 'alphanumeric'):
+            pgc.validate_web_session_request(
+                {'session': 'abc', 'id': 's', 'tool': 'subagent', 'name': 'worker-two', 'prompt': 'Do work'},
+                'abc',
+            )
+        with self.assertRaisesRegex(ValueError, 'non-empty'):
+            pgc.validate_web_session_request(
+                {'session': 'abc', 'id': 's', 'tool': 'subagent', 'name': 'worker2', 'prompt': ''},
+                'abc',
+            )
+        with self.assertRaisesRegex(ValueError, 'non-empty'):
+            pgc.validate_web_session_request(
+                {'session': 'abc', 'id': 'h', 'tool': 'handoff', 'result': ''},
+                'abc',
+            )
 
     def test_web_execution_strips_session_from_single_call(self) -> None:
         with mock.patch.object(pgc.toolcall_lib, 'execute', return_value={'ok': True}) as execute:
