@@ -254,7 +254,7 @@ def load_or_create_session_id(cwd: str = ".") -> str:
 
 
 def web_bootstrap_prompt(session_id: str) -> str:
-    return BOOTSTRAP_PROMPT + f'''\n\nAdditional chatgpt-web tools:\n- subagent {{name,prompt}} - create a fresh ChatGPT subagent conversation; name must be alphanumeric.\n- handoff {{result}} - send a completed subagent result back to the immediate parent conversation.\n\nWeb session routing:\nEvery executable Poor Girl's Codex request MUST include the exact top-level field \"session\": \"{session_id}\". This applies to both single-call objects and {{\"calls\":[...]}} batches. This watcher accepts this session and descendant sessions beginning with \"{session_id}::\". Requests outside that session tree are inert and will be ignored. When merely discussing or showing example JSON, do not include this session value unless you intend the example to execute.'''
+    return BOOTSTRAP_PROMPT + f'''\n\nAdditional chatgpt-web tools:\n- subagent {{name,prompt}} - create a fresh ChatGPT subagent conversation; name may contain letters, digits, '-' and '_', and must start with a letter or digit.\n- handoff {{result}} - send a completed subagent result back to the immediate parent conversation.\n\nWeb session routing:\nEvery executable Poor Girl's Codex request MUST include the exact top-level field \"session\": \"{session_id}\". This applies to both single-call objects and {{\"calls\":[...]}} batches. This watcher accepts this session and descendant sessions beginning with \"{session_id}::\". Requests outside that session tree are inert and will be ignored. When merely discussing or showing example JSON, do not include this session value unless you intend the example to execute.'''
 
 
 def web_session_matches(session: Any, session_id: str) -> bool:
@@ -277,11 +277,17 @@ def execute_web_session_request(
     *,
     announce: bool = False,
     tool_executor=None,
+    progress_prefix: str | None = None,
 ) -> Any:
     validate_web_session_request(request, session_id)
     executable = dict(request)
     executable.pop("session", None)
-    return execute_request(executable, announce=announce, tool_executor=tool_executor)
+    return execute_request(
+        executable,
+        announce=announce,
+        tool_executor=tool_executor,
+        progress_prefix=progress_prefix,
+    )
 
 
 def latest_assistant_toolcall(root):
@@ -353,8 +359,11 @@ def validate_request(request: Any, *, supported_tools: set[str] = LOCAL_TOOLS) -
         if tool == "subagent":
             name = call.get("name")
             prompt = call.get("prompt")
-            if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9]+", name) is None:
-                raise ValueError(f"call {index} subagent name must be alphanumeric")
+            if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) is None:
+                raise ValueError(
+                    f"call {index} subagent name must start with an alphanumeric character "
+                    "and contain only alphanumerics, '-' or '_'"
+                )
             if not isinstance(prompt, str) or not prompt.strip():
                 raise ValueError(f"call {index} subagent prompt must be a non-empty string")
         if tool == "handoff":
@@ -365,7 +374,13 @@ def validate_request(request: Any, *, supported_tools: set[str] = LOCAL_TOOLS) -
             raise ValueError(f"call {index} stop_on_error must be a boolean")
 
 
-def tool_call_line(call: Any, index: int, status: str | None = None) -> str:
+def tool_call_line(
+    call: Any,
+    index: int,
+    status: str | None = None,
+    *,
+    prefix: str | None = None,
+) -> str:
     if isinstance(call, dict):
         tool_name = f"{str(call.get('tool', '?')):<8}"
         call_id = str(call.get('id', index))
@@ -373,7 +388,8 @@ def tool_call_line(call: Any, index: int, status: str | None = None) -> str:
         tool_name = f"{'?':<8}"
         call_id = str(index)
 
-    line = f"  {color('>', '1;35')} {color(tool_name, '1;36')} {color(call_id, '1')}"
+    leader = f"{prefix} " if prefix else "  "
+    line = f"{leader}{color('>', '1;35')} {color(tool_name, '1;36')} {color(call_id, '1')}"
     if status is not None:
         status_code = "1;32" if status == "done" else "1;33"
         line += f" {color(f'[{status}]', status_code)}"
@@ -381,27 +397,39 @@ def tool_call_line(call: Any, index: int, status: str | None = None) -> str:
 
 
 class ToolCallProgress:
-    def __init__(self, calls: list[Any]) -> None:
+    def __init__(self, calls: list[Any], *, prefix: str | None = None) -> None:
         self.calls = calls
+        self.prefix = prefix
         self.statuses: list[str | None] = [None] * len(calls)
-        self.rendered = False
+        self.active_index: int | None = None
 
     def render(self) -> None:
-        lines = [tool_call_line(call, index, self.statuses[index]) for index, call in enumerate(self.calls)]
-        if self.rendered and sys.stdout.isatty() and lines:
-            sys.stdout.write(f"\033[{len(lines)}A")
-            for line in lines:
-                sys.stdout.write(f"\r\033[2K{line}\n")
-            sys.stdout.flush()
-            return
-
-        for line in lines:
-            print(line, flush=True)
-        self.rendered = True
+        for index, call in enumerate(self.calls):
+            print(tool_call_line(call, index, prefix=self.prefix), flush=True)
 
     def set_status(self, index: int, status: str) -> None:
         self.statuses[index] = status
-        self.render()
+        line = tool_call_line(self.calls[index], index, status, prefix=self.prefix)
+
+        if not sys.stdout.isatty():
+            print(line, flush=True)
+            return
+
+        if status == "running":
+            if self.active_index is not None:
+                sys.stdout.write("\n")
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            self.active_index = index
+            return
+
+        if self.active_index == index:
+            sys.stdout.write(f"\r\033[2K{line}\n")
+            sys.stdout.flush()
+            self.active_index = None
+            return
+
+        print(line, flush=True)
 
 
 def skipped_result(call: Any, index: int) -> dict[str, Any]:
@@ -420,7 +448,13 @@ def skipped_result(call: Any, index: int) -> dict[str, Any]:
     }
 
 
-def execute_request(request: Any, *, announce: bool = False, tool_executor=None) -> Any:
+def execute_request(
+    request: Any,
+    *,
+    announce: bool = False,
+    tool_executor=None,
+    progress_prefix: str | None = None,
+) -> Any:
     calls, top_level_stop_on_error, single, top_level_stop_present = request_calls(request)
     if top_level_stop_present:
         print(
@@ -429,9 +463,7 @@ def execute_request(request: Any, *, announce: bool = False, tool_executor=None)
             flush=True,
         )
 
-    progress = ToolCallProgress(calls) if announce else None
-    if progress is not None:
-        progress.render()
+    progress = ToolCallProgress(calls, prefix=progress_prefix) if announce else None
 
     results = []
     stopped = False
@@ -594,7 +626,11 @@ def latest_valid_request(root):
 def show_startup_ui(bootstrap_prompt: str, *, clipboard_write) -> None:
     border = "+================================================================+"
     print(color(border, "1;36"))
-    print(color("|                     POOR GIRL'S CODEX                          |", "1;35"))
+    print(
+        color("|", "36")
+        + color("                     POOR GIRL'S CODEX                          ", "1;35")
+        + color("|", "36")
+    )
     print(color("|                the hacky ChatGPT coding harness                |", "36"))
     print(color(border, "1;36"))
     print()
@@ -762,11 +798,12 @@ def main() -> None:
             session_id=session_id,
             bootstrap_prompt=bootstrap_prompt,
             validate_request=lambda request: validate_web_session_request(request, session_id),
-            execute_request=lambda request, announce=False, tool_executor=None: execute_web_session_request(
+            execute_request=lambda request, announce=False, tool_executor=None, progress_prefix=None: execute_web_session_request(
                 request,
                 session_id,
                 announce=announce,
                 tool_executor=tool_executor,
+                progress_prefix=progress_prefix,
             ),
             fenced_result=fenced_result,
             too_long_fallback=too_long_fallback_for_request,

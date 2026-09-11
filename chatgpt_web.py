@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -17,6 +18,7 @@ DEFAULT_POLL_SECONDS = 0.25
 DELIVERY_RETRY_INITIAL_SECONDS = 0.25
 DELIVERY_RETRY_MAX_SECONDS = 8.0
 MESSAGE_TOO_LONG_TEXT = 'The message you submitted was too long, please edit it and resubmit.'
+SUBAGENT_COLOR_CODES = ('1;34', '1;35', '1;36', '1;33', '1;32')
 
 
 class MessageTooLongError(RuntimeError):
@@ -263,6 +265,29 @@ class WebSessionWatcher:
             return request['calls']
         return [request]
 
+    def subagent_name(self, routing_session_id: str | None) -> str | None:
+        if routing_session_id is None or self.root_session_id is None:
+            return None
+        if routing_session_id == self.root_session_id:
+            return None
+        root_prefix = self.root_session_id + '::'
+        if not routing_session_id.startswith(root_prefix):
+            return None
+        return routing_session_id.rsplit('::', 1)[-1]
+
+    @staticmethod
+    def color_subagent(name: str) -> str:
+        label = f'[{name}]'
+        if not sys.stdout.isatty():
+            return label
+        digest = hashlib.sha256(name.encode('utf-8')).digest()
+        code = SUBAGENT_COLOR_CODES[digest[0] % len(SUBAGENT_COLOR_CODES)]
+        return f'\033[{code}m{label}\033[0m'
+
+    def progress_prefix(self, routing_session_id: str | None) -> str | None:
+        name = self.subagent_name(routing_session_id)
+        return self.color_subagent(name) if name is not None else None
+
     def bind_routing_session(self, session: WebSession, routing_session_id: str) -> None:
         existing = self.sessions_by_routing_id.get(routing_session_id)
         if existing is not None and existing is not session:
@@ -366,11 +391,6 @@ class WebSessionWatcher:
                     session.page = page
                     session.label = label
                     self.sessions[conversation_id] = session
-                    print(
-                        f'  [web] rekeyed {session.label} '
-                        f'({previous_id[:8]} -> {conversation_id[:8]})',
-                        flush=True,
-                    )
                 else:
                     session = WebSession(conversation_id=conversation_id, label=label, page=page)
                     session.last_too_long_error_id = self.interface.latest_too_long_error_id(session)
@@ -378,8 +398,11 @@ class WebSessionWatcher:
                     if prime_new:
                         existing = self.interface.valid_request(session, self.validate_request)
                         if existing is not None:
-                            session.seen_fingerprints.add(existing[2])
-                    print(f'  [web] attached {session.label} ({conversation_id[:8]})', flush=True)
+                            _, request, fingerprint = existing
+                            routing_session_id = self.request_session_id(request)
+                            if routing_session_id is not None:
+                                self.bind_routing_session(session, routing_session_id)
+                            session.seen_fingerprints.add(fingerprint)
             else:
                 session.page = page
                 session.label = label
@@ -389,7 +412,6 @@ class WebSessionWatcher:
                 session = self.sessions.pop(conversation_id)
                 if session.routing_session_id is not None:
                     self.sessions_by_routing_id.pop(session.routing_session_id, None)
-                print(f'  [web] detached {session.label} ({conversation_id[:8]})', flush=True)
 
     def scan_session(self, session: WebSession, now: float) -> bool:
         candidate = self.interface.valid_request(session, self.validate_request)
@@ -419,27 +441,32 @@ class WebSessionWatcher:
         # Claim before execution. A failed delivery or repeated poll must never replay effects.
         session.seen_fingerprints.add(fingerprint)
         session.settling_fingerprint = None
-        print(f'  [web:{session.label}] tool calls:', flush=True)
         calls = self.request_calls(request)
         has_orchestration = any(
             isinstance(call, dict) and call.get('tool') in {'subagent', 'handoff'}
             for call in calls
         )
+        progress_prefix = self.progress_prefix(routing_session_id)
         if has_orchestration:
             if routing_session_id is None:
                 raise RuntimeError('web orchestration tool call is missing its PGC session id')
-            result = self.execute_request(
-                request,
-                announce=True,
-                tool_executor=lambda call, index: self.execute_orchestration_tool(
+            execute_kwargs = {
+                'announce': True,
+                'tool_executor': lambda call, index: self.execute_orchestration_tool(
                     session,
                     routing_session_id,
                     call,
                     index,
                 ),
-            )
+            }
+            if progress_prefix is not None:
+                execute_kwargs['progress_prefix'] = progress_prefix
+            result = self.execute_request(request, **execute_kwargs)
         else:
-            result = self.execute_request(request, announce=True)
+            execute_kwargs = {'announce': True}
+            if progress_prefix is not None:
+                execute_kwargs['progress_prefix'] = progress_prefix
+            result = self.execute_request(request, **execute_kwargs)
         session.pending_results.append(self.fenced_result(result))
         session.pending_fallbacks.append(self.too_long_fallback(request, result))
         return True
@@ -510,7 +537,6 @@ class WebSessionWatcher:
         session.delivery_attempt = 0
         session.next_delivery_at = 0.0
         session.delivered += 1
-        print(f'  [web:{session.label}] sent results', flush=True)
         return True
 
     def step(self) -> bool:
@@ -537,13 +563,12 @@ class WebSessionWatcher:
 
     def run(self) -> None:
         self.refresh_sessions()
-        print(
-            f'chatgpt-web watcher ready: {len(self.sessions)} conversation tab(s); '
-            'new conversation tabs are discovered automatically',
-            flush=True,
-        )
-        if not self.sessions:
-            print('  [web] waiting for a ChatGPT /c/... conversation tab', flush=True)
+        if self.root_session_id is not None:
+            print(f'PGC session: {self.root_session_id}', flush=True)
+            root = self.sessions_by_routing_id.get(self.root_session_id)
+            if root is not None:
+                print(f'attached {root.label} ({root.conversation_id[:8]})', flush=True)
+        print('chatgpt-web watcher ready', flush=True)
         try:
             while True:
                 progressed = self.step()

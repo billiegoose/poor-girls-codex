@@ -39,11 +39,21 @@ class ToolCallProgressTests(unittest.TestCase):
             "  > read     inspect-streaming-tests-for-completion-mocks\n",
         )
 
-    def test_tty_updates_redraw_full_call_list_with_statuses(self) -> None:
+    def test_progress_prefix_is_rendered_before_tool_marker(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch.object(pgc.sys, "stdout", stdout):
+            progress = pgc.ToolCallProgress(self.calls[:1], prefix="[closure-parity]")
+            progress.render()
+
+        self.assertEqual(
+            stdout.getvalue(),
+            "[closure-parity] > run      inspect-live-chatgpt-buttons-python\n",
+        )
+
+    def test_tty_progress_rewrites_each_running_row_in_place(self) -> None:
         stdout = FakeTTY()
         with mock.patch.object(pgc.sys, "stdout", stdout):
             progress = pgc.ToolCallProgress(self.calls)
-            progress.render()
             progress.set_status(0, "running")
             progress.set_status(0, "done")
             progress.set_status(1, "running")
@@ -55,7 +65,34 @@ class ToolCallProgressTests(unittest.TestCase):
         self.assertIn("inspect-live-chatgpt-buttons-python [done]", visible)
         self.assertIn("inspect-streaming-tests-for-completion-mocks [running]", visible)
         self.assertTrue(visible.endswith("inspect-streaming-tests-for-completion-mocks [done]\n"))
-        self.assertEqual(output.count("\x1b[2A"), 4)
+        self.assertEqual(output.count("\r\x1b[2K"), 2)
+        self.assertNotIn("\x1b[2A", output)
+
+    def test_prefixed_tty_progress_rewrites_same_row(self) -> None:
+        stdout = FakeTTY()
+        with mock.patch.object(pgc.sys, "stdout", stdout):
+            progress = pgc.ToolCallProgress(self.calls[:1], prefix="[closure-parity]")
+            progress.set_status(0, "running")
+            progress.set_status(0, "done")
+
+        output = stdout.getvalue()
+        visible = visible_text(output)
+        self.assertIn("[closure-parity] > run", visible)
+        self.assertIn("[running]", visible)
+        self.assertTrue(visible.endswith("[done]\n"))
+        self.assertEqual(output.count("\r\x1b[2K"), 1)
+
+    def test_non_tty_progress_remains_append_only(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch.object(pgc.sys, "stdout", stdout):
+            progress = pgc.ToolCallProgress(self.calls[:1])
+            progress.set_status(0, "running")
+            progress.set_status(0, "done")
+
+        output = stdout.getvalue()
+        self.assertIn("[running]\n", output)
+        self.assertTrue(output.endswith("[done]\n"))
+        self.assertNotIn("\r\x1b[2K", output)
 
     def test_tool_level_stop_on_error_skips_only_later_calls(self) -> None:
         calls = [

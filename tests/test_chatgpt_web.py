@@ -146,6 +146,35 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIsNot(watcher.sessions['a'].seen_fingerprints, watcher.sessions['b'].seen_fingerprints)
         self.assertIsNot(watcher.sessions['a'].pending_results, watcher.sessions['b'].pending_results)
 
+    def test_new_session_primes_and_binds_visible_root_without_executing(self) -> None:
+        interface = mock.Mock()
+        page = FakePage('https' + '://chatgpt.com/c/a', title='Cats')
+        interface.pages.return_value = [page]
+        interface.describe_page.return_value = ('a', 'Cats')
+        interface.latest_too_long_error_id.return_value = None
+        interface.valid_request.return_value = (
+            '{}',
+            {'session': 'root', 'tool': 'status'},
+            'visible-toolcall',
+        )
+        execute = mock.Mock()
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=execute,
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+        )
+
+        watcher.refresh_sessions()
+
+        session = watcher.sessions['a']
+        self.assertEqual(session.routing_session_id, 'root')
+        self.assertIs(watcher.sessions_by_routing_id['root'], session)
+        self.assertEqual(session.seen_fingerprints, {'visible-toolcall'})
+        execute.assert_not_called()
+
     def test_refresh_rekeys_same_page_when_temporary_conversation_id_changes(self) -> None:
         interface = mock.Mock()
         original_page = mock.Mock()
@@ -182,6 +211,29 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertEqual(child.seen_fingerprints, set())
         self.assertIs(watcher.sessions_by_routing_id['root::worker'], child)
         interface.valid_request.assert_not_called()
+
+    def test_root_session_has_no_progress_prefix(self) -> None:
+        watcher = web.WebSessionWatcher(
+            mock.Mock(),
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+        )
+        self.assertIsNone(watcher.progress_prefix('root'))
+
+    def test_subagent_progress_prefix_uses_leaf_name(self) -> None:
+        watcher = web.WebSessionWatcher(
+            mock.Mock(),
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+        )
+        with mock.patch.object(web.sys.stdout, 'isatty', return_value=False):
+            self.assertEqual(watcher.progress_prefix('root::parent::closure-parity'), '[closure-parity]')
 
     def test_subagent_uses_derived_session_and_composed_prompt(self) -> None:
         interface = mock.Mock()

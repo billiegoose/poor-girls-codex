@@ -88,6 +88,12 @@ class InterfaceSelectionTests(unittest.TestCase):
         self.assertIn('Requests outside that session tree are inert', prompt)
         self.assertNotIn('subagent {name,prompt}', pgc.BOOTSTRAP_PROMPT)
 
+    def test_hyphenated_subagent_name_is_valid(self) -> None:
+        pgc.validate_request(
+            {'tool': 'subagent', 'name': 'closure-parity', 'prompt': 'Review closures'},
+            supported_tools=pgc.SUPPORTED_TOOLS,
+        )
+
     def test_subagent_and_handoff_validation(self) -> None:
         pgc.validate_web_session_request(
             {'session': 'abc', 'id': 's', 'tool': 'subagent', 'name': 'worker2', 'prompt': 'Do work'},
@@ -99,9 +105,9 @@ class InterfaceSelectionTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, 'unsupported tool'):
             pgc.validate_request({'id': 's', 'tool': 'subagent', 'name': 'worker2', 'prompt': 'Do work'})
-        with self.assertRaisesRegex(ValueError, 'alphanumeric'):
+        with self.assertRaisesRegex(ValueError, 'contain only alphanumerics'):
             pgc.validate_web_session_request(
-                {'session': 'abc', 'id': 's', 'tool': 'subagent', 'name': 'worker-two', 'prompt': 'Do work'},
+                {'session': 'abc', 'id': 's', 'tool': 'subagent', 'name': 'worker two!', 'prompt': 'Do work'},
                 'abc',
             )
         with self.assertRaisesRegex(ValueError, 'non-empty'):
