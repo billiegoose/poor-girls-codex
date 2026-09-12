@@ -19,6 +19,7 @@ from enum import Enum, auto
 from typing import Any, Protocol
 
 import toolcall_lib
+from progress_ui import ResponseProgress
 
 
 POLL_SECONDS = 0.5
@@ -85,6 +86,7 @@ class CompletedBatch:
     results: list[Any]
     single: bool
     compact: bool = False
+    response_progress: ResponseProgress | None = None
 
     def render(self) -> str:
         if self.compact:
@@ -100,7 +102,14 @@ class WatcherState:
     pending_batches: list[CompletedBatch] = field(default_factory=list)
     last_submitted_batches: list[CompletedBatch] = field(default_factory=list)
 
-    def record_completed(self, fingerprint: str, request: Any, result: Any) -> None:
+    def record_completed(
+        self,
+        fingerprint: str,
+        request: Any,
+        result: Any,
+        *,
+        response_progress: ResponseProgress | None = None,
+    ) -> None:
         calls, _, single, _ = request_calls(request)
         results = [result] if single else list(result)
         self.pending_batches.append(
@@ -109,6 +118,7 @@ class WatcherState:
                 calls=list(calls),
                 results=results,
                 single=single,
+                response_progress=response_progress,
             )
         )
 
@@ -118,11 +128,32 @@ class WatcherState:
     def render_pending(self) -> str:
         return "\n".join(batch.render().rstrip("\n") for batch in self.pending_batches) + "\n"
 
+    def pending_response_progresses(self) -> list[ResponseProgress]:
+        return [
+            batch.response_progress
+            for batch in self.pending_batches
+            if batch.response_progress is not None
+        ]
+
+    def commit_pending_response_progress(self) -> None:
+        for progress in self.pending_response_progresses():
+            progress.commit()
+
+    def resolve_pending_response_progress(self) -> None:
+        for batch in self.pending_batches:
+            if batch.response_progress is None:
+                continue
+            status = "[sent summary]" if batch.compact else "[sent]"
+            batch.response_progress.set_status(status)
+
     def mark_submitted(self) -> None:
         self.last_submitted_batches = self.pending_batches
         self.pending_batches = []
 
     def acknowledge_last_submission(self) -> None:
+        for batch in self.last_submitted_batches:
+            if batch.response_progress is not None:
+                batch.response_progress.commit()
         self.last_submitted_batches = []
 
     def restore_last_submission_compact(self) -> None:
@@ -132,6 +163,8 @@ class WatcherState:
         self.last_submitted_batches = []
         for batch in restored:
             batch.compact = True
+            if batch.response_progress is not None:
+                batch.response_progress.set_status("Message too large [retry with summary]")
         self.pending_batches = restored + self.pending_batches
 
     def last_submission_key(self) -> str | None:
@@ -548,8 +581,13 @@ def paste_result_into_composer(
     *,
     send: bool,
     known_fingerprints: set[str] | None = None,
+    response_progresses: list[ResponseProgress] | None = None,
 ) -> DeliveryOutcome:
     interface = current_interface()
+
+    def set_response_status(status: str) -> None:
+        for progress in response_progresses or []:
+            progress.set_status(status)
     if not send:
         interface.set_composer_text(root, text)
         return DeliveryOutcome.SENT
@@ -592,11 +630,16 @@ def paste_result_into_composer(
             SEND_RETRY_INITIAL_SECONDS * (2**attempt),
             SEND_RETRY_MAX_SECONDS,
         )
-        print(
-            "  watcher warning: frontend is not ready to submit the result; "
-            f"retrying in {delay:g}s",
-            flush=True,
-        )
+        if response_progresses:
+            set_response_status(
+                f"ChatGPT send button is not available [retry in {delay:g}s]"
+            )
+        else:
+            print(
+                "  watcher warning: frontend is not ready to submit the result; "
+                f"retrying in {delay:g}s",
+                flush=True,
+            )
 
         if known_fingerprints is None:
             time.sleep(delay)
@@ -682,11 +725,6 @@ def watch_loop() -> None:
                     if submission_key is not None and handled_too_long_for != submission_key:
                         handled_too_long_for = submission_key
                         state.restore_last_submission_compact()
-                        print(
-                            "  watcher warning: ChatGPT rejected tool results as too long; "
-                            "queued a compact retry while retaining completed results",
-                            flush=True,
-                        )
                 too_long_visible = current_too_long_visible
 
                 candidate = latest_valid_request(root)
@@ -711,9 +749,19 @@ def watch_loop() -> None:
                         # twice merely because delivery later fails or is interrupted.
                         state.seen_fingerprints.add(fingerprint)
                         state.phase = WatcherPhase.EXECUTING
-                        print(color("tool calls", "1;35") + ":", flush=True)
+                        state.commit_pending_response_progress()
+                        ResponseProgress.commit_live()
+                        print(flush=True)
+                        print(color("tool calls:", "1;35"), flush=True)
                         result = execute_request(request, announce=True)
-                        state.record_completed(fingerprint, request, result)
+                        response_progress = ResponseProgress()
+                        state.record_completed(
+                            fingerprint,
+                            request,
+                            result,
+                            response_progress=response_progress,
+                        )
+                        response_progress.set_status("[pending]")
                         handled_too_long_for = None
 
                         # Rescan before delivery. If another request appeared while
@@ -731,16 +779,15 @@ def watch_loop() -> None:
                         rendered,
                         send=True,
                         known_fingerprints=state.seen_fingerprints,
+                        response_progresses=state.pending_response_progresses(),
                     )
                     if outcome is DeliveryOutcome.INTERRUPTED:
-                        print(
-                            "  delivery interrupted by new tool calls; retaining completed results",
-                            flush=True,
-                        )
+                        for progress in state.pending_response_progresses():
+                            progress.set_status("[pending]")
                         continue
 
+                    state.resolve_pending_response_progress()
                     state.mark_submitted()
-                    print(f"  {color('OK', '1;32')} sent results\n", flush=True)
                     continue
 
                 time.sleep(POLL_SECONDS)
@@ -770,8 +817,8 @@ def main() -> None:
     parser.add_argument(
         "--interface",
         choices=("chatgpt-macos", "chatgpt-web"),
-        default="chatgpt-macos",
-        help="model-facing interface to use (default: chatgpt-macos)",
+        default="chatgpt-web",
+        help="model-facing interface to use (default: chatgpt-web)",
     )
     parser.add_argument(
         "--cdp-url",

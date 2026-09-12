@@ -94,6 +94,66 @@ class ToolCallProgressTests(unittest.TestCase):
         self.assertTrue(output.endswith("[done]\n"))
         self.assertNotIn("\r\x1b[2K", output)
 
+    def test_response_status_colors_sent_green_on_tty(self) -> None:
+        stdout = FakeTTY()
+        with mock.patch.object(pgc.sys, "stdout", stdout):
+            progress = pgc.ResponseProgress()
+            progress.set_status("[sent]")
+            progress.commit()
+
+        self.assertIn("\x1b[1;32m[sent]\x1b[0m", stdout.getvalue())
+
+    def test_response_progress_rewrites_live_tty_row(self) -> None:
+        stdout = FakeTTY()
+        with mock.patch.object(pgc.sys, "stdout", stdout):
+            progress = pgc.ResponseProgress()
+            progress.set_status("[pending]")
+            progress.set_status("ChatGPT send button is not available [retry in 0.25s]")
+            progress.set_status("[sent]")
+            progress.commit()
+
+        output = stdout.getvalue()
+        visible = visible_text(output)
+        self.assertIn("response   [pending]", visible)
+        self.assertIn(
+            "response   ChatGPT send button is not available [retry in 0.25s]",
+            visible,
+        )
+        self.assertIn("response   [sent]", visible)
+        self.assertTrue(output.endswith("\n"))
+        self.assertEqual(output.count("\r\x1b[2K"), 2)
+
+    def test_response_progress_non_tty_reports_each_state(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch.object(pgc.sys, "stdout", stdout):
+            progress = pgc.ResponseProgress(prefix="[closure-parity]")
+            progress.set_status("[pending]")
+            progress.set_status("Message too large [retry with summary]")
+            progress.set_status("[sent summary]")
+
+        self.assertEqual(
+            stdout.getvalue(),
+            "[closure-parity] response   [pending]\n"
+            "[closure-parity] response   Message too large [retry with summary]\n"
+            "[closure-parity] response   [sent summary]\n",
+        )
+
+    def test_response_progress_commits_previous_live_owner(self) -> None:
+        stdout = FakeTTY()
+        with mock.patch.object(pgc.sys, "stdout", stdout):
+            first = pgc.ResponseProgress(prefix="[first]")
+            second = pgc.ResponseProgress(prefix="[second]")
+            first.set_status("[pending]")
+            second.set_status("[pending]")
+            second.set_status("[sent]")
+            second.commit()
+
+        output = stdout.getvalue()
+        visible = visible_text(output)
+        self.assertIn("[first] response   [pending]\n[second] response   [pending]", visible)
+        self.assertTrue(visible.endswith("[second] response   [sent]\n"))
+        self.assertEqual(output.count("\r\x1b[2K"), 1)
+
     def test_tool_level_stop_on_error_skips_only_later_calls(self) -> None:
         calls = [
             {"id": "first", "tool": "read"},

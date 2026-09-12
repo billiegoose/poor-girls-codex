@@ -21,7 +21,15 @@ class WatcherDeliveryTests(unittest.TestCase):
             mock.patch.object(pgc.time, "sleep") as sleep,
             redirect_stdout(StringIO()) as stdout,
         ):
-            pgc.paste_result_into_composer("app", "root", "payload", send=True)
+            progress = pgc.ResponseProgress()
+            progress.set_status("[pending]")
+            pgc.paste_result_into_composer(
+                "app",
+                "root",
+                "payload",
+                send=True,
+                response_progresses=[progress],
+            )
 
         self.assertEqual(frontend.set_composer_text.call_count, 3)
         frontend.submit_composer.assert_called_once_with("app", "root", "payload")
@@ -30,9 +38,10 @@ class WatcherDeliveryTests(unittest.TestCase):
             [0.1, 0.25, 0.1, 0.5, 0.1],
         )
         output = stdout.getvalue()
-        self.assertIn("watcher warning", output)
-        self.assertIn("retrying in 0.25s", output)
-        self.assertIn("retrying in 0.5s", output)
+        self.assertIn("response   [pending]", output)
+        self.assertIn("ChatGPT send button is not available [retry in 0.25s]", output)
+        self.assertIn("ChatGPT send button is not available [retry in 0.5s]", output)
+        self.assertNotIn("watcher warning", output)
 
     def test_send_wait_is_interrupted_by_new_tool_call(self) -> None:
         candidate_a = ('{"id":"a","tool":"read"}', {"id": "a", "tool": "read"}, "fingerprint-a")
@@ -154,8 +163,10 @@ class WatcherDeliveryTests(unittest.TestCase):
         self.assertIn("The tools already ran; do not repeat them", deliveries[1])
         self.assertLess(len(deliveries[1]), 2000)
         output = stdout.getvalue()
-        self.assertIn("queued a compact retry while retaining completed results", output)
-        self.assertGreaterEqual(output.count("sent results"), 2)
+        self.assertIn("response   [pending]", output)
+        self.assertIn("Message too large [retry with summary]", output)
+        self.assertIn("response   [sent summary]", output)
+        self.assertNotIn("queued a compact retry while retaining completed results", output)
 
     def test_ctrl_x_dumps_while_watcher_waits(self) -> None:
         hotkeys = mock.MagicMock()
@@ -256,7 +267,9 @@ class WatcherDeliveryTests(unittest.TestCase):
         self.assertNotIn('"id": "call-b"', deliveries[0])
         self.assertEqual(deliveries[1].count('"id": "call-a"'), 1)
         self.assertEqual(deliveries[1].count('"id": "call-b"'), 1)
-        self.assertIn("delivery interrupted by new tool calls", stdout.getvalue())
+        output = stdout.getvalue()
+        self.assertIn("response   [pending]", output)
+        self.assertNotIn("delivery interrupted by new tool calls", output)
 
     def test_delivery_error_does_not_reexecute_same_toolcall(self) -> None:
         request = {"id": "side-effect", "tool": "run", "script": "echo hi"}

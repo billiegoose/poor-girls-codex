@@ -183,7 +183,7 @@ class ChatGPTWebTests(unittest.TestCase):
         watcher.refresh_sessions()
         self.assertEqual(set(watcher.sessions), {'a', 'b'})
         self.assertIsNot(watcher.sessions['a'].seen_fingerprints, watcher.sessions['b'].seen_fingerprints)
-        self.assertIsNot(watcher.sessions['a'].pending_results, watcher.sessions['b'].pending_results)
+        self.assertIsNot(watcher.sessions['a'].pending_responses, watcher.sessions['b'].pending_responses)
 
     def test_new_session_primes_and_binds_visible_root_without_executing(self) -> None:
         interface = mock.Mock()
@@ -236,7 +236,7 @@ class ChatGPTWebTests(unittest.TestCase):
             original_page,
             routing_session_id='root::worker',
         )
-        child.pending_results.append('pending')
+        child.pending_responses.append(web.PendingResponse('pending', 'pending'))
         watcher.sessions['WEB:temporary'] = child
         watcher.sessions_by_routing_id['root::worker'] = child
 
@@ -246,7 +246,7 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIs(watcher.sessions['real-child'], child)
         self.assertEqual(child.conversation_id, 'real-child')
         self.assertEqual(child.routing_session_id, 'root::worker')
-        self.assertEqual(child.pending_results, ['pending'])
+        self.assertEqual([response.result for response in child.pending_responses], ['pending'])
         self.assertEqual(child.seen_fingerprints, set())
         self.assertIs(watcher.sessions_by_routing_id['root::worker'], child)
         interface.valid_request.assert_not_called()
@@ -363,9 +363,41 @@ class ChatGPTWebTests(unittest.TestCase):
 
         self.assertTrue(result['ok'])
         self.assertEqual(result['parent_session'], 'root::a')
-        self.assertEqual(root.pending_results, [])
-        self.assertEqual(len(parent.pending_results), 1)
-        self.assertIn('nested result', parent.pending_results[0])
+        self.assertEqual(root.pending_responses, [])
+        self.assertEqual(len(parent.pending_responses), 1)
+        self.assertIn('nested result', parent.pending_responses[0].result)
+
+    def test_handoff_result_delivers_from_parent_without_parallel_state(self) -> None:
+        interface = mock.Mock()
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+        parent = web.WebSession('parent-c', 'Parent', mock.Mock(), routing_session_id='root::a')
+        child = web.WebSession('child-c', 'Child', mock.Mock(), routing_session_id='root::a::b')
+        watcher.sessions_by_routing_id = {
+            'root::a': parent,
+            'root::a::b': child,
+        }
+
+        result = watcher.execute_orchestration_tool(
+            child,
+            'root::a::b',
+            {'id': 'h', 'tool': 'handoff', 'result': 'nested result'},
+            0,
+        )
+
+        self.assertTrue(result['ok'])
+        self.assertTrue(watcher.deliver_session(parent, 0.0))
+        interface.submit.assert_called_once()
+        submitted_session, submitted_text = interface.submit.call_args.args
+        self.assertIs(submitted_session, parent)
+        self.assertIn('nested result', submitted_text)
+        self.assertEqual(parent.pending_responses, [])
+        self.assertEqual(parent.delivered, 1)
 
     def test_root_handoff_is_rejected(self) -> None:
         watcher = web.WebSessionWatcher(
@@ -423,7 +455,7 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertFalse(watcher.scan_session(session, 1.0))
         self.assertTrue(watcher.scan_session(session, 1.35))
         execute.assert_called_once_with({'tool': 'status'}, announce=True)
-        self.assertEqual(session.pending_results, ['RESULT'])
+        self.assertEqual([response.result for response in session.pending_responses], ['RESULT'])
         self.assertEqual(session.seen_fingerprints, {'second'})
 
     def test_step_routes_results_to_originating_sessions(self) -> None:
@@ -470,7 +502,13 @@ class ChatGPTWebTests(unittest.TestCase):
 
     def test_delivery_failure_is_isolated_and_retried_without_reexecution(self) -> None:
         interface = mock.Mock()
-        a = web.WebSession('a', 'Cats', mock.Mock(), pending_results=['RESULT'])
+        progress = mock.Mock(spec=web.ResponseProgress)
+        a = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            pending_responses=[web.PendingResponse('RESULT', 'FALLBACK', progress=progress)],
+        )
         interface.submit.side_effect = [RuntimeError('busy'), None]
         watcher = web.WebSessionWatcher(
             interface,
@@ -480,11 +518,15 @@ class ChatGPTWebTests(unittest.TestCase):
             too_long_fallback=lambda request, result: 'FALLBACK',
         )
         self.assertFalse(watcher.deliver_session(a, 0.0))
-        self.assertEqual(a.pending_results, ['RESULT'])
+        self.assertEqual([response.result for response in a.pending_responses], ['RESULT'])
+        progress.set_status.assert_called_with(
+            'ChatGPT send button is not available [retry in 0.25s]'
+        )
         self.assertFalse(watcher.deliver_session(a, 0.1))
         self.assertTrue(watcher.deliver_session(a, 0.25))
-        self.assertEqual(a.pending_results, [])
+        self.assertEqual(a.pending_responses, [])
         self.assertEqual(a.delivered, 1)
+        progress.set_status.assert_called_with('[sent]')
 
     def test_too_long_delivery_sends_compact_fallback_without_reexecution(self) -> None:
         interface = mock.Mock()
@@ -512,14 +554,16 @@ class ChatGPTWebTests(unittest.TestCase):
         )
 
         self.assertTrue(watcher.scan_session(session, 0.0))
+        progress = session.pending_responses[0].progress
+        self.assertEqual(progress.status, '[pending]')
         self.assertTrue(watcher.deliver_session(session, 0.0))
+        self.assertEqual(progress.status, '[sent summary]')
         execute.assert_called_once_with({'id': 'x', 'tool': 'status'}, announce=True)
         self.assertEqual(
             interface.submit.call_args_list,
             [mock.call(session, 'FULL\n'), mock.call(session, 'COMPACT\n')],
         )
-        self.assertEqual(session.pending_results, [])
-        self.assertEqual(session.pending_fallbacks, [])
+        self.assertEqual(session.pending_responses, [])
         self.assertEqual(session.delivered, 1)
 
     def test_post_submit_too_long_error_queues_compact_retry_without_reexecution(self) -> None:
@@ -544,20 +588,24 @@ class ChatGPTWebTests(unittest.TestCase):
         interface.valid_request.return_value = ('{}', {'id': 'x', 'tool': 'status'}, 'fp')
 
         self.assertTrue(watcher.scan_session(session, 0.0))
+        progress = session.pending_responses[0].progress
         self.assertTrue(watcher.deliver_session(session, 0.0))
-        self.assertEqual(session.last_submitted_fallbacks, ['COMPACT'])
+        self.assertEqual(progress.status, '[sent]')
+        self.assertEqual(
+            [response.fallback for response in session.last_submitted_responses],
+            ['COMPACT'],
+        )
         self.assertTrue(watcher.recover_rejected_submission(session))
-        self.assertEqual(session.pending_results, ['COMPACT'])
-        self.assertEqual(session.pending_fallbacks, ['COMPACT'])
+        self.assertEqual(progress.status, 'Message too large [retry with summary]')
+        self.assertEqual([response.render() for response in session.pending_responses], ['COMPACT'])
+        self.assertTrue(session.pending_responses[0].compact)
         execute.assert_called_once_with({'id': 'x', 'tool': 'status'}, announce=True)
 
         # The same rendered error must not enqueue the compact result repeatedly.
-        session.pending_results.clear()
-        session.pending_fallbacks.clear()
-        session.last_submitted_fallbacks = ['COMPACT']
+        session.pending_responses.clear()
+        session.last_submitted_responses = [web.PendingResponse('FULL', 'COMPACT')]
         self.assertFalse(watcher.recover_rejected_submission(session))
-        self.assertEqual(session.pending_results, [])
-        self.assertEqual(session.pending_fallbacks, [])
+        self.assertEqual(session.pending_responses, [])
 
     def test_existing_too_long_error_is_baselined_when_tab_attaches(self) -> None:
         interface = mock.Mock()
@@ -576,10 +624,10 @@ class ChatGPTWebTests(unittest.TestCase):
 
         watcher.refresh_sessions()
         session = watcher.sessions['a']
-        session.last_submitted_fallbacks = ['COMPACT']
+        session.last_submitted_responses = [web.PendingResponse('FULL', 'COMPACT')]
         self.assertEqual(session.last_too_long_error_id, 'existing-error')
         self.assertFalse(watcher.recover_rejected_submission(session))
-        self.assertEqual(session.pending_results, [])
+        self.assertEqual(session.pending_responses, [])
 
 
 if __name__ == '__main__':

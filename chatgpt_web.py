@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from progress_ui import ResponseProgress, color as progress_color
+
 
 ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]'
 COMPOSER_SELECTOR = '#prompt-textarea'
@@ -26,14 +28,28 @@ class MessageTooLongError(RuntimeError):
 
 
 @dataclass
+class PendingResponse:
+    result: str
+    fallback: str
+    progress: ResponseProgress | None = None
+    compact: bool = False
+
+    def render(self) -> str:
+        return self.fallback if self.compact else self.result
+
+    def set_status(self, status: str) -> None:
+        if self.progress is not None:
+            self.progress.set_status(status)
+
+
+@dataclass
 class WebSession:
     conversation_id: str
     label: str
     page: Any
     seen_fingerprints: set[str] = field(default_factory=set)
-    pending_results: list[str] = field(default_factory=list)
-    pending_fallbacks: list[str] = field(default_factory=list)
-    last_submitted_fallbacks: list[str] = field(default_factory=list)
+    pending_responses: list[PendingResponse] = field(default_factory=list)
+    last_submitted_responses: list[PendingResponse] = field(default_factory=list)
     last_too_long_error_id: str | None = None
     settling_fingerprint: str | None = None
     settle_deadline: float = 0.0
@@ -378,8 +394,7 @@ class WebSessionWatcher:
                 + call['result'].rstrip()
                 + '\n'
             )
-            parent.pending_results.append(message)
-            parent.pending_fallbacks.append(message)
+            parent.pending_responses.append(PendingResponse(message, message))
             return {**base, 'ok': True, 'parent_session': parent_session_id}
 
         from toolcall_lib import execute
@@ -463,6 +478,10 @@ class WebSessionWatcher:
             for call in calls
         )
         progress_prefix = self.progress_prefix(routing_session_id)
+        ResponseProgress.commit_live()
+        print(flush=True)
+        header_prefix = f'{progress_prefix} ' if progress_prefix is not None else ''
+        print(f"{header_prefix}{progress_color('tool calls:', '1;35')}", flush=True)
         if has_orchestration:
             if routing_session_id is None:
                 raise RuntimeError('web orchestration tool call is missing its PGC session id')
@@ -483,8 +502,15 @@ class WebSessionWatcher:
             if progress_prefix is not None:
                 execute_kwargs['progress_prefix'] = progress_prefix
             result = self.execute_request(request, **execute_kwargs)
-        session.pending_results.append(self.fenced_result(result))
-        session.pending_fallbacks.append(self.too_long_fallback(request, result))
+        response_progress = ResponseProgress(prefix=progress_prefix)
+        session.pending_responses.append(
+            PendingResponse(
+                result=self.fenced_result(result),
+                fallback=self.too_long_fallback(request, result),
+                progress=response_progress,
+            )
+        )
+        response_progress.set_status('[pending]')
         return True
 
     def recover_rejected_submission(self, session: WebSession) -> bool:
@@ -492,64 +518,68 @@ class WebSessionWatcher:
         if error_id is None or error_id == session.last_too_long_error_id:
             return False
         session.last_too_long_error_id = error_id
-        if not session.last_submitted_fallbacks:
+        if not session.last_submitted_responses:
             return False
 
-        compact = list(session.last_submitted_fallbacks)
-        session.last_submitted_fallbacks.clear()
-        session.pending_results = compact + session.pending_results
-        session.pending_fallbacks = compact + session.pending_fallbacks
-        print(
-            f'  [web:{session.label}] ChatGPT rejected submitted results as too long; '
-            'queued compact retry',
-            flush=True,
-        )
+        restored = session.last_submitted_responses
+        session.last_submitted_responses = []
+        for response in restored:
+            response.compact = True
+            response.set_status('Message too large [retry with summary]')
+        session.pending_responses = restored + session.pending_responses
         return True
 
     def deliver_session(self, session: WebSession, now: float) -> bool:
-        if not session.pending_results or now < session.next_delivery_at:
+        if not session.pending_responses or now < session.next_delivery_at:
             return False
-        rendered = '\n'.join(part.rstrip('\n') for part in session.pending_results) + '\n'
+
+        rendered = '\n'.join(
+            response.render().rstrip('\n') for response in session.pending_responses
+        ) + '\n'
         try:
             self.interface.submit(session, rendered)
         except MessageTooLongError:
-            fallback = '\n'.join(part.rstrip('\n') for part in session.pending_fallbacks) + '\n'
-            print(
-                f'  [web:{session.label}] full results too large; sending compact summary',
-                flush=True,
-            )
+            for response in session.pending_responses:
+                response.compact = True
+                response.set_status('Message too large [retry with summary]')
+            fallback = '\n'.join(
+                response.fallback.rstrip('\n') for response in session.pending_responses
+            ) + '\n'
             try:
                 self.interface.submit(session, fallback)
-            except RuntimeError as exc:
+            except RuntimeError:
                 delay = min(
                     DELIVERY_RETRY_INITIAL_SECONDS * (2**session.delivery_attempt),
                     DELIVERY_RETRY_MAX_SECONDS,
                 )
                 session.delivery_attempt += 1
                 session.next_delivery_at = now + delay
-                print(
-                    f'  [web:{session.label}] compact delivery deferred ({exc}); retrying in {delay:g}s',
-                    flush=True,
-                )
+                for response in session.pending_responses:
+                    response.set_status(
+                        f'ChatGPT send button is not available [retry in {delay:g}s]'
+                    )
                 return False
-            session.last_submitted_fallbacks.clear()
-        except RuntimeError as exc:
+            for response in session.pending_responses:
+                response.set_status('[sent summary]')
+            session.last_submitted_responses = []
+        except RuntimeError:
             delay = min(
                 DELIVERY_RETRY_INITIAL_SECONDS * (2**session.delivery_attempt),
                 DELIVERY_RETRY_MAX_SECONDS,
             )
             session.delivery_attempt += 1
             session.next_delivery_at = now + delay
-            print(
-                f'  [web:{session.label}] delivery deferred ({exc}); retrying in {delay:g}s',
-                flush=True,
-            )
+            for response in session.pending_responses:
+                response.set_status(
+                    f'ChatGPT send button is not available [retry in {delay:g}s]'
+                )
             return False
         else:
-            session.last_submitted_fallbacks = list(session.pending_fallbacks)
+            for response in session.pending_responses:
+                response.set_status('[sent summary]' if response.compact else '[sent]')
+            session.last_submitted_responses = list(session.pending_responses)
 
-        session.pending_results.clear()
-        session.pending_fallbacks.clear()
+        session.pending_responses.clear()
         session.delivery_attempt = 0
         session.next_delivery_at = 0.0
         session.delivered += 1
