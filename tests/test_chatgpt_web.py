@@ -93,6 +93,8 @@ class ChatGPTWebTests(unittest.TestCase):
         )
 
         page.goto.assert_called_once_with('https' + '://chatgpt.com/', wait_until='domcontentloaded')
+        page.locator.assert_any_call(web.ASSISTANT_SELECTOR)
+        page.locator.return_value.last.wait_for.assert_any_call(state='attached', timeout=30_000)
         self.assertEqual(child.conversation_id, 'child')
 
     def test_submit_uses_dom_click_without_playwright_actionability(self) -> None:
@@ -112,6 +114,43 @@ class ChatGPTWebTests(unittest.TestCase):
         interface.set_composer_text.assert_called_once_with(session, 'result')
         button.evaluate.assert_called_once_with('element => element.click()')
         button.click.assert_not_called()
+
+    def test_submit_focuses_background_tab_only_when_send_button_is_missing(self) -> None:
+        interface = web.ChatGPTWeb()
+        missing = mock.Mock()
+        missing.count.return_value = 0
+        enabled_button = mock.Mock()
+        enabled_button.is_enabled.return_value = True
+        present = mock.Mock()
+        present.count.return_value = 1
+        present.last = enabled_button
+        page = mock.Mock()
+        page.locator.side_effect = [missing, present]
+        page.get_by_role.return_value = missing
+        session = web.WebSession('a', 'Background', page)
+        interface.set_composer_text = mock.Mock()
+
+        interface.submit(session, 'result')
+
+        page.bring_to_front.assert_called_once_with()
+        enabled_button.evaluate.assert_called_once_with('element => element.click()')
+
+    def test_submit_does_not_focus_when_send_button_is_already_enabled(self) -> None:
+        interface = web.ChatGPTWeb()
+        button = mock.Mock()
+        button.is_enabled.return_value = True
+        locator = mock.Mock()
+        locator.count.return_value = 1
+        locator.last = button
+        page = mock.Mock()
+        page.locator.return_value = locator
+        session = web.WebSession('a', 'Background', page)
+        interface.set_composer_text = mock.Mock()
+
+        interface.submit(session, 'result')
+
+        page.bring_to_front.assert_not_called()
+        button.evaluate.assert_called_once_with('element => element.click()')
 
     def test_fingerprint_includes_assistant_message_identity(self) -> None:
         interface = web.ChatGPTWeb()

@@ -184,9 +184,21 @@ class ChatGPTWeb:
 
     def submit(self, session: WebSession, text: str) -> None:
         self.set_composer_text(session, text)
-        button = session.page.locator(SEND_SELECTOR)
-        if button.count() == 0:
-            button = session.page.get_by_role('button', name='Send prompt')
+
+        def send_button():
+            button = session.page.locator(SEND_SELECTOR)
+            if button.count() == 0:
+                button = session.page.get_by_role('button', name='Send prompt')
+            return button
+
+        button = send_button()
+        if button.count() == 0 or not button.last.is_enabled():
+            # ChatGPT sometimes does not materialize an enabled send button for a
+            # genuinely background Chrome tab. Focusing that tab is enough to make
+            # the composer controls catch up, so automate that only as a fallback.
+            session.page.bring_to_front()
+            button = send_button()
+
         if button.count() == 0:
             raise RuntimeError(f'{session.label}: ChatGPT send button is not available')
         if not button.last.is_enabled():
@@ -216,6 +228,10 @@ class ChatGPTWeb:
                 lambda url: self.conversation_id_for_url(str(url)) is not None,
                 timeout=30_000,
             )
+            # Do not let the next subagent steal foreground focus until this
+            # conversation's assistant turn has actually started. ChatGPT can
+            # otherwise leave a just-submitted background tab dormant forever.
+            page.locator(ASSISTANT_SELECTOR).last.wait_for(state='attached', timeout=30_000)
             conversation_id, _ = self.describe_page(page)
             return WebSession(conversation_id, label, page)
         except Exception:
