@@ -43,7 +43,11 @@ class InterfaceSelectionTests(unittest.TestCase):
         interface.root.return_value = ('app', 'root')
 
         with (
-            mock.patch.object(sys, 'argv', ['poor_girls_codex.py', 'copy']),
+            mock.patch.object(
+                sys,
+                'argv',
+                ['poor_girls_codex.py', 'copy', '--interface', 'chatgpt-macos'],
+            ),
             mock.patch.object(pgc, 'create_interface', return_value=interface),
             mock.patch.object(pgc, 'latest_assistant_toolcall', return_value=('{}', {})),
             mock.patch.object(sys, 'stdout'),
