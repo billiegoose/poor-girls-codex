@@ -853,6 +853,39 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertEqual(a.delivered, 1)
         self.assertEqual(b.delivered, 1)
 
+    def test_run_handles_first_sigint_cooperatively_and_restores_handler(self) -> None:
+        interface = mock.Mock()
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            poll_seconds=0.0,
+        )
+        watcher.refresh_sessions = mock.Mock()
+        previous_handler = object()
+        installed_handlers = []
+
+        def install_handler(signum, handler):
+            installed_handlers.append((signum, handler))
+
+        def step_once():
+            installed_handlers[0][1](web.signal.SIGINT, None)
+            return False
+
+        watcher.step = mock.Mock(side_effect=step_once)
+        with (
+            mock.patch.object(web.signal, 'getsignal', return_value=previous_handler),
+            mock.patch.object(web.signal, 'signal', side_effect=install_handler),
+            mock.patch('builtins.print'),
+        ):
+            watcher.run()
+
+        watcher.step.assert_called_once_with()
+        self.assertEqual(installed_handlers[0][0], web.signal.SIGINT)
+        self.assertEqual(installed_handlers[-1], (web.signal.SIGINT, previous_handler))
+
     def test_run_web_watcher_passes_bootstrap_prompt_to_watcher_run(self) -> None:
         interface = mock.Mock()
         watcher = mock.Mock()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import signal
 import sys
 import time
 from dataclasses import dataclass, field
@@ -751,13 +752,29 @@ class WebSessionWatcher:
             f"  {progress_color('[ready]', '1;32')} Waiting for ChatGPT tool calls...",
             flush=True,
         )
+
+        stop_requested = False
+        previous_sigint = signal.getsignal(signal.SIGINT)
+
+        def request_stop(signum: int, frame: Any) -> None:
+            nonlocal stop_requested
+            if stop_requested:
+                raise KeyboardInterrupt
+            stop_requested = True
+
+        signal.signal(signal.SIGINT, request_stop)
         try:
-            while True:
+            while not stop_requested:
                 progressed = self.step()
-                if not progressed:
+                if not progressed and not stop_requested:
                     time.sleep(self.poll_seconds)
         except KeyboardInterrupt:
-            print("\nPoor Girl's Codex web watcher stopped.")
+            # A second Ctrl+C deliberately forces an immediate exit.
+            pass
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
+
+        print("\nPoor Girl's Codex web watcher stopped.")
 
 
 def inspect_web_sessions(*, cdp_url: str) -> list[tuple[str, str, str]]:
