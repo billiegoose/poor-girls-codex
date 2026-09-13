@@ -669,7 +669,13 @@ class WebSessionWatcher:
         live: set[str] = set()
         for page in self.interface.pages():
             self.interface.instrument_conversations_responses(page)
-            conversation_id, label = self.interface.describe_page(page)
+            try:
+                conversation_id, label = self.interface.describe_page(page)
+            except RuntimeError:
+                # A tab can navigate away from /c/<id> between pages() filtering it
+                # and this refresh pass describing it (for example back to '/').
+                # Treat it as no longer live instead of crashing the watcher.
+                continue
             live.add(conversation_id)
             session = self.sessions.get(conversation_id)
             if session is None:

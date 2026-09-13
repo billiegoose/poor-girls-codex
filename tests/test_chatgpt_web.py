@@ -513,6 +513,29 @@ class ChatGPTWebTests(unittest.TestCase):
 
         self.assertIsNone(interface.recent_valid_request(session, lambda request: None))
 
+    def test_refresh_ignores_page_that_navigates_away_after_enumeration(self) -> None:
+        interface = mock.Mock()
+        page = FakePage('https' + '://chatgpt.com/')
+        interface.pages.return_value = [page]
+        interface.describe_page.side_effect = RuntimeError(
+            'not a ChatGPT conversation URL: https://chatgpt.com/'
+        )
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+        existing = web.WebSession('a', 'Cats', page)
+        watcher.sessions['a'] = existing
+
+        watcher.refresh_sessions()
+
+        self.assertEqual(watcher.sessions, {})
+        interface.instrument_conversations_responses.assert_called_once_with(page)
+        interface.latest_too_long_error_id.assert_not_called()
+
     def test_refresh_gives_each_conversation_independent_state(self) -> None:
         interface = mock.Mock()
         pages = [
