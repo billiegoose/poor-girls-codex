@@ -89,6 +89,16 @@ class WatcherDeliveryTests(unittest.TestCase):
             [0.1, 1.0, 0.1, 2.0, 0.1, 2.0, 0.1, 2.0, 0.1],
         )
 
+    def test_fenced_result_uses_plain_code_fence_without_language_tag(self) -> None:
+        message = pgc.fenced_result({"id": "example", "ok": True})
+
+        self.assertTrue(message.startswith("```\n"))
+        self.assertFalse(message.startswith("```json\n"))
+        self.assertEqual(
+            message,
+            '```\n{\n  "id": "example",\n  "ok": true\n}\n```\n',
+        )
+
     def test_too_long_fallback_is_small_and_summarizes_calls(self) -> None:
         calls = [
             {"id": f"call-{index}", "tool": "read"}

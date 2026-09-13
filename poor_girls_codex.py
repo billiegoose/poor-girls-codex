@@ -536,7 +536,7 @@ def execute_request(
 
 
 def fenced_result(result: Any) -> str:
-    return "```json\n" + json.dumps(result, indent=2, ensure_ascii=False) + "\n```\n"
+    return "```\n" + json.dumps(result, indent=2, ensure_ascii=False) + "\n```\n"
 
 
 def too_long_fallback(calls: list[Any], results: list[Any]) -> str:
