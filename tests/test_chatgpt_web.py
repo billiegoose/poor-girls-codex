@@ -135,26 +135,58 @@ class ChatGPTWebTests(unittest.TestCase):
         )
         self.assertIs(child.cdp_session, cdp_session)
 
-    def test_archive_conversation_marks_chat_archived(self) -> None:
+    def test_archive_conversation_uses_top_right_archive_menu_and_waits_for_navigation(self) -> None:
         interface = web.ChatGPTWeb()
+        more_button = mock.Mock()
+        more = mock.Mock()
+        more.count.return_value = 1
+        more.last = more_button
+        archive = mock.Mock()
         page = mock.Mock()
-        page.evaluate.return_value = {'ok': True, 'status': 200, 'text': ''}
+        page.url = 'https' + '://chatgpt.com/c/conversation-123'
+        page.locator.return_value = more
+        page.get_by_role.return_value = archive
         session = web.WebSession('conversation-123', 'Child', page)
 
         interface.archive_conversation(session)
 
-        script, conversation_id = page.evaluate.call_args.args
-        self.assertEqual(conversation_id, 'conversation-123')
-        self.assertIn('is_archived: true', script)
-        self.assertIn("method: 'PATCH'", script)
+        page.locator.assert_called_once_with('button[data-testid="conversation-options-button"]')
+        more_button.wait_for.assert_called_once_with(state='visible', timeout=5_000)
+        more_button.evaluate.assert_called_once_with('element => element.click()')
+        page.get_by_role.assert_called_once_with('menuitem', name='Archive', exact=True)
+        archive.wait_for.assert_called_once_with(state='visible', timeout=5_000)
+        archive.evaluate.assert_called_once_with('element => element.click()')
+        predicate = page.wait_for_url.call_args.args[0]
+        self.assertFalse(predicate('https' + '://chatgpt.com/c/conversation-123'))
+        self.assertTrue(predicate('https' + '://chatgpt.com/'))
+        self.assertEqual(page.wait_for_url.call_args.kwargs, {'timeout': 10_000})
 
-    def test_archive_conversation_raises_on_failed_request(self) -> None:
+    def test_archive_conversation_raises_when_options_button_is_missing(self) -> None:
         interface = web.ChatGPTWeb()
+        more = mock.Mock()
+        more.count.return_value = 0
         page = mock.Mock()
-        page.evaluate.return_value = {'ok': False, 'status': 500, 'text': 'archive failed'}
+        page.locator.return_value = more
         session = web.WebSession('conversation-123', 'Child', page)
 
-        with self.assertRaisesRegex(RuntimeError, 'failed to archive.*500.*archive failed'):
+        with self.assertRaisesRegex(RuntimeError, 'conversation options button not found'):
+            interface.archive_conversation(session)
+
+    def test_archive_conversation_raises_when_archive_does_not_navigate_away(self) -> None:
+        interface = web.ChatGPTWeb()
+        more_button = mock.Mock()
+        more = mock.Mock()
+        more.count.return_value = 1
+        more.last = more_button
+        archive = mock.Mock()
+        page = mock.Mock()
+        page.url = 'https' + '://chatgpt.com/c/conversation-123'
+        page.locator.return_value = more
+        page.get_by_role.return_value = archive
+        page.wait_for_url.side_effect = RuntimeError('timed out')
+        session = web.WebSession('conversation-123', 'Child', page)
+
+        with self.assertRaisesRegex(RuntimeError, 'archive did not navigate away'):
             interface.archive_conversation(session)
 
     def test_submit_uses_dom_click_without_playwright_actionability(self) -> None:

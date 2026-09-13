@@ -336,24 +336,27 @@ class ChatGPTWeb:
         return self._create_conversation(contexts[0], label=None, prompt=prompt)
 
     def archive_conversation(self, session: WebSession) -> None:
-        result = session.page.evaluate(
-            """async conversationId => {
-                const response = await fetch(`/backend-api/conversation/${conversationId}`, {
-                    method: 'PATCH',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({is_archived: true}),
-                });
-                return {ok: response.ok, status: response.status, text: await response.text()};
-            }""",
-            session.conversation_id,
-        )
-        if not result.get('ok'):
-            status = result.get('status', '?')
-            text = str(result.get('text', '')).strip()
-            detail = f': {text}' if text else ''
-            raise RuntimeError(
-                f'{session.label}: failed to archive ChatGPT conversation ({status}){detail}'
+        page = session.page
+        more = page.locator('button[data-testid="conversation-options-button"]')
+        if more.count() == 0:
+            raise RuntimeError(f'{session.label}: ChatGPT conversation options button not found')
+        more.last.wait_for(state='visible', timeout=5_000)
+        more.last.evaluate('element => element.click()')
+
+        archive = page.get_by_role('menuitem', name='Archive', exact=True)
+        archive.wait_for(state='visible', timeout=5_000)
+        archive.evaluate('element => element.click()')
+
+        try:
+            page.wait_for_url(
+                lambda url: self.conversation_id_for_url(str(url)) != session.conversation_id,
+                timeout=10_000,
             )
+        except Exception as exc:
+            if self.conversation_id_for_url(str(page.url)) == session.conversation_id:
+                raise RuntimeError(
+                    f'{session.label}: ChatGPT archive did not navigate away from the conversation'
+                ) from exc
 
 
 class WebSessionWatcher:
