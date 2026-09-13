@@ -97,7 +97,7 @@ class ChatGPTWebTests(unittest.TestCase):
         interface._browser = browser
         self.assertEqual([page.url for page in interface.pages()], ['https' + '://chatgpt.com/c/a'])
 
-    def test_conversations_response_instrumentation_logs_429_headers_without_cookies(self) -> None:
+    def test_conversations_response_429_starts_backoff_without_reading_headers(self) -> None:
         interface = web.ChatGPTWeb()
         page = mock.Mock()
         page.url = 'https' + '://chatgpt.com/c/abcdef123456'
@@ -107,31 +107,22 @@ class ChatGPTWebTests(unittest.TestCase):
         response.url = 'https' + '://chatgpt.com/backend-api/conversations?offset=0&limit=28'
         response.status = 429
         response.request.method = 'GET'
-        response.all_headers.return_value = {
-            'X-RateLimit-Limit': '30',
-            'X-RateLimit-Remaining': '0',
-            'Retry-After': '42',
-            'CF-Ray': 'abc123',
-            'Server': 'cloudflare',
-            'Set-Cookie': 'secret=session',
-        }
 
+        interface.dismiss_rate_limit_dialog = mock.Mock(return_value=False)
         with (
-            mock.patch.object(web.time, 'time', return_value=1234.567),
+            mock.patch.object(web.time, 'monotonic', return_value=100.0),
             mock.patch('builtins.print') as printed,
         ):
             callback(response)
 
+        interface.dismiss_rate_limit_dialog.assert_called_once_with(page)
         output = '\n'.join(str(call.args[0]) for call in printed.call_args_list)
-        self.assertIn('[web:conversations] 1234.567 #1 abcdef12 GET 429', output)
-        self.assertIn('"x-ratelimit-limit":"30"', output)
-        self.assertIn('"x-ratelimit-remaining":"0"', output)
-        self.assertIn('"retry-after":"42"', output)
-        self.assertIn('"server":"cloudflare"', output)
-        self.assertNotIn('set-cookie', output.lower())
-        self.assertNotIn('secret=session', output)
+        self.assertIn('[web:rate-limit] GET 429', output)
+        self.assertIn('pausing PGC for 60s', output)
+        self.assertEqual(interface.rate_limit_remaining(100.0), 60.0)
+        response.all_headers.assert_not_called()
 
-    def test_conversations_response_instrumentation_logs_rate_metadata_on_success(self) -> None:
+    def test_conversations_response_success_is_silent_and_does_not_read_headers(self) -> None:
         interface = web.ChatGPTWeb()
         page = mock.Mock()
         page.url = 'https' + '://chatgpt.com/c/abcdef123456'
@@ -139,20 +130,12 @@ class ChatGPTWebTests(unittest.TestCase):
         response.url = 'https' + '://chatgpt.com/backend-api/conversations?offset=0'
         response.status = 200
         response.request.method = 'GET'
-        response.all_headers.return_value = {
-            'X-Rate-Limit-Remaining': '7',
-            'CF-Ray': 'ray-id',
-            'Content-Type': 'application/json',
-        }
 
         with mock.patch('builtins.print') as printed:
             interface.log_conversations_response(page, response)
 
-        output = '\n'.join(str(call.args[0]) for call in printed.call_args_list)
-        self.assertIn('GET 200', output)
-        self.assertIn('"x-rate-limit-remaining":"7"', output)
-        self.assertIn('"cf-ray":"ray-id"', output)
-        self.assertNotIn('content-type', output.lower())
+        printed.assert_not_called()
+        response.all_headers.assert_not_called()
 
     def test_conversations_response_instrumentation_logs_singular_conversation_endpoint(self) -> None:
         interface = web.ChatGPTWeb()
@@ -162,17 +145,19 @@ class ChatGPTWebTests(unittest.TestCase):
         response.url = 'https' + '://chatgpt.com/backend-api/conversation/abcdef123456'
         response.status = 429
         response.request.method = 'GET'
-        response.all_headers.return_value = {'Retry-After': '17'}
 
-        with mock.patch('builtins.print') as printed:
+        with (
+            mock.patch.object(web.time, 'monotonic', return_value=100.0),
+            mock.patch('builtins.print') as printed,
+        ):
             interface.log_conversations_response(page, response)
 
         output = '\n'.join(str(call.args[0]) for call in printed.call_args_list)
         self.assertIn('GET 429', output)
         self.assertIn('/backend-api/conversation/abcdef123456', output)
-        self.assertIn('"retry-after":"17"', output)
+        response.all_headers.assert_not_called()
 
-    def test_conversations_response_instrumentation_logs_bare_singular_conversation_endpoint(self) -> None:
+    def test_conversations_response_bare_singular_success_is_silent(self) -> None:
         interface = web.ChatGPTWeb()
         page = mock.Mock()
         page.url = 'https' + '://chatgpt.com/c/abcdef123456'
@@ -180,14 +165,12 @@ class ChatGPTWebTests(unittest.TestCase):
         response.url = 'https' + '://chatgpt.com/backend-api/conversation'
         response.status = 200
         response.request.method = 'POST'
-        response.all_headers.return_value = {}
 
         with mock.patch('builtins.print') as printed:
             interface.log_conversations_response(page, response)
 
-        output = '\n'.join(str(call.args[0]) for call in printed.call_args_list)
-        self.assertIn('POST 200', output)
-        self.assertIn('/backend-api/conversation', output)
+        printed.assert_not_called()
+        response.all_headers.assert_not_called()
 
     def test_conversations_response_instrumentation_logs_f_conversation_endpoint(self) -> None:
         interface = web.ChatGPTWeb()
@@ -197,19 +180,79 @@ class ChatGPTWebTests(unittest.TestCase):
         response.url = 'https' + '://chatgpt.com/backend-api/f/conversation'
         response.status = 429
         response.request.method = 'POST'
-        response.all_headers.return_value = {
-            'Retry-After': '23',
-            'X-RateLimit-Remaining': '0',
-        }
 
-        with mock.patch('builtins.print') as printed:
+        with (
+            mock.patch.object(web.time, 'monotonic', return_value=100.0),
+            mock.patch('builtins.print') as printed,
+        ):
             interface.log_conversations_response(page, response)
 
         output = '\n'.join(str(call.args[0]) for call in printed.call_args_list)
         self.assertIn('POST 429', output)
         self.assertIn('/backend-api/f/conversation', output)
-        self.assertIn('"retry-after":"23"', output)
-        self.assertIn('"x-ratelimit-remaining":"0"', output)
+        response.all_headers.assert_not_called()
+
+    def test_rate_limit_backoff_coalesces_burst_and_doubles_after_retry(self) -> None:
+        interface = web.ChatGPTWeb()
+
+        with mock.patch.object(web.time, 'monotonic', return_value=100.0):
+            interface.note_rate_limit(
+                method='GET',
+                url='https://chatgpt.com/backend-api/conversations',
+            )
+        self.assertEqual(interface.rate_limit_remaining(100.0), 60.0)
+
+        # More 429s from the same burst must not extend or exponentiate the pause.
+        with mock.patch.object(web.time, 'monotonic', return_value=110.0):
+            interface.note_rate_limit(
+                method='GET',
+                url='https://chatgpt.com/backend-api/conversations',
+            )
+        self.assertEqual(interface.rate_limit_remaining(110.0), 50.0)
+
+        # If traffic is still rejected after the pause expires, back off harder.
+        with mock.patch.object(web.time, 'monotonic', return_value=161.0):
+            interface.note_rate_limit(
+                method='GET',
+                url='https://chatgpt.com/backend-api/conversations',
+            )
+        self.assertEqual(interface.rate_limit_remaining(161.0), 120.0)
+
+    def test_rate_limit_backoff_resets_after_quiet_period(self) -> None:
+        interface = web.ChatGPTWeb()
+        with mock.patch.object(web.time, 'monotonic', return_value=100.0):
+            interface.note_rate_limit(method='GET', url='https://chatgpt.com/backend-api/conversations')
+        with mock.patch.object(web.time, 'monotonic', return_value=161.0):
+            interface.note_rate_limit(method='GET', url='https://chatgpt.com/backend-api/conversations')
+        self.assertEqual(interface.rate_limit_remaining(161.0), 120.0)
+
+        with mock.patch.object(web.time, 'monotonic', return_value=1_062.0):
+            interface.note_rate_limit(method='GET', url='https://chatgpt.com/backend-api/conversations')
+        self.assertEqual(interface.rate_limit_remaining(1_062.0), 60.0)
+
+    def test_dismiss_rate_limit_dialog_clicks_got_it(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        dialog = page.get_by_role.return_value.filter.return_value
+        button = dialog.get_by_role.return_value.last
+        button.count.return_value = 1
+        button.is_visible.return_value = True
+
+        self.assertTrue(interface.dismiss_rate_limit_dialog(page))
+
+        page.get_by_role.assert_called_once_with('dialog')
+        page.get_by_role.return_value.filter.assert_called_once_with(has_text='Too many requests')
+        dialog.get_by_role.assert_called_once_with('button', name='Got it', exact=True)
+        button.evaluate.assert_called_once_with('element => element.click()')
+
+    def test_dismiss_rate_limit_dialog_is_harmless_when_modal_is_absent(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        button = page.get_by_role.return_value.filter.return_value.get_by_role.return_value.last
+        button.count.return_value = 0
+
+        self.assertFalse(interface.dismiss_rate_limit_dialog(page))
+        button.evaluate.assert_not_called()
 
     def test_conversations_response_instrumentation_attaches_once_per_page(self) -> None:
         interface = web.ChatGPTWeb()
@@ -1301,6 +1344,81 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertEqual(a.delivered, 1)
         self.assertEqual(b.delivered, 1)
 
+    def test_rate_limit_suspends_and_restores_active_background_tabs(self) -> None:
+        interface = mock.Mock()
+        interface.rate_limit_remaining.side_effect = [30.0, 20.0, 0.0]
+        cdp_session = mock.Mock()
+        session = web.WebSession('a', 'Cats', mock.Mock(), cdp_session=cdp_session)
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+        watcher.sessions = {'a': session}
+
+        self.assertTrue(watcher.sync_rate_limit_suspension())
+        self.assertTrue(watcher.sync_rate_limit_suspension())
+        self.assertFalse(watcher.sync_rate_limit_suspension())
+
+        # One dismissal attempt when entering cooldown and one after thawing;
+        # the middle cooldown tick must not poll the DOM continuously.
+        self.assertEqual(interface.dismiss_rate_limit_dialog.call_count, 2)
+        self.assertEqual(
+            cdp_session.send.call_args_list,
+            [
+                mock.call('Emulation.setFocusEmulationEnabled', {'enabled': False}),
+                mock.call('Page.setWebLifecycleState', {'state': 'frozen'}),
+                mock.call('Emulation.setFocusEmulationEnabled', {'enabled': True}),
+                mock.call('Page.setWebLifecycleState', {'state': 'active'}),
+            ],
+        )
+        self.assertFalse(watcher.rate_limit_suspended)
+
+    def test_step_does_not_refresh_scan_or_deliver_during_rate_limit_backoff(self) -> None:
+        interface = mock.Mock()
+        interface.rate_limit_remaining.return_value = 30.0
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+        watcher.refresh_sessions = mock.Mock()
+
+        self.assertFalse(watcher.step())
+
+        watcher.refresh_sessions.assert_not_called()
+        interface.valid_request.assert_not_called()
+        interface.submit.assert_not_called()
+
+    def test_delivery_timeout_still_fires_during_rate_limit_suspension(self) -> None:
+        interface = mock.Mock()
+        interface.rate_limit_remaining.return_value = 30.0
+        session = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            pending_responses=[web.PendingResponse('RESULT', 'FALLBACK')],
+            delivery_failure_started_at=100.0,
+        )
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            clock=lambda: 3_700.0,
+        )
+        watcher.sessions = {'a': session}
+
+        with self.assertRaises(web.DeliveryFailureTimeout):
+            watcher.step()
+
+        interface.rate_limit_remaining.assert_not_called()
+
     def test_run_handles_first_sigint_cooperatively_and_restores_handler(self) -> None:
         interface = mock.Mock()
         watcher = web.WebSessionWatcher(
@@ -1394,7 +1512,121 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertTrue(watcher.deliver_session(a, 0.25))
         self.assertEqual(a.pending_responses, [])
         self.assertEqual(a.delivered, 1)
+        self.assertIsNone(a.delivery_failure_started_at)
         progress.set_status.assert_called_with('[sent]')
+
+    def test_delivery_backoff_caps_without_huge_integer_float_conversion(self) -> None:
+        interface = mock.Mock()
+        interface.submit.side_effect = RuntimeError('busy')
+        session = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            pending_responses=[web.PendingResponse('RESULT', 'FALLBACK')],
+            delivery_attempt=100_000,
+        )
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+
+        self.assertFalse(watcher.deliver_session(session, 10.0))
+        self.assertEqual(session.next_delivery_at, 18.0)
+        self.assertEqual(session.delivery_attempt, 100_001)
+        self.assertEqual(session.delivery_failure_started_at, 10.0)
+
+    def test_delivery_timeout_fires_at_one_hour_even_while_backoff_is_waiting(self) -> None:
+        progress = mock.Mock(spec=web.ResponseProgress)
+        session = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            pending_responses=[web.PendingResponse('RESULT', 'FALLBACK', progress=progress)],
+            next_delivery_at=3_708.0,
+            delivery_failure_started_at=100.0,
+        )
+        watcher = web.WebSessionWatcher(
+            mock.Mock(),
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+
+        with self.assertRaisesRegex(
+            web.DeliveryFailureTimeout,
+            'unable to deliver tool results for 1 hour',
+        ):
+            watcher.deliver_session(session, 3_700.0)
+        progress.set_status.assert_called_with('Delivery failed for 1 hour; stopping PGC')
+
+    def test_unexpected_delivery_exception_uses_retry_and_eventually_times_out(self) -> None:
+        interface = mock.Mock()
+        interface.rate_limit_remaining.return_value = 0.0
+        interface.submit.side_effect = OverflowError('int too large to convert to float')
+        session = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            pending_responses=[web.PendingResponse('RESULT', 'FALLBACK')],
+        )
+        clock = mock.Mock(side_effect=[100.0, 3_700.0])
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            clock=clock,
+        )
+        watcher.sessions = {'a': session}
+        watcher.refresh_sessions = mock.Mock()
+        watcher.recover_rejected_submission = mock.Mock(return_value=False)
+        watcher.scan_session = mock.Mock(return_value=False)
+
+        with mock.patch('builtins.print'):
+            self.assertFalse(watcher.step())
+        self.assertEqual(session.delivery_failure_started_at, 100.0)
+        self.assertEqual(session.next_delivery_at, 100.25)
+
+        with self.assertRaises(web.DeliveryFailureTimeout):
+            watcher.step()
+
+    def test_run_stops_cleanly_on_delivery_timeout_and_restores_sigint_handler(self) -> None:
+        watcher = web.WebSessionWatcher(
+            mock.Mock(),
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            poll_seconds=0.0,
+        )
+        watcher.refresh_sessions = mock.Mock()
+        watcher.step = mock.Mock(
+            side_effect=web.DeliveryFailureTimeout(
+                'Cats: unable to deliver tool results for 1 hour; stopping PGC'
+            )
+        )
+        previous_handler = object()
+        installed_handlers = []
+
+        def install_handler(signum, handler):
+            installed_handlers.append((signum, handler))
+
+        with (
+            mock.patch.object(web.signal, 'getsignal', return_value=previous_handler),
+            mock.patch.object(web.signal, 'signal', side_effect=install_handler),
+            mock.patch('builtins.print') as printed,
+        ):
+            watcher.run()
+
+        output = '\n'.join(str(call.args[0]) for call in printed.call_args_list)
+        self.assertIn('unable to deliver tool results for 1 hour; stopping PGC', output)
+        self.assertIn("Poor Girl's Codex web watcher stopped.", output)
+        self.assertEqual(installed_handlers[-1], (web.signal.SIGINT, previous_handler))
 
     def test_too_long_delivery_sends_compact_fallback_without_reexecution(self) -> None:
         interface = mock.Mock()

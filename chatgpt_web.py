@@ -21,6 +21,10 @@ DEFAULT_POLL_SECONDS = 0.25
 RECENT_ASSISTANT_MESSAGE_LIMIT = 10
 DELIVERY_RETRY_INITIAL_SECONDS = 0.25
 DELIVERY_RETRY_MAX_SECONDS = 8.0
+DELIVERY_FAILURE_TIMEOUT_SECONDS = 60.0 * 60.0
+RATE_LIMIT_BACKOFF_INITIAL_SECONDS = 60.0
+RATE_LIMIT_BACKOFF_MAX_SECONDS = 300.0
+RATE_LIMIT_BACKOFF_RESET_SECONDS = 900.0
 MESSAGE_TOO_LONG_TEXT = 'The message you submitted was too long, please edit it and resubmit.'
 SUBAGENT_COLOR_CODES = ('1;34', '1;35', '1;36', '1;33', '1;32')
 SUBAGENT_COMPLETION_INSTRUCTIONS = '''Subagent completion protocol:
@@ -31,6 +35,10 @@ SUBAGENT_COMPLETION_INSTRUCTIONS = '''Subagent completion protocol:
 
 
 class MessageTooLongError(RuntimeError):
+    pass
+
+
+class DeliveryFailureTimeout(RuntimeError):
     pass
 
 
@@ -62,6 +70,7 @@ class WebSession:
     settle_deadline: float = 0.0
     delivery_attempt: int = 0
     next_delivery_at: float = 0.0
+    delivery_failure_started_at: float | None = None
     delivered: int = 0
     routing_session_id: str | None = None
     retire_requested: bool = False
@@ -82,7 +91,9 @@ class ChatGPTWeb:
         self._playwright = None
         self._browser = None
         self._instrumented_page_ids: set[int] = set()
-        self._conversations_response_count = 0
+        self._rate_limit_until = 0.0
+        self._rate_limit_backoff_seconds = RATE_LIMIT_BACKOFF_INITIAL_SECONDS
+        self._last_rate_limit_at: float | None = None
 
     def connect(self) -> None:
         try:
@@ -157,62 +168,58 @@ class ChatGPTWeb:
         except ValueError:
             return False
 
-    @staticmethod
-    def rate_limit_headers(headers: dict[str, str]) -> dict[str, str]:
-        interesting: dict[str, str] = {}
-        for raw_name, raw_value in headers.items():
-            name = str(raw_name).lower()
-            compact_name = name.replace('-', '')
-            if (
-                'ratelimit' in compact_name
-                or name == 'retry-after'
-                or name.startswith('x-openai-')
-                or name in {'request-id', 'x-request-id'}
-                or name.startswith('cf-')
-            ):
-                interesting[name] = str(raw_value)
-        return interesting
+    def rate_limit_remaining(self, now: float | None = None) -> float:
+        if now is None:
+            now = time.monotonic()
+        return max(0.0, self._rate_limit_until - now)
 
-    @staticmethod
-    def safe_response_headers(headers: dict[str, str]) -> dict[str, str]:
-        # A 429 is rare enough that complete response metadata is useful,
-        # but never copy cookies into the terminal log.
-        return {
-            str(name).lower(): str(value)
-            for name, value in headers.items()
-            if str(name).lower() not in {'set-cookie', 'set-cookie2'}
-        }
+    def note_rate_limit(self, *, method: str, url: str) -> None:
+        now = time.monotonic()
+        already_paused = now < self._rate_limit_until
+        if not already_paused:
+            if (
+                self._last_rate_limit_at is None
+                or now - self._last_rate_limit_at >= RATE_LIMIT_BACKOFF_RESET_SECONDS
+            ):
+                self._rate_limit_backoff_seconds = RATE_LIMIT_BACKOFF_INITIAL_SECONDS
+            else:
+                self._rate_limit_backoff_seconds = min(
+                    self._rate_limit_backoff_seconds * 2,
+                    RATE_LIMIT_BACKOFF_MAX_SECONDS,
+                )
+            self._rate_limit_until = now + self._rate_limit_backoff_seconds
+            print(
+                f'  [web:rate-limit] {method} 429 {url} -- '
+                f'pausing PGC for {self._rate_limit_backoff_seconds:g}s',
+                flush=True,
+            )
+        self._last_rate_limit_at = now
+
+    def dismiss_rate_limit_dialog(self, page: Any) -> bool:
+        try:
+            dialog = page.get_by_role('dialog').filter(has_text='Too many requests')
+            button = dialog.get_by_role('button', name='Got it', exact=True).last
+            if button.count() == 0 or not button.is_visible():
+                return False
+            button.evaluate('element => element.click()')
+            return True
+        except Exception:
+            return False
 
     def log_conversations_response(self, page: Any, response: Any) -> None:
         if not self.is_conversations_response_url(str(response.url)):
             return
         try:
-            headers = response.all_headers()
             status = int(response.status)
-            method = str(response.request.method)
-            self._conversations_response_count += 1
-            sequence = self._conversations_response_count
-            timestamp = time.time()
-            conversation_id = self.conversation_id_for_url(str(page.url))
-            conversation = conversation_id[:8] if conversation_id is not None else 'new-chat'
-            print(
-                f'  [web:conversations] {timestamp:.3f} #{sequence} {conversation} '
-                f'{method} {status} {response.url}',
-                flush=True,
+            if status != 429:
+                return
+            self.note_rate_limit(
+                method=str(response.request.method),
+                url=str(response.url),
             )
-            reported_headers = (
-                self.safe_response_headers(headers)
-                if status == 429
-                else self.rate_limit_headers(headers)
-            )
-            if reported_headers:
-                print(
-                    '    response headers: '
-                    + json.dumps(reported_headers, sort_keys=True, separators=(',', ':')),
-                    flush=True,
-                )
-            elif status == 429:
-                print('    response headers: {}', flush=True)
+            # Try immediately; sync_rate_limit_suspension retries on every paused
+            # watcher iteration in case React has not painted the dialog yet.
+            self.dismiss_rate_limit_dialog(page)
         except Exception as exc:
             print(f'  [web:conversations] instrumentation error: {exc}', flush=True)
 
@@ -487,6 +494,7 @@ class WebSessionWatcher:
         self.clock = clock
         self.sessions: dict[str, WebSession] = {}
         self.sessions_by_routing_id: dict[str, WebSession] = {}
+        self.rate_limit_suspended = False
 
     @staticmethod
     def request_session_id(request: Any) -> str | None:
@@ -819,8 +827,46 @@ class WebSessionWatcher:
         session.pending_responses = restored + session.pending_responses
         return True
 
+    @staticmethod
+    def delivery_retry_delay(attempt: int) -> float:
+        delay = DELIVERY_RETRY_INITIAL_SECONDS
+        remaining = max(0, attempt)
+        while remaining > 0 and delay < DELIVERY_RETRY_MAX_SECONDS:
+            delay = min(delay * 2, DELIVERY_RETRY_MAX_SECONDS)
+            remaining -= 1
+        return min(delay, DELIVERY_RETRY_MAX_SECONDS)
+
+    @staticmethod
+    def raise_if_delivery_timed_out(session: WebSession, now: float) -> None:
+        started_at = session.delivery_failure_started_at
+        if started_at is None or now - started_at < DELIVERY_FAILURE_TIMEOUT_SECONDS:
+            return
+        for response in session.pending_responses:
+            response.set_status('Delivery failed for 1 hour; stopping PGC')
+        raise DeliveryFailureTimeout(
+            f'{session.label}: unable to deliver tool results for 1 hour; stopping PGC'
+        )
+
+    def schedule_delivery_retry(self, session: WebSession, now: float) -> float:
+        if session.delivery_failure_started_at is None:
+            session.delivery_failure_started_at = now
+        else:
+            self.raise_if_delivery_timed_out(session, now)
+
+        delay = self.delivery_retry_delay(session.delivery_attempt)
+        session.delivery_attempt += 1
+        session.next_delivery_at = now + delay
+        for response in session.pending_responses:
+            response.set_status(
+                f'ChatGPT send button is not available [retry in {delay:g}s]'
+            )
+        return delay
+
     def deliver_session(self, session: WebSession, now: float) -> bool:
-        if not session.pending_responses or now < session.next_delivery_at:
+        if not session.pending_responses:
+            return False
+        self.raise_if_delivery_timed_out(session, now)
+        if now < session.next_delivery_at:
             return False
 
         rendered = '\n'.join(
@@ -838,31 +884,13 @@ class WebSessionWatcher:
             try:
                 self.interface.submit(session, fallback)
             except RuntimeError:
-                delay = min(
-                    DELIVERY_RETRY_INITIAL_SECONDS * (2**session.delivery_attempt),
-                    DELIVERY_RETRY_MAX_SECONDS,
-                )
-                session.delivery_attempt += 1
-                session.next_delivery_at = now + delay
-                for response in session.pending_responses:
-                    response.set_status(
-                        f'ChatGPT send button is not available [retry in {delay:g}s]'
-                    )
+                self.schedule_delivery_retry(session, now)
                 return False
             for response in session.pending_responses:
                 response.set_status('[sent summary]')
             session.last_submitted_responses = []
         except RuntimeError:
-            delay = min(
-                DELIVERY_RETRY_INITIAL_SECONDS * (2**session.delivery_attempt),
-                DELIVERY_RETRY_MAX_SECONDS,
-            )
-            session.delivery_attempt += 1
-            session.next_delivery_at = now + delay
-            for response in session.pending_responses:
-                response.set_status(
-                    f'ChatGPT send button is not available [retry in {delay:g}s]'
-                )
+            self.schedule_delivery_retry(session, now)
             return False
         else:
             for response in session.pending_responses:
@@ -872,12 +900,79 @@ class WebSessionWatcher:
         session.pending_responses.clear()
         session.delivery_attempt = 0
         session.next_delivery_at = 0.0
+        session.delivery_failure_started_at = None
         session.delivered += 1
         return True
 
+    def rate_limit_remaining(self) -> float:
+        callback = getattr(self.interface, 'rate_limit_remaining', None)
+        if not callable(callback):
+            return 0.0
+        remaining = callback()
+        if not isinstance(remaining, (int, float)):
+            return 0.0
+        return max(0.0, float(remaining))
+
+    def sync_rate_limit_suspension(self) -> bool:
+        remaining = self.rate_limit_remaining()
+        if remaining > 0.0:
+            if not self.rate_limit_suspended:
+                # The response callback already made one dismissal attempt. Try once
+                # more immediately before freezing in case React painted the dialog
+                # between the network event and this watcher iteration.
+                for session in self.sessions.values():
+                    self.interface.dismiss_rate_limit_dialog(session.page)
+                    if session.cdp_session is None:
+                        continue
+                    try:
+                        session.cdp_session.send(
+                            'Emulation.setFocusEmulationEnabled',
+                            {'enabled': False},
+                        )
+                        session.cdp_session.send(
+                            'Page.setWebLifecycleState',
+                            {'state': 'frozen'},
+                        )
+                    except Exception as exc:
+                        print(
+                            f'  [web:{session.label}] rate-limit suspension error: {exc}',
+                            flush=True,
+                        )
+                self.rate_limit_suspended = True
+            return True
+
+        if self.rate_limit_suspended:
+            for session in self.sessions.values():
+                if session.cdp_session is not None:
+                    try:
+                        session.cdp_session.send(
+                            'Emulation.setFocusEmulationEnabled',
+                            {'enabled': True},
+                        )
+                        session.cdp_session.send(
+                            'Page.setWebLifecycleState',
+                            {'state': 'active'},
+                        )
+                    except Exception as exc:
+                        print(
+                            f'  [web:{session.label}] rate-limit resume error: {exc}',
+                            flush=True,
+                        )
+                # A modal that had not rendered before the freeze can materialize
+                # when the page becomes active again. Clear that before normal work.
+                self.interface.dismiss_rate_limit_dialog(session.page)
+            self.rate_limit_suspended = False
+            print('  [web:rate-limit] cooldown complete; resuming PGC', flush=True)
+        return False
+
     def step(self) -> bool:
-        self.refresh_sessions()
         now = self.clock()
+        for session in self.sessions.values():
+            if session.pending_responses:
+                self.raise_if_delivery_timed_out(session, now)
+        if self.sync_rate_limit_suspension():
+            return False
+        self.refresh_sessions()
         progressed = False
 
         # Scan every conversation before delivering anything. A slow/busy tab cannot
@@ -899,8 +994,14 @@ class WebSessionWatcher:
         for session in list(self.sessions.values()):
             try:
                 progressed = self.deliver_session(session, now) or progressed
+            except DeliveryFailureTimeout:
+                raise
             except Exception as exc:
-                print(f'  [web:{session.label}] delivery error: {exc}', flush=True)
+                delay = self.schedule_delivery_retry(session, now)
+                print(
+                    f'  [web:{session.label}] delivery error: {exc} [retry in {delay:g}s]',
+                    flush=True,
+                )
 
         return progressed
 
@@ -937,6 +1038,8 @@ class WebSessionWatcher:
                 progressed = self.step()
                 if not progressed and not stop_requested:
                     time.sleep(self.poll_seconds)
+        except DeliveryFailureTimeout as exc:
+            print(f'  [web] {exc}', flush=True)
         except KeyboardInterrupt:
             # A second Ctrl+C deliberately forces an immediate exit.
             pass

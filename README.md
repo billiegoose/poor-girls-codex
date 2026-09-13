@@ -106,7 +106,7 @@ Requests may be single calls, arrays of calls, or batches of the form:
     {
       "id": "tests",
       "tool": "run",
-      "command": ["pytest", "-q"]
+      "command": ["uv", "run", "python", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"]
     }
   ],
   "stop_on_error": true
@@ -236,6 +236,30 @@ System Settings
 ```
 
 The ChatGPT desktop application must be running with an ordinary conversation open.
+
+## Testing
+
+Poor Girl's Codex uses Python's standard-library `unittest` framework. `pytest` is not a project dependency.
+
+Run the complete test suite through the project's `uv` environment:
+
+```sh
+uv run python -m unittest discover -s tests -p 'test_*.py'
+```
+
+Run one test module while iterating on a focused change:
+
+```sh
+uv run python -m unittest tests.test_chatgpt_web
+```
+
+For a quick syntax check of files you changed, `py_compile` is also useful:
+
+```sh
+uv run python -m py_compile chatgpt_web.py tests/test_chatgpt_web.py
+```
+
+Agents working in this repository should prefer these commands instead of assuming `pytest` is installed.
 
 ## Design principles
 
