@@ -197,6 +197,12 @@ class ChatGPTWeb:
             return None
         return self.valid_request_from_message(messages.last, validate_request)
 
+    def latest_message_is_assistant(self, session: WebSession) -> bool:
+        messages = session.page.locator('[data-message-author-role]')
+        if messages.count() == 0:
+            return False
+        return messages.last.get_attribute('data-message-author-role') == 'assistant'
+
     def recent_valid_request(
         self,
         session: WebSession,
@@ -429,6 +435,12 @@ class WebSessionWatcher:
         name = self.subagent_name(routing_session_id)
         return self.color_subagent(name) if name is not None else None
 
+    def should_replay_recovered_request(self, session: WebSession, fingerprint: str) -> bool:
+        if self.interface.latest_message_is_assistant(session) is not True:
+            return False
+        latest = self.interface.valid_request(session, self.validate_request)
+        return latest is not None and latest[2] == fingerprint
+
     def bind_routing_session(self, session: WebSession, routing_session_id: str) -> None:
         existing = self.sessions_by_routing_id.get(routing_session_id)
         if existing is not None and existing is not session:
@@ -442,6 +454,12 @@ class WebSessionWatcher:
             )
         session.routing_session_id = routing_session_id
         self.sessions_by_routing_id[routing_session_id] = session
+        if (
+            self.root_session_id is not None
+            and routing_session_id.startswith(self.root_session_id + '::')
+            and session.cdp_session is None
+        ):
+            session.cdp_session = self.interface.emulate_active_page(session.page)
 
     def retire_subagent(self, session: WebSession) -> None:
         self.interface.archive_conversation(session)
@@ -472,7 +490,8 @@ class WebSessionWatcher:
             if routing_session_id != self.root_session_id:
                 continue
             self.bind_routing_session(session, routing_session_id)
-            session.seen_fingerprints.add(fingerprint)
+            if not self.should_replay_recovered_request(session, fingerprint):
+                session.seen_fingerprints.add(fingerprint)
             return session
 
         created = self.interface.create_root_conversation(bootstrap_prompt)
@@ -590,7 +609,8 @@ class WebSessionWatcher:
                             routing_session_id = self.request_session_id(request)
                             if routing_session_id is not None:
                                 self.bind_routing_session(session, routing_session_id)
-                            session.seen_fingerprints.add(fingerprint)
+                            if not self.should_replay_recovered_request(session, fingerprint):
+                                session.seen_fingerprints.add(fingerprint)
             else:
                 session.page = page
                 session.label = label

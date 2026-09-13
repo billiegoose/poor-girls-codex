@@ -7,9 +7,10 @@ import chatgpt_web as web
 
 
 class FakeLocator:
-    def __init__(self, texts=None, *, message_id=None):
+    def __init__(self, texts=None, *, message_id=None, author_role=None):
         self.texts = list(texts or [])
         self.message_id = message_id
+        self.author_role = author_role
 
     @property
     def last(self):
@@ -24,7 +25,10 @@ class FakeLocator:
         message_id = self.message_id
         if isinstance(message_id, list):
             message_id = message_id[index]
-        return FakeLocator([self.texts[index]], message_id=message_id)
+        author_role = self.author_role
+        if isinstance(author_role, list):
+            author_role = author_role[index]
+        return FakeLocator([self.texts[index]], message_id=message_id, author_role=author_role)
 
     def inner_text(self):
         return self.texts[0]
@@ -32,6 +36,8 @@ class FakeLocator:
     def get_attribute(self, name):
         if name == 'data-message-id':
             return self.message_id
+        if name == 'data-message-author-role':
+            return self.author_role
         return None
 
     def locator(self, selector):
@@ -41,11 +47,20 @@ class FakeLocator:
 
 
 class FakePage:
-    def __init__(self, url, *, title='', code=None, message_id='message-1'):
+    def __init__(
+        self,
+        url,
+        *,
+        title='',
+        code=None,
+        message_id='message-1',
+        message_roles=None,
+    ):
         self.url = url
         self._title = title
         self.code = code or []
         self.message_id = message_id
+        self.message_roles = list(message_roles or [])
 
     def title(self):
         return self._title
@@ -53,6 +68,11 @@ class FakePage:
     def locator(self, selector):
         if selector == web.ASSISTANT_SELECTOR:
             return FakeLocator(self.code, message_id=self.message_id)
+        if selector == '[data-message-author-role]':
+            return FakeLocator(
+                [''] * len(self.message_roles),
+                author_role=self.message_roles,
+            )
         return FakeLocator([])
 
 
@@ -255,6 +275,28 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertNotEqual(first[2], second[2])
 
+    def test_latest_message_is_assistant_uses_actual_final_conversation_turn(self) -> None:
+        interface = web.ChatGPTWeb()
+        assistant_last = web.WebSession(
+            'a',
+            'A',
+            FakePage(
+                'https' + '://chatgpt.com/c/a',
+                message_roles=['user', 'assistant'],
+            ),
+        )
+        user_last = web.WebSession(
+            'b',
+            'B',
+            FakePage(
+                'https' + '://chatgpt.com/c/b',
+                message_roles=['assistant', 'user'],
+            ),
+        )
+
+        self.assertTrue(interface.latest_message_is_assistant(assistant_last))
+        self.assertFalse(interface.latest_message_is_assistant(user_last))
+
     def test_recent_valid_request_looks_past_newer_non_tool_assistant_message(self) -> None:
         interface = web.ChatGPTWeb()
         session = web.WebSession(
@@ -321,7 +363,45 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIsNot(watcher.sessions['a'].seen_fingerprints, watcher.sessions['b'].seen_fingerprints)
         self.assertIsNot(watcher.sessions['a'].pending_responses, watcher.sessions['b'].pending_responses)
 
-    def test_new_session_primes_and_binds_visible_root_without_executing(self) -> None:
+    def test_new_session_replays_final_assistant_toolcall_after_restart(self) -> None:
+        interface = mock.Mock()
+        page = FakePage('https' + '://chatgpt.com/c/a', title='Cats')
+        interface.pages.return_value = [page]
+        interface.describe_page.return_value = ('a', 'Cats')
+        interface.latest_too_long_error_id.return_value = None
+        recovered = (
+            '{}',
+            {'session': 'root', 'tool': 'status'},
+            'visible-toolcall',
+        )
+        interface.recent_valid_request.return_value = recovered
+        interface.latest_message_is_assistant.return_value = True
+        interface.valid_request.return_value = recovered
+        execute = mock.Mock(return_value={'ok': True})
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=execute,
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            settle_seconds=0.0,
+        )
+
+        watcher.refresh_sessions()
+
+        session = watcher.sessions['a']
+        self.assertEqual(session.routing_session_id, 'root')
+        self.assertIs(watcher.sessions_by_routing_id['root'], session)
+        self.assertEqual(session.seen_fingerprints, set())
+        execute.assert_not_called()
+
+        self.assertFalse(watcher.scan_session(session, 0.0))
+        self.assertTrue(watcher.scan_session(session, 0.0))
+        execute.assert_called_once_with({'session': 'root', 'tool': 'status'}, announce=True)
+        self.assertEqual(session.seen_fingerprints, {'visible-toolcall'})
+
+    def test_new_session_suppresses_recovered_toolcall_when_later_user_turn_exists(self) -> None:
         interface = mock.Mock()
         page = FakePage('https' + '://chatgpt.com/c/a', title='Cats')
         interface.pages.return_value = [page]
@@ -330,13 +410,13 @@ class ChatGPTWebTests(unittest.TestCase):
         interface.recent_valid_request.return_value = (
             '{}',
             {'session': 'root', 'tool': 'status'},
-            'visible-toolcall',
+            'completed-toolcall',
         )
-        execute = mock.Mock()
+        interface.latest_message_is_assistant.return_value = False
         watcher = web.WebSessionWatcher(
             interface,
             validate_request=lambda request: None,
-            execute_request=execute,
+            execute_request=mock.Mock(),
             fenced_result=str,
             too_long_fallback=lambda request, result: 'FALLBACK',
             root_session_id='root',
@@ -344,16 +424,45 @@ class ChatGPTWebTests(unittest.TestCase):
 
         watcher.refresh_sessions()
 
-        session = watcher.sessions['a']
-        self.assertEqual(session.routing_session_id, 'root')
-        self.assertIs(watcher.sessions_by_routing_id['root'], session)
-        self.assertEqual(session.seen_fingerprints, {'visible-toolcall'})
-        execute.assert_not_called()
+        self.assertEqual(watcher.sessions['a'].seen_fingerprints, {'completed-toolcall'})
+        interface.valid_request.assert_not_called()
+
+    def test_new_session_suppresses_older_toolcall_when_latest_assistant_turn_is_prose(self) -> None:
+        interface = mock.Mock()
+        page = FakePage('https' + '://chatgpt.com/c/a', title='Cats')
+        interface.pages.return_value = [page]
+        interface.describe_page.return_value = ('a', 'Cats')
+        interface.latest_too_long_error_id.return_value = None
+        interface.recent_valid_request.return_value = (
+            '{}',
+            {'session': 'root', 'tool': 'status'},
+            'older-toolcall',
+        )
+        interface.latest_message_is_assistant.return_value = True
+        interface.valid_request.return_value = None
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+        )
+
+        watcher.refresh_sessions()
+
+        self.assertEqual(watcher.sessions['a'].seen_fingerprints, {'older-toolcall'})
 
     def test_ensure_root_session_reuses_chat_with_recent_root_toolcall(self) -> None:
         interface = mock.Mock()
         existing = web.WebSession('a', 'Existing root', mock.Mock())
         interface.recent_valid_request.return_value = (
+            '{}',
+            {'session': 'root', 'tool': 'status'},
+            'recent-root-toolcall',
+        )
+        interface.latest_message_is_assistant.return_value = True
+        interface.valid_request.return_value = (
             '{}',
             {'session': 'root', 'tool': 'status'},
             'recent-root-toolcall',
@@ -373,7 +482,7 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIs(root, existing)
         self.assertEqual(existing.routing_session_id, 'root')
         self.assertIs(watcher.sessions_by_routing_id['root'], existing)
-        self.assertEqual(existing.seen_fingerprints, {'recent-root-toolcall'})
+        self.assertEqual(existing.seen_fingerprints, set())
         interface.recent_valid_request.assert_called_once_with(existing, watcher.validate_request)
         interface.create_root_conversation.assert_not_called()
 
@@ -441,6 +550,36 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertEqual(child.seen_fingerprints, set())
         self.assertIs(watcher.sessions_by_routing_id['root::worker'], child)
         interface.valid_request.assert_not_called()
+
+    def test_restart_binding_restores_active_emulation_for_recovered_subagent(self) -> None:
+        interface = mock.Mock()
+        page = FakePage('https' + '://chatgpt.com/c/child', title='Child')
+        cdp_session = mock.Mock()
+        interface.pages.return_value = [page]
+        interface.describe_page.return_value = ('child', 'Child')
+        interface.latest_too_long_error_id.return_value = None
+        interface.recent_valid_request.return_value = (
+            '{}',
+            {'session': 'root::worker', 'tool': 'status'},
+            'child-toolcall',
+        )
+        interface.latest_message_is_assistant.return_value = False
+        interface.emulate_active_page.return_value = cdp_session
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+        )
+
+        watcher.refresh_sessions()
+
+        child = watcher.sessions['child']
+        self.assertEqual(child.routing_session_id, 'root::worker')
+        self.assertIs(child.cdp_session, cdp_session)
+        interface.emulate_active_page.assert_called_once_with(page)
 
     def test_root_session_has_no_progress_prefix(self) -> None:
         watcher = web.WebSessionWatcher(
@@ -882,24 +1021,6 @@ class ChatGPTWebTests(unittest.TestCase):
         interface.archive_conversation.assert_called_once_with(child)
         child_page.close.assert_called_once_with()
         self.assertEqual(child.pending_responses, [])
-
-    def test_new_session_primes_existing_request_without_executing_it(self) -> None:
-        interface = mock.Mock()
-        page = FakePage('https' + '://chatgpt.com/c/a', title='Cats')
-        interface.pages.return_value = [page]
-        interface.describe_page.return_value = ('a', 'Cats')
-        interface.recent_valid_request.return_value = ('{}', {'tool': 'status'}, 'already-visible')
-        execute = mock.Mock()
-        watcher = web.WebSessionWatcher(
-            interface,
-            validate_request=lambda request: None,
-            execute_request=execute,
-            fenced_result=str,
-            too_long_fallback=lambda request, result: 'FALLBACK',
-        )
-        watcher.refresh_sessions()
-        self.assertEqual(watcher.sessions['a'].seen_fingerprints, {'already-visible'})
-        execute.assert_not_called()
 
     def test_settling_is_nonblocking_and_requires_same_fingerprint(self) -> None:
         interface = mock.Mock()
