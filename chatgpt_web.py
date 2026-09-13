@@ -544,7 +544,10 @@ class WebSessionWatcher:
         self.sessions_by_routing_id[routing_session_id] = session
         if (
             self.root_session_id is not None
-            and routing_session_id.startswith(self.root_session_id + '::')
+            and (
+                routing_session_id == self.root_session_id
+                or routing_session_id.startswith(self.root_session_id + '::')
+            )
             and session.cdp_session is None
         ):
             session.cdp_session = self.interface.emulate_active_page(session.page)

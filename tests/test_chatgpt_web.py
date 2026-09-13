@@ -746,6 +746,36 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIs(watcher.sessions_by_routing_id['root::worker'], child)
         interface.valid_request.assert_not_called()
 
+    def test_restart_binding_restores_active_emulation_for_recovered_root(self) -> None:
+        interface = mock.Mock()
+        page = FakePage('https' + '://chatgpt.com/c/root-chat', title='Root')
+        cdp_session = mock.Mock()
+        interface.pages.return_value = [page]
+        interface.describe_page.return_value = ('root-chat', 'Root')
+        interface.latest_too_long_error_id.return_value = None
+        interface.recent_valid_request.return_value = (
+            '{}',
+            {'session': 'root', 'tool': 'status'},
+            'root-toolcall',
+        )
+        interface.latest_message_is_assistant.return_value = False
+        interface.emulate_active_page.return_value = cdp_session
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+        )
+
+        watcher.refresh_sessions()
+
+        root = watcher.sessions['root-chat']
+        self.assertEqual(root.routing_session_id, 'root')
+        self.assertIs(root.cdp_session, cdp_session)
+        interface.emulate_active_page.assert_called_once_with(page)
+
     def test_restart_binding_restores_active_emulation_for_recovered_subagent(self) -> None:
         interface = mock.Mock()
         page = FakePage('https' + '://chatgpt.com/c/child', title='Child')
