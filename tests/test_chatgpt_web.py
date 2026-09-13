@@ -97,6 +97,173 @@ class ChatGPTWebTests(unittest.TestCase):
         interface._browser = browser
         self.assertEqual([page.url for page in interface.pages()], ['https' + '://chatgpt.com/c/a'])
 
+    def test_conversations_response_instrumentation_logs_429_headers_without_cookies(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        page.url = 'https' + '://chatgpt.com/c/abcdef123456'
+        interface.instrument_conversations_responses(page)
+        callback = page.on.call_args.args[1]
+        response = mock.Mock()
+        response.url = 'https' + '://chatgpt.com/backend-api/conversations?offset=0&limit=28'
+        response.status = 429
+        response.request.method = 'GET'
+        response.all_headers.return_value = {
+            'X-RateLimit-Limit': '30',
+            'X-RateLimit-Remaining': '0',
+            'Retry-After': '42',
+            'CF-Ray': 'abc123',
+            'Server': 'cloudflare',
+            'Set-Cookie': 'secret=session',
+        }
+
+        with (
+            mock.patch.object(web.time, 'time', return_value=1234.567),
+            mock.patch('builtins.print') as printed,
+        ):
+            callback(response)
+
+        output = '\n'.join(str(call.args[0]) for call in printed.call_args_list)
+        self.assertIn('[web:conversations] 1234.567 #1 abcdef12 GET 429', output)
+        self.assertIn('"x-ratelimit-limit":"30"', output)
+        self.assertIn('"x-ratelimit-remaining":"0"', output)
+        self.assertIn('"retry-after":"42"', output)
+        self.assertIn('"server":"cloudflare"', output)
+        self.assertNotIn('set-cookie', output.lower())
+        self.assertNotIn('secret=session', output)
+
+    def test_conversations_response_instrumentation_logs_rate_metadata_on_success(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        page.url = 'https' + '://chatgpt.com/c/abcdef123456'
+        response = mock.Mock()
+        response.url = 'https' + '://chatgpt.com/backend-api/conversations?offset=0'
+        response.status = 200
+        response.request.method = 'GET'
+        response.all_headers.return_value = {
+            'X-Rate-Limit-Remaining': '7',
+            'CF-Ray': 'ray-id',
+            'Content-Type': 'application/json',
+        }
+
+        with mock.patch('builtins.print') as printed:
+            interface.log_conversations_response(page, response)
+
+        output = '\n'.join(str(call.args[0]) for call in printed.call_args_list)
+        self.assertIn('GET 200', output)
+        self.assertIn('"x-rate-limit-remaining":"7"', output)
+        self.assertIn('"cf-ray":"ray-id"', output)
+        self.assertNotIn('content-type', output.lower())
+
+    def test_conversations_response_instrumentation_logs_singular_conversation_endpoint(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        page.url = 'https' + '://chatgpt.com/c/abcdef123456'
+        response = mock.Mock()
+        response.url = 'https' + '://chatgpt.com/backend-api/conversation/abcdef123456'
+        response.status = 429
+        response.request.method = 'GET'
+        response.all_headers.return_value = {'Retry-After': '17'}
+
+        with mock.patch('builtins.print') as printed:
+            interface.log_conversations_response(page, response)
+
+        output = '\n'.join(str(call.args[0]) for call in printed.call_args_list)
+        self.assertIn('GET 429', output)
+        self.assertIn('/backend-api/conversation/abcdef123456', output)
+        self.assertIn('"retry-after":"17"', output)
+
+    def test_conversations_response_instrumentation_logs_bare_singular_conversation_endpoint(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        page.url = 'https' + '://chatgpt.com/c/abcdef123456'
+        response = mock.Mock()
+        response.url = 'https' + '://chatgpt.com/backend-api/conversation'
+        response.status = 200
+        response.request.method = 'POST'
+        response.all_headers.return_value = {}
+
+        with mock.patch('builtins.print') as printed:
+            interface.log_conversations_response(page, response)
+
+        output = '\n'.join(str(call.args[0]) for call in printed.call_args_list)
+        self.assertIn('POST 200', output)
+        self.assertIn('/backend-api/conversation', output)
+
+    def test_conversations_response_instrumentation_logs_f_conversation_endpoint(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        page.url = 'https' + '://chatgpt.com/c/abcdef123456'
+        response = mock.Mock()
+        response.url = 'https' + '://chatgpt.com/backend-api/f/conversation'
+        response.status = 429
+        response.request.method = 'POST'
+        response.all_headers.return_value = {
+            'Retry-After': '23',
+            'X-RateLimit-Remaining': '0',
+        }
+
+        with mock.patch('builtins.print') as printed:
+            interface.log_conversations_response(page, response)
+
+        output = '\n'.join(str(call.args[0]) for call in printed.call_args_list)
+        self.assertIn('POST 429', output)
+        self.assertIn('/backend-api/f/conversation', output)
+        self.assertIn('"retry-after":"23"', output)
+        self.assertIn('"x-ratelimit-remaining":"0"', output)
+
+    def test_conversations_response_instrumentation_attaches_once_per_page(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+
+        interface.instrument_conversations_responses(page)
+        interface.instrument_conversations_responses(page)
+
+        page.on.assert_called_once_with('response', mock.ANY)
+
+    def test_conversations_response_instrumentation_ignores_same_path_on_other_hosts(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        page.url = 'https' + '://chatgpt.com/c/abcdef123456'
+        response = mock.Mock()
+        response.url = 'https' + '://example.com/backend-api/conversations?offset=0'
+
+        with mock.patch('builtins.print') as printed:
+            interface.log_conversations_response(page, response)
+
+        printed.assert_not_called()
+        response.all_headers.assert_not_called()
+
+    def test_conversations_response_instrumentation_ignores_malformed_urls(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        response = mock.Mock()
+        response.url = 'https://[broken/backend-api/conversations'
+
+        with mock.patch('builtins.print') as printed:
+            interface.log_conversations_response(page, response)
+
+        printed.assert_not_called()
+        response.all_headers.assert_not_called()
+
+    def test_refresh_sessions_attaches_conversations_instrumentation_to_existing_pages(self) -> None:
+        interface = mock.Mock()
+        page = FakePage('https' + '://chatgpt.com/c/a', title='Cats')
+        interface.pages.return_value = [page]
+        interface.describe_page.return_value = ('a', 'Cats')
+        interface.recent_valid_request.return_value = None
+        interface.latest_too_long_error_id.return_value = None
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+
+        watcher.refresh_sessions()
+
+        interface.instrument_conversations_responses.assert_called_once_with(page)
+
     def test_create_conversation_uses_plain_chatgpt_root_url(self) -> None:
         interface = web.ChatGPTWeb()
         page = mock.Mock()
@@ -117,7 +284,12 @@ class ChatGPTWebTests(unittest.TestCase):
             prompt='Do work',
         )
 
+        page.on.assert_called_once_with('response', mock.ANY)
         page.goto.assert_called_once_with('https' + '://chatgpt.com/', wait_until='domcontentloaded')
+        self.assertLess(
+            page.method_calls.index(mock.call.on('response', mock.ANY)),
+            page.method_calls.index(mock.call.goto('https' + '://chatgpt.com/', wait_until='domcontentloaded')),
+        )
         page.locator.assert_any_call(web.ASSISTANT_SELECTOR)
         page.locator.return_value.last.wait_for.assert_any_call(state='attached', timeout=30_000)
         self.assertEqual(child.conversation_id, 'child')

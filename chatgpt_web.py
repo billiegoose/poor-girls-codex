@@ -81,6 +81,8 @@ class ChatGPTWeb:
         self.cdp_url = cdp_url
         self._playwright = None
         self._browser = None
+        self._instrumented_page_ids: set[int] = set()
+        self._conversations_response_count = 0
 
     def connect(self) -> None:
         try:
@@ -138,6 +140,91 @@ class ChatGPTWeb:
             title = ''
         label = title or f'chat-{conversation_id[:8]}'
         return conversation_id, label
+
+    @staticmethod
+    def is_conversations_response_url(url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+            if parsed.hostname != 'chatgpt.com':
+                return False
+            return (
+                parsed.path == '/backend-api/conversations'
+                or parsed.path == '/backend-api/conversation'
+                or parsed.path.startswith('/backend-api/conversation/')
+                or parsed.path == '/backend-api/f/conversation'
+                or parsed.path.startswith('/backend-api/f/conversation/')
+            )
+        except ValueError:
+            return False
+
+    @staticmethod
+    def rate_limit_headers(headers: dict[str, str]) -> dict[str, str]:
+        interesting: dict[str, str] = {}
+        for raw_name, raw_value in headers.items():
+            name = str(raw_name).lower()
+            compact_name = name.replace('-', '')
+            if (
+                'ratelimit' in compact_name
+                or name == 'retry-after'
+                or name.startswith('x-openai-')
+                or name in {'request-id', 'x-request-id'}
+                or name.startswith('cf-')
+            ):
+                interesting[name] = str(raw_value)
+        return interesting
+
+    @staticmethod
+    def safe_response_headers(headers: dict[str, str]) -> dict[str, str]:
+        # A 429 is rare enough that complete response metadata is useful,
+        # but never copy cookies into the terminal log.
+        return {
+            str(name).lower(): str(value)
+            for name, value in headers.items()
+            if str(name).lower() not in {'set-cookie', 'set-cookie2'}
+        }
+
+    def log_conversations_response(self, page: Any, response: Any) -> None:
+        if not self.is_conversations_response_url(str(response.url)):
+            return
+        try:
+            headers = response.all_headers()
+            status = int(response.status)
+            method = str(response.request.method)
+            self._conversations_response_count += 1
+            sequence = self._conversations_response_count
+            timestamp = time.time()
+            conversation_id = self.conversation_id_for_url(str(page.url))
+            conversation = conversation_id[:8] if conversation_id is not None else 'new-chat'
+            print(
+                f'  [web:conversations] {timestamp:.3f} #{sequence} {conversation} '
+                f'{method} {status} {response.url}',
+                flush=True,
+            )
+            reported_headers = (
+                self.safe_response_headers(headers)
+                if status == 429
+                else self.rate_limit_headers(headers)
+            )
+            if reported_headers:
+                print(
+                    '    response headers: '
+                    + json.dumps(reported_headers, sort_keys=True, separators=(',', ':')),
+                    flush=True,
+                )
+            elif status == 429:
+                print('    response headers: {}', flush=True)
+        except Exception as exc:
+            print(f'  [web:conversations] instrumentation error: {exc}', flush=True)
+
+    def instrument_conversations_responses(self, page: Any) -> None:
+        page_id = id(page)
+        if page_id in self._instrumented_page_ids:
+            return
+        page.on(
+            'response',
+            lambda response: self.log_conversations_response(page, response),
+        )
+        self._instrumented_page_ids.add(page_id)
 
     @staticmethod
     def json_candidates_for_message(message: Any) -> tuple[str | None, list[str]]:
@@ -294,6 +381,7 @@ class ChatGPTWeb:
         emulate_active: bool = False,
     ) -> WebSession:
         page = context.new_page()
+        self.instrument_conversations_responses(page)
         cdp_session = self.emulate_active_page(page) if emulate_active else None
         try:
             page.goto('https' + '://chatgpt.com/', wait_until='domcontentloaded')
@@ -580,6 +668,7 @@ class WebSessionWatcher:
     def refresh_sessions(self, *, prime_new: bool = True) -> None:
         live: set[str] = set()
         for page in self.interface.pages():
+            self.interface.instrument_conversations_responses(page)
             conversation_id, label = self.interface.describe_page(page)
             live.add(conversation_id)
             session = self.sessions.get(conversation_id)
