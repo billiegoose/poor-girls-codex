@@ -17,6 +17,7 @@ SEND_SELECTOR = 'button[data-testid="send-button"]'
 DEFAULT_CDP_URL = 'http' + '://127.0.0.1:9222'
 DEFAULT_SETTLE_SECONDS = 0.35
 DEFAULT_POLL_SECONDS = 0.25
+RECENT_ASSISTANT_MESSAGE_LIMIT = 3
 DELIVERY_RETRY_INITIAL_SECONDS = 0.25
 DELIVERY_RETRY_MAX_SECONDS = 8.0
 MESSAGE_TOO_LONG_TEXT = 'The message you submitted was too long, please edit it and resubmit.'
@@ -57,6 +58,7 @@ class WebSession:
     next_delivery_at: float = 0.0
     delivered: int = 0
     routing_session_id: str | None = None
+    retire_requested: bool = False
 
     @property
     def url(self) -> str:
@@ -130,33 +132,36 @@ class ChatGPTWeb:
         label = title or f'chat-{conversation_id[:8]}'
         return conversation_id, label
 
-    def latest_json_candidates(self, session: WebSession) -> tuple[str | None, list[str]]:
-        messages = session.page.locator(ASSISTANT_SELECTOR)
-        if messages.count() == 0:
-            return None, []
-        latest = messages.last
-        message_id = latest.get_attribute('data-message-id')
+    @staticmethod
+    def json_candidates_for_message(message: Any) -> tuple[str | None, list[str]]:
+        message_id = message.get_attribute('data-message-id')
         candidates: list[str] = []
-        code = latest.locator('pre code')
+        code = message.locator('pre code')
         for index in range(code.count()):
             text = code.nth(index).inner_text().strip()
             if text:
                 candidates.append(text)
         if candidates:
             return message_id, candidates
-        pre = latest.locator('pre')
+        pre = message.locator('pre')
         for index in range(pre.count()):
             text = pre.nth(index).inner_text().strip()
             if text:
                 candidates.append(text)
         return message_id, candidates
 
-    def valid_request(
+    def latest_json_candidates(self, session: WebSession) -> tuple[str | None, list[str]]:
+        messages = session.page.locator(ASSISTANT_SELECTOR)
+        if messages.count() == 0:
+            return None, []
+        return self.json_candidates_for_message(messages.last)
+
+    def valid_request_from_message(
         self,
-        session: WebSession,
+        message: Any,
         validate_request: Callable[[Any], None],
     ) -> tuple[str, Any, str] | None:
-        message_id, sources = self.latest_json_candidates(session)
+        message_id, sources = self.json_candidates_for_message(message)
         candidates: list[tuple[int, str, Any]] = []
         for source in sources:
             source = source.strip()
@@ -174,6 +179,32 @@ class ChatGPTWeb:
         identity = (message_id or '') + '\0' + source
         fingerprint = hashlib.sha256(identity.encode('utf-8')).hexdigest()
         return source, request, fingerprint
+
+    def valid_request(
+        self,
+        session: WebSession,
+        validate_request: Callable[[Any], None],
+    ) -> tuple[str, Any, str] | None:
+        messages = session.page.locator(ASSISTANT_SELECTOR)
+        if messages.count() == 0:
+            return None
+        return self.valid_request_from_message(messages.last, validate_request)
+
+    def recent_valid_request(
+        self,
+        session: WebSession,
+        validate_request: Callable[[Any], None],
+        *,
+        limit: int = RECENT_ASSISTANT_MESSAGE_LIMIT,
+    ) -> tuple[str, Any, str] | None:
+        messages = session.page.locator(ASSISTANT_SELECTOR)
+        count = messages.count()
+        start = max(0, count - limit)
+        for index in range(count - 1, start - 1, -1):
+            request = self.valid_request_from_message(messages.nth(index), validate_request)
+            if request is not None:
+                return request
+        return None
 
     def set_composer_text(self, session: WebSession, text: str) -> None:
         composer = session.page.locator(COMPOSER_SELECTOR).last
@@ -227,18 +258,12 @@ class ChatGPTWeb:
         # foreground-tab actionability.
         button.last.evaluate('element => element.click()')
 
-    def create_conversation(
-        self,
-        *,
-        origin: WebSession,
-        label: str,
-        prompt: str,
-    ) -> WebSession:
-        page = origin.page.context.new_page()
+    def _create_conversation(self, context: Any, *, label: str | None, prompt: str) -> WebSession:
+        page = context.new_page()
         try:
             page.goto('https' + '://chatgpt.com/', wait_until='domcontentloaded')
             page.locator(COMPOSER_SELECTOR).last.wait_for(state='visible', timeout=15_000)
-            pending = WebSession('', label, page)
+            pending = WebSession('', label or 'new chat', page)
             self.submit(pending, prompt)
             page.wait_for_url(
                 lambda url: self.conversation_id_for_url(str(url)) is not None,
@@ -248,11 +273,48 @@ class ChatGPTWeb:
             # conversation's assistant turn has actually started. ChatGPT can
             # otherwise leave a just-submitted background tab dormant forever.
             page.locator(ASSISTANT_SELECTOR).last.wait_for(state='attached', timeout=30_000)
-            conversation_id, _ = self.describe_page(page)
-            return WebSession(conversation_id, label, page)
+            conversation_id, page_label = self.describe_page(page)
+            return WebSession(conversation_id, label or page_label, page)
         except Exception:
             page.close()
             raise
+
+    def create_conversation(
+        self,
+        *,
+        origin: WebSession,
+        label: str,
+        prompt: str,
+    ) -> WebSession:
+        return self._create_conversation(origin.page.context, label=label, prompt=prompt)
+
+    def create_root_conversation(self, prompt: str) -> WebSession:
+        if self._browser is None:
+            raise RuntimeError('chatgpt-web is not connected')
+        contexts = self._browser.contexts
+        if not contexts:
+            raise RuntimeError('connected Chrome browser has no usable context')
+        return self._create_conversation(contexts[0], label=None, prompt=prompt)
+
+    def archive_conversation(self, session: WebSession) -> None:
+        result = session.page.evaluate(
+            """async conversationId => {
+                const response = await fetch(`/backend-api/conversation/${conversationId}`, {
+                    method: 'PATCH',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({is_archived: true}),
+                });
+                return {ok: response.ok, status: response.status, text: await response.text()};
+            }""",
+            session.conversation_id,
+        )
+        if not result.get('ok'):
+            status = result.get('status', '?')
+            text = str(result.get('text', '')).strip()
+            detail = f': {text}' if text else ''
+            raise RuntimeError(
+                f'{session.label}: failed to archive ChatGPT conversation ({status}){detail}'
+            )
 
 
 class WebSessionWatcher:
@@ -334,6 +396,40 @@ class WebSessionWatcher:
         session.routing_session_id = routing_session_id
         self.sessions_by_routing_id[routing_session_id] = session
 
+    def retire_subagent(self, session: WebSession) -> None:
+        self.interface.archive_conversation(session)
+        session.page.close()
+        routing_session_id = session.routing_session_id
+        if routing_session_id is not None:
+            self.sessions_by_routing_id.pop(routing_session_id, None)
+            session.routing_session_id = None
+        self.sessions.pop(session.conversation_id, None)
+
+    def ensure_root_session(self, bootstrap_prompt: str) -> WebSession | None:
+        if self.root_session_id is None:
+            return None
+
+        attached = self.sessions_by_routing_id.get(self.root_session_id)
+        if attached is not None:
+            return attached
+
+        for session in self.sessions.values():
+            recent = self.interface.recent_valid_request(session, self.validate_request)
+            if recent is None:
+                continue
+            _, request, fingerprint = recent
+            routing_session_id = self.request_session_id(request)
+            if routing_session_id != self.root_session_id:
+                continue
+            self.bind_routing_session(session, routing_session_id)
+            session.seen_fingerprints.add(fingerprint)
+            return session
+
+        created = self.interface.create_root_conversation(bootstrap_prompt)
+        self.sessions[created.conversation_id] = created
+        self.bind_routing_session(created, self.root_session_id)
+        return created
+
     def execute_orchestration_tool(
         self,
         origin: WebSession,
@@ -344,6 +440,14 @@ class WebSessionWatcher:
         tool = call.get('tool')
         call_id = call.get('id', str(index))
         base = {'id': call_id, 'tool': tool}
+
+        if origin.retire_requested:
+            return {
+                **base,
+                'ok': False,
+                'skipped': True,
+                'error': 'skipped because this subagent already handed off',
+            }
 
         if tool == 'subagent':
             if self.bootstrap_prompt_for_session is None:
@@ -395,6 +499,7 @@ class WebSessionWatcher:
                 + '\n'
             )
             parent.pending_responses.append(PendingResponse(message, message))
+            origin.retire_requested = True
             return {**base, 'ok': True, 'parent_session': parent_session_id}
 
         from toolcall_lib import execute
@@ -427,7 +532,7 @@ class WebSessionWatcher:
                     session.last_too_long_error_id = self.interface.latest_too_long_error_id(session)
                     self.sessions[conversation_id] = session
                     if prime_new:
-                        existing = self.interface.valid_request(session, self.validate_request)
+                        existing = self.interface.recent_valid_request(session, self.validate_request)
                         if existing is not None:
                             _, request, fingerprint = existing
                             routing_session_id = self.request_session_id(request)
@@ -502,6 +607,21 @@ class WebSessionWatcher:
             if progress_prefix is not None:
                 execute_kwargs['progress_prefix'] = progress_prefix
             result = self.execute_request(request, **execute_kwargs)
+
+        results = result if isinstance(result, list) else [result]
+        successful_handoff = any(
+            isinstance(call, dict)
+            and call.get('tool') == 'handoff'
+            and index < len(results)
+            and isinstance(results[index], dict)
+            and results[index].get('ok') is True
+            for index, call in enumerate(calls)
+        )
+        if successful_handoff:
+            session.retire_requested = True
+            self.retire_subagent(session)
+            return True
+
         response_progress = ResponseProgress(prefix=progress_prefix)
         session.pending_responses.append(
             PendingResponse(
@@ -593,6 +713,13 @@ class WebSessionWatcher:
         # Scan every conversation before delivering anything. A slow/busy tab cannot
         # redirect another tab's state, and simultaneous model turns are observed fairly.
         for session in list(self.sessions.values()):
+            if session.retire_requested:
+                try:
+                    self.retire_subagent(session)
+                    progressed = True
+                except Exception as exc:
+                    print(f'  [web:{session.label}] retirement error: {exc}', flush=True)
+                continue
             try:
                 progressed = self.recover_rejected_submission(session) or progressed
                 progressed = self.scan_session(session, now) or progressed
@@ -607,14 +734,23 @@ class WebSessionWatcher:
 
         return progressed
 
-    def run(self) -> None:
+    def run(self, *, bootstrap_prompt: str = '') -> None:
         self.refresh_sessions()
+        root = self.ensure_root_session(bootstrap_prompt) if self.root_session_id is not None else None
         if self.root_session_id is not None:
-            print(f'PGC session: {self.root_session_id}', flush=True)
-            root = self.sessions_by_routing_id.get(self.root_session_id)
+            print(
+                f"  {progress_color('[session]', '1;35')} {self.root_session_id}",
+                flush=True,
+            )
             if root is not None:
-                print(f'attached {root.label} ({root.conversation_id[:8]})', flush=True)
-        print('chatgpt-web watcher ready', flush=True)
+                print(
+                    f"  {progress_color('[attached]', '1;36')} {root.label} ({root.conversation_id[:8]})",
+                    flush=True,
+                )
+        print(
+            f"  {progress_color('[ready]', '1;32')} Waiting for ChatGPT tool calls...",
+            flush=True,
+        )
         try:
             while True:
                 progressed = self.step()
@@ -660,7 +796,7 @@ def run_web_watcher(
             too_long_fallback=too_long_fallback,
             root_session_id=session_id,
             bootstrap_prompt_for_session=bootstrap_prompt_for_session,
-        ).run()
+        ).run(bootstrap_prompt=bootstrap_prompt)
     finally:
         interface.close()
 

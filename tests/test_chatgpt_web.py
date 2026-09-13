@@ -13,13 +13,18 @@ class FakeLocator:
 
     @property
     def last(self):
-        return self
+        if not self.texts:
+            return self
+        return self.nth(len(self.texts) - 1)
 
     def count(self):
         return len(self.texts)
 
     def nth(self, index):
-        return FakeLocator([self.texts[index]], message_id=self.message_id)
+        message_id = self.message_id
+        if isinstance(message_id, list):
+            message_id = message_id[index]
+        return FakeLocator([self.texts[index]], message_id=message_id)
 
     def inner_text(self):
         return self.texts[0]
@@ -97,6 +102,28 @@ class ChatGPTWebTests(unittest.TestCase):
         page.locator.return_value.last.wait_for.assert_any_call(state='attached', timeout=30_000)
         self.assertEqual(child.conversation_id, 'child')
 
+    def test_archive_conversation_marks_chat_archived(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        page.evaluate.return_value = {'ok': True, 'status': 200, 'text': ''}
+        session = web.WebSession('conversation-123', 'Child', page)
+
+        interface.archive_conversation(session)
+
+        script, conversation_id = page.evaluate.call_args.args
+        self.assertEqual(conversation_id, 'conversation-123')
+        self.assertIn('is_archived: true', script)
+        self.assertIn("method: 'PATCH'", script)
+
+    def test_archive_conversation_raises_on_failed_request(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        page.evaluate.return_value = {'ok': False, 'status': 500, 'text': 'archive failed'}
+        session = web.WebSession('conversation-123', 'Child', page)
+
+        with self.assertRaisesRegex(RuntimeError, 'failed to archive.*500.*archive failed'):
+            interface.archive_conversation(session)
+
     def test_submit_uses_dom_click_without_playwright_actionability(self) -> None:
         interface = web.ChatGPTWeb()
         button = mock.Mock()
@@ -163,6 +190,51 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertNotEqual(first[2], second[2])
 
+    def test_recent_valid_request_looks_past_newer_non_tool_assistant_message(self) -> None:
+        interface = web.ChatGPTWeb()
+        session = web.WebSession(
+            'a',
+            'A',
+            FakePage(
+                'https' + '://chatgpt.com/c/a',
+                code=[
+                    '{"session":"root","id":"x","tool":"status"}',
+                    'finished normally without a tool call',
+                ],
+                message_id=['m1', 'm2'],
+            ),
+        )
+
+        result = interface.recent_valid_request(
+            session,
+            lambda request: None if request.get('session') == 'root' else (_ for _ in ()).throw(ValueError()),
+        )
+
+        self.assertIsNotNone(result)
+        _, request, fingerprint = result
+        self.assertEqual(request['session'], 'root')
+        self.assertEqual(request['tool'], 'status')
+        self.assertTrue(fingerprint)
+
+    def test_recent_valid_request_is_bounded_to_last_three_assistant_messages(self) -> None:
+        interface = web.ChatGPTWeb()
+        session = web.WebSession(
+            'a',
+            'A',
+            FakePage(
+                'https' + '://chatgpt.com/c/a',
+                code=[
+                    '{"session":"root","id":"old","tool":"status"}',
+                    'newer prose one',
+                    'newer prose two',
+                    'newer prose three',
+                ],
+                message_id=['m0', 'm1', 'm2', 'm3'],
+            ),
+        )
+
+        self.assertIsNone(interface.recent_valid_request(session, lambda request: None))
+
     def test_refresh_gives_each_conversation_independent_state(self) -> None:
         interface = mock.Mock()
         pages = [
@@ -171,7 +243,7 @@ class ChatGPTWebTests(unittest.TestCase):
         ]
         interface.pages.return_value = pages
         interface.describe_page.side_effect = [('a', 'Cats'), ('b', 'Dogs')]
-        interface.valid_request.return_value = None
+        interface.recent_valid_request.return_value = None
         interface.latest_too_long_error_id.return_value = None
         watcher = web.WebSessionWatcher(
             interface,
@@ -191,7 +263,7 @@ class ChatGPTWebTests(unittest.TestCase):
         interface.pages.return_value = [page]
         interface.describe_page.return_value = ('a', 'Cats')
         interface.latest_too_long_error_id.return_value = None
-        interface.valid_request.return_value = (
+        interface.recent_valid_request.return_value = (
             '{}',
             {'session': 'root', 'tool': 'status'},
             'visible-toolcall',
@@ -213,6 +285,61 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIs(watcher.sessions_by_routing_id['root'], session)
         self.assertEqual(session.seen_fingerprints, {'visible-toolcall'})
         execute.assert_not_called()
+
+    def test_ensure_root_session_reuses_chat_with_recent_root_toolcall(self) -> None:
+        interface = mock.Mock()
+        existing = web.WebSession('a', 'Existing root', mock.Mock())
+        interface.recent_valid_request.return_value = (
+            '{}',
+            {'session': 'root', 'tool': 'status'},
+            'recent-root-toolcall',
+        )
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+        )
+        watcher.sessions['a'] = existing
+
+        root = watcher.ensure_root_session('BOOTSTRAP')
+
+        self.assertIs(root, existing)
+        self.assertEqual(existing.routing_session_id, 'root')
+        self.assertIs(watcher.sessions_by_routing_id['root'], existing)
+        self.assertEqual(existing.seen_fingerprints, {'recent-root-toolcall'})
+        interface.recent_valid_request.assert_called_once_with(existing, watcher.validate_request)
+        interface.create_root_conversation.assert_not_called()
+
+    def test_ensure_root_session_ignores_recent_descendant_toolcall(self) -> None:
+        interface = mock.Mock()
+        existing = web.WebSession('a', 'Subagent', mock.Mock())
+        created = web.WebSession('new-root', 'Created root', mock.Mock())
+        interface.recent_valid_request.return_value = (
+            '{}',
+            {'session': 'root::worker', 'tool': 'status'},
+            'recent-child-toolcall',
+        )
+        interface.create_root_conversation.return_value = created
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+        )
+        watcher.sessions['a'] = existing
+
+        root = watcher.ensure_root_session('BOOTSTRAP')
+
+        self.assertIs(root, created)
+        interface.create_root_conversation.assert_called_once_with('BOOTSTRAP')
+        self.assertIs(watcher.sessions['new-root'], created)
+        self.assertEqual(created.routing_session_id, 'root')
+        self.assertIs(watcher.sessions_by_routing_id['root'], created)
 
     def test_refresh_rekeys_same_page_when_temporary_conversation_id_changes(self) -> None:
         interface = mock.Mock()
@@ -416,12 +543,250 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertFalse(result['ok'])
         self.assertIn('no parent', result['error'])
 
+    def test_failed_handoff_stays_open_and_queues_tool_result(self) -> None:
+        interface = mock.Mock()
+        child_page = mock.Mock()
+        child = web.WebSession(
+            'child-c',
+            'Child',
+            child_page,
+            routing_session_id='root::worker',
+            settling_fingerprint='fp',
+            settle_deadline=0.0,
+        )
+        request = {
+            'session': 'root::worker',
+            'id': 'h',
+            'tool': 'handoff',
+            'result': 'cannot deliver',
+        }
+        interface.valid_request.return_value = ('{}', request, 'fp')
+
+        def execute(request, **kwargs):
+            return kwargs['tool_executor'](request, 0)
+
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=execute,
+            fenced_result=lambda result: 'RESULT',
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            settle_seconds=0.0,
+        )
+        watcher.sessions = {'child-c': child}
+        watcher.sessions_by_routing_id = {'root::worker': child}
+
+        self.assertTrue(watcher.scan_session(child, 0.0))
+
+        self.assertFalse(child.retire_requested)
+        self.assertIs(watcher.sessions['child-c'], child)
+        self.assertIs(watcher.sessions_by_routing_id['root::worker'], child)
+        interface.archive_conversation.assert_not_called()
+        child_page.close.assert_not_called()
+        self.assertEqual([response.result for response in child.pending_responses], ['RESULT'])
+
+    def test_successful_handoff_archives_closes_and_unbinds_subagent(self) -> None:
+        interface = mock.Mock()
+        parent = web.WebSession('parent-c', 'Parent', mock.Mock(), routing_session_id='root')
+        child_page = mock.Mock()
+        child = web.WebSession(
+            'child-c',
+            'Child',
+            child_page,
+            routing_session_id='root::worker',
+            settling_fingerprint='fp',
+            settle_deadline=0.0,
+        )
+        request = {
+            'session': 'root::worker',
+            'id': 'h',
+            'tool': 'handoff',
+            'result': 'finished work',
+        }
+        interface.valid_request.return_value = ('{}', request, 'fp')
+
+        def execute(request, **kwargs):
+            return kwargs['tool_executor'](request, 0)
+
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=execute,
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            settle_seconds=0.0,
+        )
+        watcher.sessions = {'child-c': child}
+        watcher.sessions_by_routing_id = {'root': parent, 'root::worker': child}
+
+        self.assertTrue(watcher.scan_session(child, 0.0))
+
+        self.assertEqual(len(parent.pending_responses), 1)
+        self.assertIn('finished work', parent.pending_responses[0].result)
+        interface.archive_conversation.assert_called_once_with(child)
+        child_page.close.assert_called_once_with()
+        self.assertNotIn('child-c', watcher.sessions)
+        self.assertNotIn('root::worker', watcher.sessions_by_routing_id)
+        self.assertIsNone(child.routing_session_id)
+        self.assertEqual(child.pending_responses, [])
+        interface.submit.assert_not_called()
+
+    def test_handoff_retirement_retries_archive_without_reexecuting_handoff(self) -> None:
+        interface = mock.Mock()
+        parent = web.WebSession('parent-c', 'Parent', mock.Mock(), routing_session_id='root')
+        child_page = mock.Mock()
+        child = web.WebSession(
+            'child-c',
+            'Child',
+            child_page,
+            routing_session_id='root::worker',
+            settling_fingerprint='fp',
+            settle_deadline=0.0,
+        )
+        request = {
+            'session': 'root::worker',
+            'id': 'h',
+            'tool': 'handoff',
+            'result': 'finished once',
+        }
+        interface.pages.return_value = [child_page]
+        interface.describe_page.return_value = ('child-c', 'Child')
+        interface.valid_request.return_value = ('{}', request, 'fp')
+        interface.archive_conversation.side_effect = [RuntimeError('archive busy'), None]
+        executions = 0
+
+        def execute(request, **kwargs):
+            nonlocal executions
+            executions += 1
+            return kwargs['tool_executor'](request, 0)
+
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=execute,
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            settle_seconds=0.0,
+            clock=lambda: 0.0,
+        )
+        watcher.sessions = {'child-c': child}
+        watcher.sessions_by_routing_id = {'root': parent, 'root::worker': child}
+
+        watcher.step()
+        self.assertTrue(child.retire_requested)
+        self.assertEqual(executions, 1)
+        self.assertEqual(len(parent.pending_responses), 1)
+        child_page.close.assert_not_called()
+
+        watcher.step()
+        self.assertEqual(executions, 1)
+        self.assertEqual(len(parent.pending_responses), 1)
+        self.assertEqual(interface.archive_conversation.call_count, 2)
+        child_page.close.assert_called_once_with()
+        self.assertNotIn('child-c', watcher.sessions)
+        self.assertNotIn('root::worker', watcher.sessions_by_routing_id)
+
+    def test_calls_after_successful_handoff_are_skipped(self) -> None:
+        interface = mock.Mock()
+        parent = web.WebSession('parent-c', 'Parent', mock.Mock(), routing_session_id='root')
+        child_page = mock.Mock()
+        child = web.WebSession(
+            'child-c',
+            'Child',
+            child_page,
+            routing_session_id='root::worker',
+            settling_fingerprint='fp',
+            settle_deadline=0.0,
+        )
+        request = {
+            'session': 'root::worker',
+            'calls': [
+                {'id': 'h', 'tool': 'handoff', 'result': 'done now'},
+                {'id': 'x', 'tool': 'status'},
+            ],
+        }
+        interface.valid_request.return_value = ('{}', request, 'fp')
+        captured_results = []
+
+        def execute(request, **kwargs):
+            for index, call in enumerate(request['calls']):
+                captured_results.append(kwargs['tool_executor'](call, index))
+            return captured_results
+
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=execute,
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            settle_seconds=0.0,
+        )
+        watcher.sessions = {'child-c': child}
+        watcher.sessions_by_routing_id = {'root': parent, 'root::worker': child}
+
+        with mock.patch('toolcall_lib.execute') as local_execute:
+            self.assertTrue(watcher.scan_session(child, 0.0))
+
+        local_execute.assert_not_called()
+        self.assertTrue(captured_results[0]['ok'])
+        self.assertTrue(captured_results[1]['skipped'])
+        self.assertIn('already handed off', captured_results[1]['error'])
+        interface.archive_conversation.assert_called_once_with(child)
+        child_page.close.assert_called_once_with()
+
+    def test_mixed_batch_detects_handoff_result_at_matching_index(self) -> None:
+        interface = mock.Mock()
+        parent = web.WebSession('parent-c', 'Parent', mock.Mock(), routing_session_id='root')
+        child_page = mock.Mock()
+        child = web.WebSession(
+            'child-c',
+            'Child',
+            child_page,
+            routing_session_id='root::worker',
+            settling_fingerprint='fp',
+            settle_deadline=0.0,
+        )
+        request = {
+            'session': 'root::worker',
+            'calls': [
+                {'id': 'x', 'tool': 'status'},
+                {'id': 'h', 'tool': 'handoff', 'result': 'mixed result'},
+            ],
+        }
+        interface.valid_request.return_value = ('{}', request, 'fp')
+
+        def execute(request, **kwargs):
+            return [
+                kwargs['tool_executor'](call, index)
+                for index, call in enumerate(request['calls'])
+            ]
+
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=execute,
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            settle_seconds=0.0,
+        )
+        watcher.sessions = {'child-c': child}
+        watcher.sessions_by_routing_id = {'root': parent, 'root::worker': child}
+
+        with mock.patch('toolcall_lib.execute', return_value={'id': 'x', 'tool': 'status', 'ok': True}):
+            self.assertTrue(watcher.scan_session(child, 0.0))
+
+        self.assertEqual(len(parent.pending_responses), 1)
+        self.assertIn('mixed result', parent.pending_responses[0].result)
+        interface.archive_conversation.assert_called_once_with(child)
+        child_page.close.assert_called_once_with()
+        self.assertEqual(child.pending_responses, [])
+
     def test_new_session_primes_existing_request_without_executing_it(self) -> None:
         interface = mock.Mock()
         page = FakePage('https' + '://chatgpt.com/c/a', title='Cats')
         interface.pages.return_value = [page]
         interface.describe_page.return_value = ('a', 'Cats')
-        interface.valid_request.return_value = ('{}', {'tool': 'status'}, 'already-visible')
+        interface.recent_valid_request.return_value = ('{}', {'tool': 'status'}, 'already-visible')
         execute = mock.Mock()
         watcher = web.WebSessionWatcher(
             interface,
@@ -487,6 +852,28 @@ class ChatGPTWebTests(unittest.TestCase):
         ])
         self.assertEqual(a.delivered, 1)
         self.assertEqual(b.delivered, 1)
+
+    def test_run_web_watcher_passes_bootstrap_prompt_to_watcher_run(self) -> None:
+        interface = mock.Mock()
+        watcher = mock.Mock()
+        with (
+            mock.patch.object(web, 'ChatGPTWeb', return_value=interface),
+            mock.patch.object(web, 'WebSessionWatcher', return_value=watcher) as watcher_type,
+        ):
+            web.run_web_watcher(
+                cdp_url='http' + '://127.0.0.1:9222',
+                session_id='root',
+                bootstrap_prompt='BOOTSTRAP',
+                validate_request=lambda request: None,
+                execute_request=mock.Mock(),
+                fenced_result=str,
+                too_long_fallback=lambda request, result: 'FALLBACK',
+            )
+
+        interface.connect.assert_called_once_with()
+        interface.close.assert_called_once_with()
+        watcher_type.assert_called_once()
+        watcher.run.assert_called_once_with(bootstrap_prompt='BOOTSTRAP')
 
     def test_inspect_web_sessions_is_read_only_and_detaches(self) -> None:
         page = FakePage('https' + '://chatgpt.com/c/a', title='Cats')
@@ -612,7 +999,7 @@ class ChatGPTWebTests(unittest.TestCase):
         page = FakePage('https' + '://chatgpt.com/c/a', title='Cats')
         interface.pages.return_value = [page]
         interface.describe_page.return_value = ('a', 'Cats')
-        interface.valid_request.return_value = None
+        interface.recent_valid_request.return_value = None
         interface.latest_too_long_error_id.return_value = 'existing-error'
         watcher = web.WebSessionWatcher(
             interface,
