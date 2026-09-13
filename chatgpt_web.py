@@ -18,7 +18,7 @@ SEND_SELECTOR = 'button[data-testid="send-button"]'
 DEFAULT_CDP_URL = 'http' + '://127.0.0.1:9222'
 DEFAULT_SETTLE_SECONDS = 0.35
 DEFAULT_POLL_SECONDS = 0.25
-RECENT_ASSISTANT_MESSAGE_LIMIT = 3
+RECENT_ASSISTANT_MESSAGE_LIMIT = 10
 DELIVERY_RETRY_INITIAL_SECONDS = 0.25
 DELIVERY_RETRY_MAX_SECONDS = 8.0
 MESSAGE_TOO_LONG_TEXT = 'The message you submitted was too long, please edit it and resubmit.'
@@ -60,6 +60,7 @@ class WebSession:
     delivered: int = 0
     routing_session_id: str | None = None
     retire_requested: bool = False
+    cdp_session: Any | None = None
 
     @property
     def url(self) -> str:
@@ -230,6 +231,20 @@ class ChatGPTWeb:
             )
         return None
 
+    def emulate_active_page(self, page: Any) -> Any | None:
+        try:
+            cdp_session = page.context.new_cdp_session(page)
+            cdp_session.send('Emulation.setFocusEmulationEnabled', {'enabled': True})
+            cdp_session.send('Page.setWebLifecycleState', {'state': 'active'})
+            return cdp_session
+        except Exception as exc:
+            print(f'  [web] CDP active-page emulation unavailable: {exc}', flush=True)
+            try:
+                cdp_session.detach()
+            except (Exception, UnboundLocalError):
+                pass
+            return None
+
     def submit(self, session: WebSession, text: str) -> None:
         self.set_composer_text(session, text)
 
@@ -259,12 +274,20 @@ class ChatGPTWeb:
         # foreground-tab actionability.
         button.last.evaluate('element => element.click()')
 
-    def _create_conversation(self, context: Any, *, label: str | None, prompt: str) -> WebSession:
+    def _create_conversation(
+        self,
+        context: Any,
+        *,
+        label: str | None,
+        prompt: str,
+        emulate_active: bool = False,
+    ) -> WebSession:
         page = context.new_page()
+        cdp_session = self.emulate_active_page(page) if emulate_active else None
         try:
             page.goto('https' + '://chatgpt.com/', wait_until='domcontentloaded')
             page.locator(COMPOSER_SELECTOR).last.wait_for(state='visible', timeout=15_000)
-            pending = WebSession('', label or 'new chat', page)
+            pending = WebSession('', label or 'new chat', page, cdp_session=cdp_session)
             self.submit(pending, prompt)
             page.wait_for_url(
                 lambda url: self.conversation_id_for_url(str(url)) is not None,
@@ -275,8 +298,18 @@ class ChatGPTWeb:
             # otherwise leave a just-submitted background tab dormant forever.
             page.locator(ASSISTANT_SELECTOR).last.wait_for(state='attached', timeout=30_000)
             conversation_id, page_label = self.describe_page(page)
-            return WebSession(conversation_id, label or page_label, page)
+            return WebSession(
+                conversation_id,
+                label or page_label,
+                page,
+                cdp_session=cdp_session,
+            )
         except Exception:
+            if cdp_session is not None:
+                try:
+                    cdp_session.detach()
+                except Exception:
+                    pass
             page.close()
             raise
 
@@ -287,7 +320,12 @@ class ChatGPTWeb:
         label: str,
         prompt: str,
     ) -> WebSession:
-        return self._create_conversation(origin.page.context, label=label, prompt=prompt)
+        return self._create_conversation(
+            origin.page.context,
+            label=label,
+            prompt=prompt,
+            emulate_active=True,
+        )
 
     def create_root_conversation(self, prompt: str) -> WebSession:
         if self._browser is None:
@@ -399,6 +437,9 @@ class WebSessionWatcher:
 
     def retire_subagent(self, session: WebSession) -> None:
         self.interface.archive_conversation(session)
+        if session.cdp_session is not None:
+            session.cdp_session.detach()
+            session.cdp_session = None
         session.page.close()
         routing_session_id = session.routing_session_id
         if routing_session_id is not None:

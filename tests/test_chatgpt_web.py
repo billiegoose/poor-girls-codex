@@ -102,6 +102,39 @@ class ChatGPTWebTests(unittest.TestCase):
         page.locator.return_value.last.wait_for.assert_any_call(state='attached', timeout=30_000)
         self.assertEqual(child.conversation_id, 'child')
 
+    def test_create_subagent_emulates_focused_active_page_with_cdp(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        page.url = 'https' + '://chatgpt.com/c/child'
+        page.locator.return_value.last.wait_for.return_value = None
+        page.wait_for_url.return_value = None
+        cdp_session = mock.Mock()
+        context = mock.Mock()
+        context.new_page.return_value = page
+        context.new_cdp_session.return_value = cdp_session
+        page.context = context
+        origin_page = mock.Mock()
+        origin_page.context = context
+        origin = web.WebSession('parent', 'Parent', origin_page)
+        interface.submit = mock.Mock()
+        interface.describe_page = mock.Mock(return_value=('child', 'Child'))
+
+        child = interface.create_conversation(
+            origin=origin,
+            label='subagent:worker',
+            prompt='Do work',
+        )
+
+        context.new_cdp_session.assert_called_once_with(page)
+        self.assertEqual(
+            cdp_session.send.call_args_list,
+            [
+                mock.call('Emulation.setFocusEmulationEnabled', {'enabled': True}),
+                mock.call('Page.setWebLifecycleState', {'state': 'active'}),
+            ],
+        )
+        self.assertIs(child.cdp_session, cdp_session)
+
     def test_archive_conversation_marks_chat_archived(self) -> None:
         interface = web.ChatGPTWeb()
         page = mock.Mock()
@@ -216,8 +249,9 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertEqual(request['tool'], 'status')
         self.assertTrue(fingerprint)
 
-    def test_recent_valid_request_is_bounded_to_last_three_assistant_messages(self) -> None:
+    def test_recent_valid_request_is_bounded_to_last_ten_assistant_messages(self) -> None:
         interface = web.ChatGPTWeb()
+        newer_prose = [f'newer prose {index}' for index in range(10)]
         session = web.WebSession(
             'a',
             'A',
@@ -225,11 +259,9 @@ class ChatGPTWebTests(unittest.TestCase):
                 'https' + '://chatgpt.com/c/a',
                 code=[
                     '{"session":"root","id":"old","tool":"status"}',
-                    'newer prose one',
-                    'newer prose two',
-                    'newer prose three',
+                    *newer_prose,
                 ],
-                message_id=['m0', 'm1', 'm2', 'm3'],
+                message_id=[f'm{index}' for index in range(11)],
             ),
         )
 
@@ -542,6 +574,37 @@ class ChatGPTWebTests(unittest.TestCase):
         )
         self.assertFalse(result['ok'])
         self.assertIn('no parent', result['error'])
+
+    def test_retire_subagent_detaches_cdp_session_before_closing_page(self) -> None:
+        interface = mock.Mock()
+        cdp_session = mock.Mock()
+        page = mock.Mock()
+        child = web.WebSession(
+            'child-c',
+            'Child',
+            page,
+            routing_session_id='root::worker',
+            cdp_session=cdp_session,
+        )
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+        watcher.sessions = {'child-c': child}
+        watcher.sessions_by_routing_id = {'root::worker': child}
+
+        watcher.retire_subagent(child)
+
+        interface.archive_conversation.assert_called_once_with(child)
+        cdp_session.detach.assert_called_once_with()
+        page.close.assert_called_once_with()
+        self.assertIsNone(child.cdp_session)
+        self.assertIsNone(child.routing_session_id)
+        self.assertNotIn('child-c', watcher.sessions)
+        self.assertNotIn('root::worker', watcher.sessions_by_routing_id)
 
     def test_failed_handoff_stays_open_and_queues_tool_result(self) -> None:
         interface = mock.Mock()
