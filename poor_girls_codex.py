@@ -666,7 +666,7 @@ def latest_valid_request(root):
     return source, request, fingerprint
 
 
-def show_startup_ui(bootstrap_prompt: str, *, clipboard_write) -> None:
+def show_startup_ui(bootstrap_prompt: str, *, clipboard_write, web_managed: bool = False) -> None:
     border = "+================================================================+"
     print(color(border, "1;36"))
     print(
@@ -677,11 +677,14 @@ def show_startup_ui(bootstrap_prompt: str, *, clipboard_write) -> None:
     print(color("|                the hacky ChatGPT coding harness                |", "36"))
     print(color(border, "1;36"))
     print()
-    print(f"  {color('[1]', '1;35')} Open a regular ChatGPT conversation in the configured frontend.")
-    print(f"  {color('[2]', '1;35')} Paste the bootstrap prompt already on your clipboard.")
-    print(f"  {color('[3]', '1;35')} Leave me running; I'll handle tool calls in the background.")
-    print()
-    print(f"  {color('[ready]', '1;32')} Waiting for ChatGPT tool calls...", flush=True)
+    if web_managed:
+        print(f"  {color('[1]', '1;35')} Keep the connected Chrome profile running.")
+        print(f"  {color('[2]', '1;35')} I'll attach to this PGC session or create a new ChatGPT tab.")
+        print(f"  {color('[3]', '1;35')} Leave me running; I'll handle tool calls in the background.")
+    else:
+        print(f"  {color('[1]', '1;35')} Open a regular ChatGPT conversation in the configured frontend.")
+        print(f"  {color('[2]', '1;35')} Paste the bootstrap prompt already on your clipboard.")
+        print(f"  {color('[3]', '1;35')} Leave me running; I'll handle tool calls in the background.")
     print()
     clipboard_write(bootstrap_prompt)
 
@@ -703,6 +706,7 @@ def watch_loop() -> None:
     too_long_visible = interface.ui_contains_text_outside_conversation(root, MESSAGE_TOO_LONG_TEXT)
     handled_too_long_for: str | None = None
 
+    print(f"  {color('[ready]', '1;32')} Waiting for ChatGPT tool calls...", flush=True)
     print("  Press Ctrl-X to save the ChatGPT accessibility tree.", flush=True)
     with TerminalHotkeys() as hotkeys:
         while True:
@@ -839,6 +843,7 @@ def main() -> None:
             clipboard_write=lambda text: subprocess.run(
                 ["pbcopy"], input=text, text=True, check=True
             ),
+            web_managed=True,
         )
         run_web_watcher(
             cdp_url=args.cdp_url or DEFAULT_CDP_URL,
