@@ -23,6 +23,11 @@ DELIVERY_RETRY_INITIAL_SECONDS = 0.25
 DELIVERY_RETRY_MAX_SECONDS = 8.0
 MESSAGE_TOO_LONG_TEXT = 'The message you submitted was too long, please edit it and resubmit.'
 SUBAGENT_COLOR_CODES = ('1;34', '1;35', '1;36', '1;33', '1;32')
+SUBAGENT_COMPLETION_INSTRUCTIONS = '''Subagent completion protocol:
+- You are a subagent. Your task is not complete until you call the `handoff` tool.
+- When your work is complete, make `handoff` your final tool call and put your concise result in its `result` field.
+- Do not finish with a prose-only response, summary, or status update instead of calling `handoff`.
+- If more work remains, continue using the available tools. After a successful `handoff`, stop.'''
 
 
 class MessageTooLongError(RuntimeError):
@@ -509,6 +514,8 @@ class WebSessionWatcher:
                 call['prompt']
                 + '\n\n---\n\n'
                 + self.bootstrap_prompt_for_session(child_session_id)
+                + '\n\n---\n\n'
+                + SUBAGENT_COMPLETION_INSTRUCTIONS
             )
             child = self.interface.create_conversation(
                 origin=origin,

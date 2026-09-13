@@ -503,8 +503,15 @@ class ChatGPTWebTests(unittest.TestCase):
         interface.create_conversation.assert_called_once_with(
             origin=parent,
             label='subagent:worker2',
-            prompt='Investigate this\n\n---\n\nBOOTSTRAP root::worker2',
+            prompt=(
+                'Investigate this\n\n---\n\nBOOTSTRAP root::worker2\n\n---\n\n'
+                + web.SUBAGENT_COMPLETION_INSTRUCTIONS
+            ),
         )
+        prompt = interface.create_conversation.call_args.kwargs['prompt']
+        self.assertIn('not complete until you call the `handoff` tool', prompt)
+        self.assertIn('Do not finish with a prose-only response', prompt)
+        self.assertIn('make `handoff` your final tool call', prompt)
 
     def test_duplicate_subagent_session_is_rejected(self) -> None:
         interface = mock.Mock()
