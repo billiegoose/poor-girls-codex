@@ -84,14 +84,45 @@ class InterfaceSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'different PGC session'):
             pgc.validate_web_session_request({'id': 'x', 'tool': 'status'}, 'abc')
 
-    def test_web_bootstrap_describes_session_tree_routing(self) -> None:
-        prompt = pgc.web_bootstrap_prompt('abc123')
+    def test_subagent_web_bootstrap_describes_role_and_session_tree_routing(self) -> None:
+        prompt = pgc.subagent_web_bootstrap_prompt('abc123')
+        self.assertIn('You are a subagent.', prompt)
         self.assertIn('"session": "abc123"', prompt)
         self.assertIn('abc123::', prompt)
         self.assertIn('subagent {name,prompt}', prompt)
         self.assertIn('handoff {result}', prompt)
         self.assertIn('Requests outside that session tree are inert', prompt)
         self.assertNotIn('subagent {name,prompt}', pgc.BOOTSTRAP_PROMPT)
+
+    def test_root_web_bootstrap_includes_working_directory_and_omits_handoff(self) -> None:
+        prompt = pgc.root_web_bootstrap_prompt('abc123', '/tmp/projects/asgard')
+        self.assertTrue(
+            prompt.startswith(
+                'You are working on the `asgard` codebase.\n'
+                'Working directory: asgard\n\n'
+            )
+        )
+        self.assertIn('You are the root agent', prompt)
+        self.assertIn('Finish normally in this conversation', prompt)
+        self.assertIn('subagent {name,prompt}', prompt)
+        self.assertNotIn('handoff', prompt.lower())
+        self.assertIn('\"session\": \"abc123\"', prompt)
+        self.assertNotIn('Working directory:', pgc.subagent_web_bootstrap_prompt('abc123'))
+
+    def test_web_bootstrap_requires_explicit_known_role(self) -> None:
+        with self.assertRaises(TypeError):
+            pgc.web_bootstrap_prompt('abc123')
+        with self.assertRaisesRegex(ValueError, 'unsupported web bootstrap role'):
+            pgc.web_bootstrap_prompt('abc123', role='manager')
+
+    def test_root_web_bootstrap_handles_filesystem_root(self) -> None:
+        prompt = pgc.root_web_bootstrap_prompt('abc123', '/')
+        self.assertTrue(
+            prompt.startswith(
+                'You are working on the `/` codebase.\n'
+                'Working directory: /\n\n'
+            )
+        )
 
     def test_bootstrap_prompt_uses_timeout_seconds(self) -> None:
         self.assertIn('timeout_seconds?', pgc.BOOTSTRAP_PROMPT)

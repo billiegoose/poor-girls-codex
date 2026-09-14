@@ -9,6 +9,21 @@ import poor_girls_codex as pgc
 
 
 class WatcherDeliveryTests(unittest.TestCase):
+    def test_latest_invalid_json_candidate_reports_json_shaped_parse_error(self) -> None:
+        frontend = mock.Mock()
+        frontend.latest_assistant_json_candidates.return_value = [
+            'print("hello")',
+            '{"id":"x","tool":"status",}',
+        ]
+        with mock.patch.object(pgc, "INTERFACE", frontend):
+            candidate = pgc.latest_invalid_json_candidate("root")
+
+        self.assertIsNotNone(candidate)
+        source, detail, fingerprint = candidate
+        self.assertEqual(source, '{"id":"x","tool":"status",}')
+        self.assertIn("line 1", detail)
+        self.assertTrue(fingerprint)
+
     def test_send_button_retries_with_exponential_backoff(self) -> None:
         frontend = mock.Mock()
         frontend.root.return_value = ("app", "root")
@@ -177,6 +192,52 @@ class WatcherDeliveryTests(unittest.TestCase):
         self.assertIn("Message too large [retry with summary]", output)
         self.assertIn("response   [sent summary]", output)
         self.assertNotIn("queued a compact retry while retaining completed results", output)
+
+    def test_invalid_json_gets_polite_feedback_without_executing_tools(self) -> None:
+        malformed = (
+            '{"tool":"status",}',
+            'Expecting property name enclosed in double quotes at line 1, column 18',
+            'bad-json-fp',
+        )
+        invalid_candidates = iter([None, malformed, malformed, malformed, KeyboardInterrupt()])
+        deliveries: list[str] = []
+
+        frontend = mock.Mock()
+        frontend.root.return_value = ("app", "root")
+        frontend.dismiss_work_prompt.return_value = False
+        frontend.ui_contains_text_outside_conversation.return_value = False
+        hotkeys = mock.MagicMock()
+        hotkeys.__enter__.return_value = hotkeys
+        hotkeys.read.return_value = None
+
+        def fake_invalid(root):
+            value = next(invalid_candidates)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        def fake_paste(app, root, text, *, send, **kwargs):
+            deliveries.append(text)
+            return pgc.DeliveryOutcome.SENT
+
+        with (
+            mock.patch.object(pgc, "INTERFACE", frontend),
+            mock.patch.object(pgc, "latest_valid_request", return_value=None),
+            mock.patch.object(pgc, "latest_invalid_json_candidate", side_effect=fake_invalid),
+            mock.patch.object(pgc, "execute_request") as execute,
+            mock.patch.object(pgc, "paste_result_into_composer", side_effect=fake_paste),
+            mock.patch.object(pgc, "TerminalHotkeys", return_value=hotkeys),
+            mock.patch.object(pgc, "SETTLE_SECONDS", 0.0),
+            mock.patch.object(pgc, "POLL_SECONDS", 0.0),
+            mock.patch.object(pgc.time, "sleep"),
+            redirect_stdout(StringIO()),
+        ):
+            pgc.watch_loop()
+
+        execute.assert_not_called()
+        self.assertEqual(len(deliveries), 1)
+        self.assertIn("JSON was invalid", deliveries[0])
+        self.assertIn("Please resend", deliveries[0])
 
     def test_ctrl_x_dumps_while_watcher_waits(self) -> None:
         hotkeys = mock.MagicMock()

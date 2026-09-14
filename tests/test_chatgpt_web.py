@@ -77,6 +77,92 @@ class FakePage:
 
 
 class ChatGPTWebTests(unittest.TestCase):
+    def test_launch_chrome_for_cdp_uses_dedicated_profile_and_debugging_flags(self) -> None:
+        with (
+            mock.patch.object(web.Path, 'home', return_value=web.Path('/Users/tester')),
+            mock.patch.object(web.subprocess, 'run') as run,
+        ):
+            web.ChatGPTWeb.launch_chrome_for_cdp()
+
+        run.assert_called_once_with(
+            [
+                'open',
+                '-na',
+                'Google Chrome',
+                '--args',
+                '--remote-debugging-port=9222',
+                '--remote-allow-origins=*',
+                '--user-data-dir=/Users/tester/.chrome-pgc',
+                '--no-first-run',
+                '--no-default-browser-check',
+                'https://chatgpt.com/',
+            ],
+            check=True,
+        )
+
+    def test_connect_launches_chrome_and_retries_default_cdp_after_initial_failure(self) -> None:
+        interface = web.ChatGPTWeb()
+        playwright = mock.Mock()
+        browser = mock.Mock()
+        playwright.chromium.connect_over_cdp.side_effect = [
+            RuntimeError('connection refused'),
+            RuntimeError('still starting'),
+            browser,
+        ]
+        interface._start_playwright = mock.Mock(return_value=playwright)
+        interface.launch_chrome_for_cdp = mock.Mock()
+
+        with (
+            mock.patch.object(web.time, 'monotonic', side_effect=[100.0, 100.0]),
+            mock.patch.object(web.time, 'sleep') as sleep,
+        ):
+            interface.connect()
+
+        interface.launch_chrome_for_cdp.assert_called_once_with()
+        self.assertIs(interface._browser, browser)
+        self.assertEqual(playwright.chromium.connect_over_cdp.call_count, 3)
+        playwright.chromium.connect_over_cdp.assert_called_with(
+            web.DEFAULT_CDP_URL,
+            no_defaults=True,
+        )
+        sleep.assert_called_once_with(web.CHROME_CDP_RETRY_SECONDS)
+        playwright.stop.assert_not_called()
+
+    def test_connect_times_out_after_launch_and_detaches_playwright(self) -> None:
+        interface = web.ChatGPTWeb()
+        playwright = mock.Mock()
+        playwright.chromium.connect_over_cdp.side_effect = RuntimeError('connection refused')
+        interface._start_playwright = mock.Mock(return_value=playwright)
+        interface.launch_chrome_for_cdp = mock.Mock()
+
+        with (
+            mock.patch.object(web.time, 'monotonic', side_effect=[100.0, 111.0]),
+            mock.patch.object(web.time, 'sleep') as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'connection refused'):
+                interface.connect()
+
+        interface.launch_chrome_for_cdp.assert_called_once_with()
+        self.assertEqual(playwright.chromium.connect_over_cdp.call_count, 2)
+        sleep.assert_not_called()
+        playwright.stop.assert_called_once_with()
+        self.assertIsNone(interface._playwright)
+        self.assertIsNone(interface._browser)
+
+    def test_connect_does_not_launch_local_chrome_for_custom_cdp_url(self) -> None:
+        interface = web.ChatGPTWeb('http' + '://example.test:9333')
+        playwright = mock.Mock()
+        playwright.chromium.connect_over_cdp.side_effect = RuntimeError('connection refused')
+        interface._start_playwright = mock.Mock(return_value=playwright)
+        interface.launch_chrome_for_cdp = mock.Mock()
+
+        with self.assertRaisesRegex(RuntimeError, 'connection refused'):
+            interface.connect()
+
+        interface.launch_chrome_for_cdp.assert_not_called()
+        playwright.stop.assert_called_once_with()
+        self.assertIsNone(interface._playwright)
+
     def test_conversation_url_filter_is_exact(self) -> None:
         good = 'https' + '://chatgpt.com/c/abc'
         self.assertEqual(web.ChatGPTWeb.conversation_id_for_url(good), 'abc')
@@ -479,6 +565,36 @@ class ChatGPTWebTests(unittest.TestCase):
         page.bring_to_front.assert_not_called()
         button.evaluate.assert_called_once_with('element => element.click()')
 
+    def test_is_generating_uses_stop_button(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        stop = mock.Mock()
+        stop.count.return_value = 1
+        stop.last = stop
+        stop.is_visible.return_value = True
+        page.locator.return_value = stop
+        session = web.WebSession('a', 'A', page)
+
+        self.assertTrue(interface.is_generating(session))
+        page.locator.assert_called_once_with(web.STOP_SELECTOR)
+        page.get_by_role.assert_not_called()
+
+    def test_is_generating_falls_back_to_accessible_stop_button(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        missing = mock.Mock()
+        missing.count.return_value = 0
+        fallback = mock.Mock()
+        fallback.count.return_value = 1
+        fallback.last = fallback
+        fallback.is_visible.return_value = True
+        page.locator.return_value = missing
+        page.get_by_role.return_value = fallback
+        session = web.WebSession('a', 'A', page)
+
+        self.assertTrue(interface.is_generating(session))
+        page.get_by_role.assert_called_once_with('button', name='Stop answering', exact=True)
+
     def test_fingerprint_includes_assistant_message_identity(self) -> None:
         interface = web.ChatGPTWeb()
         source = '{"id":"same","tool":"status"}'
@@ -489,6 +605,52 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIsNotNone(first)
         self.assertIsNotNone(second)
         self.assertNotEqual(first[2], second[2])
+
+    def test_invalid_json_candidate_reports_json_shaped_parse_error(self) -> None:
+        interface = web.ChatGPTWeb()
+        session = web.WebSession(
+            'a',
+            'A',
+            FakePage(
+                'https' + '://chatgpt.com/c/a',
+                code=['{"id":"x","tool":"status",}'],
+                message_id='m1',
+            ),
+        )
+
+        first = interface.invalid_json_candidate(session)
+        self.assertIsNotNone(first)
+        source, detail, fingerprint = first
+        self.assertEqual(source, '{"id":"x","tool":"status",}')
+        self.assertIn('line 1', detail)
+        self.assertTrue(fingerprint)
+
+        session.page.message_id = 'm2'
+        second = interface.invalid_json_candidate(session)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(fingerprint, second[2])
+
+    def test_invalid_json_candidate_ignores_non_json_code_and_valid_json(self) -> None:
+        interface = web.ChatGPTWeb()
+        prose_code = web.WebSession(
+            'a',
+            'A',
+            FakePage('https' + '://chatgpt.com/c/a', code=['print("hello")']),
+        )
+        valid_json = web.WebSession(
+            'b',
+            'B',
+            FakePage('https' + '://chatgpt.com/c/b', code=['{"not":"a tool call"}']),
+        )
+        malformed_non_tool_json = web.WebSession(
+            'c',
+            'C',
+            FakePage('https' + '://chatgpt.com/c/c', code=['{"example": 1,}']),
+        )
+
+        self.assertIsNone(interface.invalid_json_candidate(prose_code))
+        self.assertIsNone(interface.invalid_json_candidate(valid_json))
+        self.assertIsNone(interface.invalid_json_candidate(malformed_non_tool_json))
 
     def test_latest_message_is_assistant_uses_actual_final_conversation_turn(self) -> None:
         interface = web.ChatGPTWeb()
@@ -1289,6 +1451,63 @@ class ChatGPTWebTests(unittest.TestCase):
         interface.archive_conversation.assert_called_once_with(child)
         child_page.close.assert_called_once_with()
         self.assertEqual(child.pending_responses, [])
+
+    def test_invalid_json_is_ignored_while_assistant_is_generating(self) -> None:
+        interface = mock.Mock()
+        session = web.WebSession('a', 'Cats', mock.Mock())
+        interface.valid_request.return_value = None
+        interface.is_generating.side_effect = [True, False, False]
+        interface.invalid_json_candidate.return_value = (
+            '{"tool":"status",}',
+            'Expecting property name enclosed in double quotes at line 1, column 18',
+            'bad-json-fp',
+        )
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=lambda result: 'RESULT',
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            settle_seconds=0.35,
+        )
+
+        self.assertFalse(watcher.scan_session(session, 0.0))
+        interface.invalid_json_candidate.assert_not_called()
+        self.assertFalse(watcher.scan_session(session, 1.0))
+        self.assertTrue(watcher.scan_session(session, 1.35))
+        self.assertEqual(len(session.pending_responses), 1)
+        self.assertIn('JSON was invalid', session.pending_responses[0].result)
+
+    def test_invalid_json_is_sent_back_once_after_settling(self) -> None:
+        interface = mock.Mock()
+        session = web.WebSession('a', 'Cats', mock.Mock())
+        interface.valid_request.return_value = None
+        interface.is_generating.return_value = False
+        interface.invalid_json_candidate.return_value = (
+            '{"tool":"status",}',
+            'Expecting property name enclosed in double quotes at line 1, column 18',
+            'bad-json-fp',
+        )
+        execute = mock.Mock()
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=execute,
+            fenced_result=lambda result: 'RESULT',
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            settle_seconds=0.35,
+        )
+
+        self.assertFalse(watcher.scan_session(session, 0.0))
+        self.assertTrue(watcher.scan_session(session, 0.35))
+        self.assertEqual(len(session.pending_responses), 1)
+        self.assertIn("JSON was invalid", session.pending_responses[0].result)
+        self.assertIn("Please resend", session.pending_responses[0].result)
+        self.assertEqual(session.seen_fingerprints, {'bad-json-fp'})
+        execute.assert_not_called()
+
+        self.assertFalse(watcher.scan_session(session, 1.0))
+        self.assertEqual(len(session.pending_responses), 1)
 
     def test_settling_is_nonblocking_and_requires_same_fingerprint(self) -> None:
         interface = mock.Mock()

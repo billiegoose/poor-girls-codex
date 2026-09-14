@@ -85,10 +85,13 @@ class CompletedBatch:
     calls: list[Any]
     results: list[Any]
     single: bool
+    plain_text: str | None = None
     compact: bool = False
     response_progress: ResponseProgress | None = None
 
     def render(self) -> str:
+        if self.plain_text is not None:
+            return self.plain_text.rstrip("\n") + "\n"
         if self.compact:
             return too_long_fallback(self.calls, self.results)
         payload = self.results[0] if self.single else self.results
@@ -118,6 +121,24 @@ class WatcherState:
                 calls=list(calls),
                 results=results,
                 single=single,
+                response_progress=response_progress,
+            )
+        )
+
+    def record_message(
+        self,
+        fingerprint: str,
+        message: str,
+        *,
+        response_progress: ResponseProgress | None = None,
+    ) -> None:
+        self.pending_batches.append(
+            CompletedBatch(
+                fingerprint=fingerprint,
+                calls=[],
+                results=[],
+                single=True,
+                plain_text=message,
                 response_progress=response_progress,
             )
         )
@@ -162,9 +183,10 @@ class WatcherState:
         restored = self.last_submitted_batches
         self.last_submitted_batches = []
         for batch in restored:
-            batch.compact = True
-            if batch.response_progress is not None:
-                batch.response_progress.set_status("Message too large [retry with summary]")
+            if batch.plain_text is None:
+                batch.compact = True
+                if batch.response_progress is not None:
+                    batch.response_progress.set_status("Message too large [retry with summary]")
         self.pending_batches = restored + self.pending_batches
 
     def last_submission_key(self) -> str | None:
@@ -285,8 +307,40 @@ def load_or_create_session_id(cwd: str = ".") -> str:
     return session_id
 
 
-def web_bootstrap_prompt(session_id: str) -> str:
-    return BOOTSTRAP_PROMPT + f'''\n\nAdditional chatgpt-web tools:\n- subagent {{name,prompt}} - create a fresh ChatGPT subagent conversation; name may contain letters, digits, '-' and '_', and must start with a letter or digit.\n- handoff {{result}} - send a completed subagent result back to the immediate parent conversation.\n\nWeb session routing:\nEvery executable Poor Girl's Codex request MUST include the exact top-level field \"session\": \"{session_id}\". This applies to both single-call objects and {{\"calls\":[...]}} batches. This watcher accepts this session and descendant sessions beginning with \"{session_id}::\". Requests outside that session tree are inert and will be ignored. When merely discussing or showing example JSON, do not include this session value unless you intend the example to execute.'''
+def web_bootstrap_prompt(session_id: str, *, role: str) -> str:
+    if role not in {"root", "subagent"}:
+        raise ValueError(f"unsupported web bootstrap role: {role!r}")
+
+    additional_tools = (
+        "Additional chatgpt-web tools:\n"
+        "- subagent {name,prompt} - create a fresh ChatGPT subagent conversation; "
+        "name may contain letters, digits, '-' and '_', and must start with a letter or digit."
+    )
+    if role == "subagent":
+        additional_tools += (
+            "\n- handoff {result} - send your completed result back to your immediate parent conversation."
+        )
+
+    role_instructions = (
+        "You are the root agent for this Poor Girl's Codex session. Finish normally in this conversation."
+        if role == "root"
+        else "You are a subagent. When your assigned work is complete, return it to your immediate parent with handoff {result}."
+    )
+
+    return BOOTSTRAP_PROMPT + f'''\n\nAgent role:\n{role_instructions}\n\n{additional_tools}\n\nWeb session routing:\nEvery executable Poor Girl's Codex request MUST include the exact top-level field \"session\": \"{session_id}\". This applies to both single-call objects and {{\"calls\":[...]}} batches. This watcher accepts this session and descendant sessions beginning with \"{session_id}::\". Requests outside that session tree are inert and will be ignored. When merely discussing or showing example JSON, do not include this session value unless you intend the example to execute.'''
+
+
+def subagent_web_bootstrap_prompt(session_id: str) -> str:
+    return web_bootstrap_prompt(session_id, role="subagent")
+
+
+def root_web_bootstrap_prompt(session_id: str, cwd: str = ".") -> str:
+    working_directory = os.path.basename(os.path.abspath(cwd)) or os.path.abspath(cwd)
+    return (
+        f"You are working on the `{working_directory}` codebase.\n"
+        f"Working directory: {working_directory}\n\n"
+        f"{web_bootstrap_prompt(session_id, role='root')}"
+    )
 
 
 def web_session_matches(session: Any, session_id: str) -> bool:
@@ -341,6 +395,32 @@ def latest_assistant_toolcall(root):
 
     _, source, request = min(candidates, key=lambda item: item[0])
     return source, request
+
+
+def latest_invalid_json_candidate(root):
+    interface = current_interface()
+    sources = interface.latest_assistant_json_candidates(root)
+    if not isinstance(sources, (list, tuple)):
+        return None
+
+    candidates = []
+    for source in sources:
+        if not isinstance(source, str):
+            continue
+        source = source.strip()
+        looks_like_toolcall = any(marker in source for marker in ('"tool"', '"calls"', '"session"'))
+        if not source or source[0] not in "[{" or not looks_like_toolcall:
+            continue
+        try:
+            json.loads(source)
+        except json.JSONDecodeError as exc:
+            detail = f"{exc.msg} at line {exc.lineno}, column {exc.colno}"
+            candidates.append((len(source), source, detail))
+    if not candidates:
+        return None
+    _, source, detail = min(candidates, key=lambda item: item[0])
+    fingerprint = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    return source, detail, fingerprint
 
 
 def unwrap_json(text: str) -> Any:
@@ -701,6 +781,10 @@ def watch_loop() -> None:
     existing = latest_valid_request(root)
     if existing is not None:
         state.seen_fingerprints.add(existing[2])
+    else:
+        existing_invalid_json = latest_invalid_json_candidate(root)
+        if existing_invalid_json is not None:
+            state.seen_fingerprints.add(existing_invalid_json[2])
 
     too_long_visible = interface.ui_contains_text_outside_conversation(root, MESSAGE_TOO_LONG_TEXT)
     handled_too_long_for: str | None = None
@@ -772,6 +856,36 @@ def watch_loop() -> None:
                         # delivery snapshot rather than sending a partial snapshot.
                         continue
 
+                if candidate is None:
+                    invalid_json = latest_invalid_json_candidate(root)
+                    if invalid_json is not None:
+                        _, detail, fingerprint = invalid_json
+                        if fingerprint not in state.seen_fingerprints:
+                            time.sleep(SETTLE_SECONDS)
+                            _, settled_root = interface.root()
+                            settled_valid = latest_valid_request(settled_root)
+                            if settled_valid is not None:
+                                continue
+                            settled_invalid_json = latest_invalid_json_candidate(settled_root)
+                            if settled_invalid_json is None or settled_invalid_json[2] != fingerprint:
+                                continue
+
+                            state.acknowledge_last_submission()
+                            state.seen_fingerprints.add(fingerprint)
+                            response_progress = ResponseProgress()
+                            message = (
+                                "I couldn't execute that tool call because its JSON was invalid "
+                                f"({detail}). Please resend the tool call as valid JSON in a single fenced `json` block."
+                            )
+                            state.record_message(
+                                fingerprint,
+                                message,
+                                response_progress=response_progress,
+                            )
+                            response_progress.set_status("[pending]")
+                            handled_too_long_for = None
+                            continue
+
                 if state.has_pending_results():
                     state.phase = WatcherPhase.DELIVERING
                     rendered = state.render_pending()
@@ -836,7 +950,7 @@ def main() -> None:
         from chatgpt_web import DEFAULT_CDP_URL, run_web_watcher
 
         session_id = load_or_create_session_id()
-        bootstrap_prompt = web_bootstrap_prompt(session_id)
+        bootstrap_prompt = root_web_bootstrap_prompt(session_id)
         show_startup_ui(
             bootstrap_prompt,
             clipboard_write=lambda text: subprocess.run(
@@ -858,7 +972,7 @@ def main() -> None:
             ),
             fenced_result=fenced_result,
             too_long_fallback=too_long_fallback_for_request,
-            bootstrap_prompt_for_session=web_bootstrap_prompt,
+            bootstrap_prompt_for_session=subagent_web_bootstrap_prompt,
         )
         return
 

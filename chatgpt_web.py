@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import signal
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -15,7 +17,10 @@ from progress_ui import ResponseProgress, color as progress_color
 ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]'
 COMPOSER_SELECTOR = '#prompt-textarea'
 SEND_SELECTOR = 'button[data-testid="send-button"]'
+STOP_SELECTOR = 'button[data-testid="stop-button"]'
 DEFAULT_CDP_URL = 'http' + '://127.0.0.1:9222'
+CHROME_CDP_STARTUP_TIMEOUT_SECONDS = 10.0
+CHROME_CDP_RETRY_SECONDS = 0.25
 DEFAULT_SETTLE_SECONDS = 0.35
 DEFAULT_POLL_SECONDS = 0.25
 RECENT_ASSISTANT_MESSAGE_LIMIT = 10
@@ -95,20 +100,64 @@ class ChatGPTWeb:
         self._rate_limit_backoff_seconds = RATE_LIMIT_BACKOFF_INITIAL_SECONDS
         self._last_rate_limit_at: float | None = None
 
-    def connect(self) -> None:
+    @staticmethod
+    def _start_playwright() -> Any:
         try:
             from playwright.sync_api import sync_playwright
         except ModuleNotFoundError as exc:
             raise RuntimeError(
                 'chatgpt-web requires Playwright; install project dependencies with uv sync'
             ) from exc
+        return sync_playwright().start()
 
-        self._playwright = sync_playwright().start()
+    @staticmethod
+    def launch_chrome_for_cdp() -> None:
+        subprocess.run(
+            [
+                'open',
+                '-na',
+                'Google Chrome',
+                '--args',
+                '--remote-debugging-port=9222',
+                '--remote-allow-origins=*',
+                f'--user-data-dir={Path.home() / ".chrome-pgc"}',
+                '--no-first-run',
+                '--no-default-browser-check',
+                'https://chatgpt.com/',
+            ],
+            check=True,
+        )
+
+    def _connect_browser(self) -> Any:
+        return self._playwright.chromium.connect_over_cdp(
+            self.cdp_url,
+            no_defaults=True,
+        )
+
+    def _connect_browser_after_chrome_launch(self) -> Any:
+        deadline = time.monotonic() + CHROME_CDP_STARTUP_TIMEOUT_SECONDS
+        while True:
+            try:
+                return self._connect_browser()
+            except Exception:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(CHROME_CDP_RETRY_SECONDS)
+
+    def connect(self) -> None:
+        self._playwright = self._start_playwright()
         try:
-            self._browser = self._playwright.chromium.connect_over_cdp(
-                self.cdp_url,
-                no_defaults=True,
-            )
+            self._browser = self._connect_browser()
+            return
+        except Exception:
+            if self.cdp_url != DEFAULT_CDP_URL:
+                self._playwright.stop()
+                self._playwright = None
+                raise
+
+        try:
+            self.launch_chrome_for_cdp()
+            self._browser = self._connect_browser_after_chrome_launch()
         except Exception:
             self._playwright.stop()
             self._playwright = None
@@ -291,6 +340,30 @@ class ChatGPTWeb:
             return None
         return self.valid_request_from_message(messages.last, validate_request)
 
+    def invalid_json_candidate(self, session: WebSession) -> tuple[str, str, str] | None:
+        messages = session.page.locator(ASSISTANT_SELECTOR)
+        if messages.count() == 0:
+            return None
+        message = messages.last
+        message_id, sources = self.json_candidates_for_message(message)
+        candidates: list[tuple[int, str, str]] = []
+        for source in sources:
+            source = source.strip()
+            looks_like_toolcall = any(marker in source for marker in ('"tool"', '"calls"', '"session"'))
+            if not source or source[0] not in '[{' or not looks_like_toolcall:
+                continue
+            try:
+                json.loads(source)
+            except json.JSONDecodeError as exc:
+                detail = f'{exc.msg} at line {exc.lineno}, column {exc.colno}'
+                candidates.append((len(source), source, detail))
+        if not candidates:
+            return None
+        _, source, detail = min(candidates, key=lambda item: item[0])
+        identity = (message_id or '') + '\0invalid-json\0' + source
+        fingerprint = hashlib.sha256(identity.encode('utf-8')).hexdigest()
+        return source, detail, fingerprint
+
     def latest_message_is_assistant(self, session: WebSession) -> bool:
         messages = session.page.locator('[data-message-author-role]')
         if messages.count() == 0:
@@ -324,6 +397,12 @@ class ChatGPTWeb:
         if button.count() == 0:
             button = session.page.get_by_role('button', name='Send prompt')
         return button.count() > 0 and button.last.is_enabled()
+
+    def is_generating(self, session: WebSession) -> bool:
+        button = session.page.locator(STOP_SELECTOR)
+        if button.count() == 0:
+            button = session.page.get_by_role('button', name='Stop answering', exact=True)
+        return button.count() > 0 and button.last.is_visible()
 
     def latest_too_long_error_id(self, session: WebSession) -> str | None:
         matches = session.page.get_by_text(MESSAGE_TOO_LONG_TEXT, exact=True)
@@ -730,8 +809,34 @@ class WebSessionWatcher:
     def scan_session(self, session: WebSession, now: float) -> bool:
         candidate = self.interface.valid_request(session, self.validate_request)
         if candidate is None:
+            if self.interface.is_generating(session) is True:
+                session.settling_fingerprint = None
+                return False
+            invalid_json = self.interface.invalid_json_candidate(session)
+            if invalid_json is None:
+                session.settling_fingerprint = None
+                return False
+            _, detail, fingerprint = invalid_json
+            if fingerprint in session.seen_fingerprints:
+                session.settling_fingerprint = None
+                return False
+            if session.settling_fingerprint != fingerprint:
+                session.settling_fingerprint = fingerprint
+                session.settle_deadline = now + self.settle_seconds
+                return False
+            if now < session.settle_deadline:
+                return False
+
+            session.seen_fingerprints.add(fingerprint)
             session.settling_fingerprint = None
-            return False
+            message = (
+                "I couldn't execute that tool call because its JSON was invalid "
+                f"({detail}). Please resend the tool call as valid JSON in a single fenced `json` block."
+            )
+            response_progress = ResponseProgress(prefix=self.progress_prefix(session.routing_session_id))
+            session.pending_responses.append(PendingResponse(message, message, progress=response_progress))
+            response_progress.set_status('[pending]')
+            return True
 
         _, request, fingerprint = candidate
         routing_session_id = self.request_session_id(request)
