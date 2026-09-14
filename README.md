@@ -88,7 +88,6 @@ The harness currently exposes these tools:
 | `diff`   | Read Git diffs                                         |
 | `edit`   | Perform exact, optionally SHA-guarded textual edits    |
 | `write`  | Create or replace files                                |
-| `patch`  | Apply unified diffs with `git apply --check` first     |
 | `run`    | Execute commands or Bash scripts with captured output  |
 
 Requests may be single calls, arrays of calls, or batches of the form:

@@ -27,7 +27,7 @@ SETTLE_SECONDS = 0.35
 SEND_RETRY_INITIAL_SECONDS = 0.25
 SEND_RETRY_MAX_SECONDS = 8.0
 MESSAGE_TOO_LONG_TEXT = "The message you submitted was too long, please edit it and resubmit."
-LOCAL_TOOLS = {"read", "find", "tree", "status", "diff", "edit", "write", "patch", "run"}
+LOCAL_TOOLS = {"read", "find", "tree", "status", "diff", "edit", "write", "run"}
 WEB_ORCHESTRATION_TOOLS = {"subagent", "handoff"}
 SUPPORTED_TOOLS = LOCAL_TOOLS | WEB_ORCHESTRATION_TOOLS
 SESSION_DIR = ".pgc"
@@ -224,14 +224,13 @@ When you need to use a local tool, make the tool request the final content of yo
 
 Available tools:
 - read {path,start?,end?,numbered?,max_bytes?}
-- find {pattern,paths?,fixed_strings?,ignore_case?,globs?,cwd?,timeout?,max_bytes?}
-- tree {path?,depth?,cwd?,max_bytes?}
+- find {pattern,paths?,fixed_strings?,ignore_case?,globs?,cwd?,timeout_seconds?,max_bytes?}
+- tree {path?,depth?,cwd?,timeout_seconds?,max_bytes?}
 - status {cwd?}
 - diff {paths?,staged?,cwd?,max_bytes?}
 - edit {path,old,new,expected_sha256?,replace_all?}
 - write {path,content,overwrite?,expected_sha256?,mkdirs?}
-- patch {patch,cwd?}
-- run {command|script,cwd?,timeout?,env?,max_bytes?}
+- run {command|script,cwd?,timeout_seconds?,env?,max_bytes?}
 
 A single call may be a JSON object. Multiple calls should use {"calls":[...]}. Every call should have a short descriptive "id". To stop later calls when one fails, put "stop_on_error": true on that individual call. Top-level "stop_on_error" is deprecated.
 

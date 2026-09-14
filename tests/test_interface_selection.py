@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 import poor_girls_codex as pgc
+import toolcall_lib
 
 
 class InterfaceSelectionTests(unittest.TestCase):
@@ -91,6 +92,28 @@ class InterfaceSelectionTests(unittest.TestCase):
         self.assertIn('handoff {result}', prompt)
         self.assertIn('Requests outside that session tree are inert', prompt)
         self.assertNotIn('subagent {name,prompt}', pgc.BOOTSTRAP_PROMPT)
+
+    def test_bootstrap_prompt_uses_timeout_seconds(self) -> None:
+        self.assertIn('timeout_seconds?', pgc.BOOTSTRAP_PROMPT)
+        self.assertNotIn('timeout?', pgc.BOOTSTRAP_PROMPT)
+
+    def test_timeout_seconds_takes_precedence_over_legacy_timeout(self) -> None:
+        self.assertEqual(
+            toolcall_lib.timeout_seconds({'timeout_seconds': 7, 'timeout': 99}),
+            7,
+        )
+
+    def test_legacy_timeout_remains_supported(self) -> None:
+        self.assertEqual(toolcall_lib.timeout_seconds({'timeout': 11}), 11)
+        self.assertEqual(toolcall_lib.timeout_seconds({}), toolcall_lib.DEFAULT_TIMEOUT)
+
+    def test_patch_tool_is_not_supported(self) -> None:
+        self.assertNotIn('patch', pgc.LOCAL_TOOLS)
+        with self.assertRaisesRegex(ValueError, 'unsupported tool'):
+            pgc.validate_request(
+                {'tool': 'patch', 'patch': 'not used'},
+                supported_tools=pgc.SUPPORTED_TOOLS,
+            )
 
     def test_hyphenated_subagent_name_is_valid(self) -> None:
         pgc.validate_request(

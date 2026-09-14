@@ -104,6 +104,12 @@ def require(call: dict[str, Any], key: str) -> Any:
     return call[key]
 
 
+def timeout_seconds(call: dict[str, Any]) -> int:
+    if "timeout_seconds" in call:
+        return int(call["timeout_seconds"])
+    return int(call.get("timeout", DEFAULT_TIMEOUT))
+
+
 def tool_read(call: dict[str, Any]) -> dict[str, Any]:
     path = Path(require(call, "path"))
     text = read_text(path)
@@ -186,7 +192,7 @@ def tool_find(call: dict[str, Any]) -> dict[str, Any]:
     result = run_process(
         argv,
         cwd=call.get("cwd"),
-        timeout=int(call.get("timeout", DEFAULT_TIMEOUT)),
+        timeout=timeout_seconds(call),
     )
 
     # ripgrep: 0 = matches, 1 = no matches, 2+ = error
@@ -241,7 +247,7 @@ def tool_tree(call: dict[str, Any]) -> dict[str, Any]:
     result = run_process(
         argv,
         cwd=call.get("cwd"),
-        timeout=int(call.get("timeout", DEFAULT_TIMEOUT)),
+        timeout=timeout_seconds(call),
     )
     if result["exit_code"] != 0:
         raise ToolError(result["stderr"].strip() or "tree failed")
@@ -382,37 +388,6 @@ def tool_write(call: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def tool_patch(call: dict[str, Any]) -> dict[str, Any]:
-    patch = str(require(call, "patch"))
-    cwd = call.get("cwd")
-
-    check = run_process(
-        ["git", "apply", "--check", "-"],
-        stdin=patch,
-        cwd=cwd,
-    )
-    if check["exit_code"] != 0:
-        raise ToolError(
-            check["stderr"].strip()
-            or check["stdout"].strip()
-            or "git apply --check failed"
-        )
-
-    apply = run_process(
-        ["git", "apply", "-"],
-        stdin=patch,
-        cwd=cwd,
-    )
-    if apply["exit_code"] != 0:
-        raise ToolError(
-            apply["stderr"].strip()
-            or apply["stdout"].strip()
-            or "git apply failed"
-        )
-
-    return {"applied": True}
-
-
 def tool_run(call: dict[str, Any]) -> dict[str, Any]:
     command = call.get("command")
     script = call.get("script")
@@ -420,7 +395,7 @@ def tool_run(call: dict[str, Any]) -> dict[str, Any]:
     if (command is None) == (script is None):
         raise ToolError("provide exactly one of command or script")
 
-    timeout = int(call.get("timeout", DEFAULT_TIMEOUT))
+    timeout = timeout_seconds(call)
     cwd = call.get("cwd")
     env = call.get("env")
 
@@ -468,7 +443,6 @@ TOOLS = {
     "diff": tool_diff,
     "edit": tool_edit,
     "write": tool_write,
-    "patch": tool_patch,
     "run": tool_run,
 }
 
@@ -548,10 +522,10 @@ Available tools:
   read   {path, start?, end?, numbered?, max_bytes?}
          Read a UTF-8 file. Returns content, line information, and SHA-256.
 
-  find   {pattern, paths?, fixed_strings?, ignore_case?, globs?, cwd?, timeout?, max_bytes?}
+  find   {pattern, paths?, fixed_strings?, ignore_case?, globs?, cwd?, timeout_seconds?, max_bytes?}
          Search with ripgrep. No matches is a successful result with found=false.
 
-  tree   {path?, depth?, cwd?, max_bytes?}
+  tree   {path?, depth?, cwd?, timeout_seconds?, max_bytes?}
          Inspect directory structure.
 
   status {cwd?}
@@ -566,10 +540,7 @@ Available tools:
   write  {path, content, overwrite?, expected_sha256?, mkdirs?}
          Create or replace a UTF-8 file. Refuses overwriting by default.
 
-  patch  {patch, cwd?}
-         Apply a unified diff using git apply --check followed by git apply.
-
-  run    {command | script, cwd?, timeout?, env?, max_bytes?}
+  run    {command | script, cwd?, timeout_seconds?, env?, max_bytes?}
          Execute a command. "command" accepts a string or argv array without a shell; "script" explicitly executes Bash. A subprocess nonzero exit is represented by ok=true with its exit_code; ok=false means the tool invocation itself failed.
 
 Every call should have a unique descriptive id. Batch results preserve those ids.
