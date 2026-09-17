@@ -630,6 +630,26 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertNotEqual(fingerprint, second[2])
 
+    def test_invalid_request_candidate_reports_semantic_validation_error(self) -> None:
+        interface = web.ChatGPTWeb()
+        source = '{"session":"root","calls":[{"id":"x","tool":"script","script":"echo hi"}]}'
+        session = web.WebSession(
+            'a',
+            'A',
+            FakePage('https' + '://chatgpt.com/c/a', code=[source], message_id='m1'),
+        )
+
+        candidate = interface.invalid_request_candidate(
+            session,
+            lambda request: (_ for _ in ()).throw(ValueError("call 0 has unsupported tool 'script'")),
+        )
+
+        self.assertIsNotNone(candidate)
+        parsed_source, detail, fingerprint = candidate
+        self.assertEqual(parsed_source, source)
+        self.assertEqual(detail, "call 0 has unsupported tool 'script'")
+        self.assertTrue(fingerprint)
+
     def test_invalid_json_candidate_ignores_non_json_code_and_valid_json(self) -> None:
         interface = web.ChatGPTWeb()
         prose_code = web.WebSession(
@@ -1452,6 +1472,100 @@ class ChatGPTWebTests(unittest.TestCase):
         child_page.close.assert_called_once_with()
         self.assertEqual(child.pending_responses, [])
 
+    def test_foreign_session_invalid_request_is_inert(self) -> None:
+        interface = mock.Mock()
+        session = web.WebSession('a', 'Cats', mock.Mock())
+        interface.valid_request.return_value = None
+        interface.is_generating.return_value = False
+        interface.invalid_json_candidate.return_value = None
+        interface.invalid_request_candidate.return_value = (
+            '{"session":"other-root","tool":"script"}',
+            'web tool request is for a different PGC session',
+            'foreign-fp',
+        )
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=lambda result: 'RESULT',
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            settle_seconds=0.0,
+        )
+
+        with mock.patch('builtins.print') as printed:
+            self.assertFalse(watcher.scan_session(session, 0.0))
+
+        printed.assert_not_called()
+        self.assertEqual(session.pending_responses, [])
+        self.assertEqual(session.seen_fingerprints, set())
+        self.assertIsNone(session.settling_fingerprint)
+
+    def test_current_session_descendant_invalid_request_is_diagnosed(self) -> None:
+        interface = mock.Mock()
+        session = web.WebSession('a', 'Cats', mock.Mock())
+        interface.valid_request.return_value = None
+        interface.is_generating.return_value = False
+        interface.invalid_json_candidate.return_value = None
+        interface.invalid_request_candidate.return_value = (
+            '{"session":"root::worker","tool":"script"}',
+            "call 0 has unsupported tool 'script'",
+            'descendant-fp',
+        )
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=lambda result: 'RESULT',
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            settle_seconds=0.0,
+        )
+
+        with mock.patch('builtins.print') as printed:
+            self.assertFalse(watcher.scan_session(session, 0.0))
+            self.assertTrue(watcher.scan_session(session, 0.0))
+
+        output = '\n'.join(str(call) for call in printed.call_args_list)
+        self.assertIn("invalid tool call: call 0 has unsupported tool 'script'", output)
+        self.assertEqual(len(session.pending_responses), 1)
+
+    def test_invalid_request_is_printed_and_sent_back_once_after_settling(self) -> None:
+        interface = mock.Mock()
+        session = web.WebSession('a', 'Cats', mock.Mock())
+        interface.valid_request.return_value = None
+        interface.is_generating.return_value = False
+        interface.invalid_json_candidate.return_value = None
+        interface.invalid_request_candidate.return_value = (
+            '{"tool":"script"}',
+            "call 0 has unsupported tool 'script'",
+            'bad-request-fp',
+        )
+        execute = mock.Mock()
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=execute,
+            fenced_result=lambda result: 'RESULT',
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            settle_seconds=0.35,
+        )
+
+        self.assertFalse(watcher.scan_session(session, 0.0))
+        with mock.patch('builtins.print') as printed:
+            self.assertTrue(watcher.scan_session(session, 0.35))
+
+        output = '\n'.join(str(call) for call in printed.call_args_list)
+        self.assertIn("invalid tool call: call 0 has unsupported tool 'script'", output)
+        self.assertEqual(len(session.pending_responses), 1)
+        self.assertIn('request was invalid', session.pending_responses[0].result)
+        self.assertIn("unsupported tool 'script'", session.pending_responses[0].result)
+        self.assertEqual(session.seen_fingerprints, {'bad-request-fp'})
+        execute.assert_not_called()
+
+        self.assertFalse(watcher.scan_session(session, 1.0))
+        self.assertEqual(len(session.pending_responses), 1)
+
     def test_invalid_json_is_ignored_while_assistant_is_generating(self) -> None:
         interface = mock.Mock()
         session = web.WebSession('a', 'Cats', mock.Mock())
@@ -1704,6 +1818,66 @@ class ChatGPTWebTests(unittest.TestCase):
         interface.connect.assert_called_once_with()
         interface.close.assert_called_once_with()
         interface.submit.assert_not_called()
+
+    def test_terminal_error_summary_omits_playwright_fill_payload(self) -> None:
+        payload = 'SECRET-PAYLOAD-' * 500
+        exc = RuntimeError(
+            'Locator.fill: Timeout 30000ms exceeded.\n'
+            'Call log:\n'
+            '  - waiting for locator("#prompt-textarea").last\n'
+            f'    - fill("{payload}")\n'
+            '    - more payload-derived diagnostics'
+        )
+
+        summary = web.terminal_error_summary(exc)
+
+        self.assertIn('Locator.fill: Timeout 30000ms exceeded.', summary)
+        self.assertIn('waiting for locator("#prompt-textarea").last', summary)
+        self.assertIn('fill(<payload omitted>)', summary)
+        self.assertNotIn('SECRET-PAYLOAD', summary)
+        self.assertNotIn('more payload-derived diagnostics', summary)
+        self.assertLessEqual(len(summary), web.TERMINAL_ERROR_MAX_CHARS)
+
+    def test_terminal_error_summary_caps_other_large_errors(self) -> None:
+        summary = web.terminal_error_summary(RuntimeError('x' * 5000))
+        self.assertLessEqual(len(summary), web.TERMINAL_ERROR_MAX_CHARS)
+        self.assertTrue(summary.endswith('...'))
+
+    def test_step_sanitizes_delivery_exception_before_printing(self) -> None:
+        interface = mock.Mock()
+        interface.rate_limit_remaining.return_value = 0.0
+        payload = 'SECRET-PAYLOAD-' * 500
+        session = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            pending_responses=[web.PendingResponse('RESULT', 'FALLBACK')],
+        )
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            clock=lambda: 1.0,
+        )
+        watcher.sessions = {'a': session}
+        watcher.refresh_sessions = mock.Mock()
+        watcher.scan_session = mock.Mock(return_value=False)
+        watcher.deliver_session = mock.Mock(side_effect=RuntimeError(
+            'Locator.fill: Timeout 30000ms exceeded.\n'
+            'Call log:\n'
+            f'  - fill("{payload}")\n'
+            '  - later diagnostics'
+        ))
+
+        with mock.patch('builtins.print') as print_mock:
+            watcher.step()
+
+        output = '\n'.join(str(call) for call in print_mock.call_args_list)
+        self.assertIn('fill(<payload omitted>)', output)
+        self.assertNotIn('SECRET-PAYLOAD', output)
+        self.assertNotIn('later diagnostics', output)
 
     def test_delivery_failure_is_isolated_and_retried_without_reexecution(self) -> None:
         interface = mock.Mock()

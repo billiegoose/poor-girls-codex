@@ -244,15 +244,17 @@ BOOTSTRAP_PROMPT = r'''You are operating as a coding agent through Poor Girl's C
 
 When you need to use a local tool, make the tool request the final content of your response as one fenced ```json code block. Poor Girl's Codex will execute it and send the JSON result back automatically.
 
+Local tools already execute from the current working directory. Omit `cwd` unless you intentionally need to operate in a different directory.
+
 Available tools:
 - read {path,start?,end?,numbered?,max_bytes?}
-- find {pattern,paths?,fixed_strings?,ignore_case?,globs?,cwd?,timeout_seconds?,max_bytes?}
-- tree {path?,depth?,cwd?,timeout_seconds?,max_bytes?}
-- status {cwd?}
-- diff {paths?,staged?,cwd?,max_bytes?}
+- find {pattern,paths?,fixed_strings?,ignore_case?,globs?,cwd? (only to change directories),timeout_seconds?,max_bytes?}
+- tree {path?,depth?,cwd? (only to change directories),timeout_seconds?,max_bytes?}
+- status {cwd? (only to change directories)}
+- diff {paths?,staged?,cwd? (only to change directories),max_bytes?}
 - edit {path,old,new,expected_sha256?,replace_all?}
 - write {path,content,overwrite?,expected_sha256?,mkdirs?}
-- run {command|script,cwd?,timeout_seconds?,env?,max_bytes?}
+- run {command|script,cwd? (only to change directories),timeout_seconds?,env?,max_bytes?}
 
 A single call may be a JSON object. Multiple calls should use {"calls":[...]}. Every call should have a short descriptive "id". To stop later calls when one fails, put "stop_on_error": true on that individual call. Top-level "stop_on_error" is deprecated.
 

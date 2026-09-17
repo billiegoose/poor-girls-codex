@@ -31,7 +31,23 @@ RATE_LIMIT_BACKOFF_INITIAL_SECONDS = 60.0
 RATE_LIMIT_BACKOFF_MAX_SECONDS = 300.0
 RATE_LIMIT_BACKOFF_RESET_SECONDS = 900.0
 MESSAGE_TOO_LONG_TEXT = 'The message you submitted was too long, please edit it and resubmit.'
+TERMINAL_ERROR_MAX_CHARS = 1200
 SUBAGENT_COLOR_CODES = ('1;34', '1;35', '1;36', '1;33', '1;32')
+
+
+def terminal_error_summary(exc: BaseException, max_chars: int = TERMINAL_ERROR_MAX_CHARS) -> str:
+    safe_lines: list[str] = []
+    for line in str(exc).strip().splitlines():
+        fill_index = line.find('fill(')
+        if fill_index >= 0:
+            safe_lines.append(line[:fill_index] + 'fill(<payload omitted>)')
+            break
+        safe_lines.append(line)
+
+    summary = '\n'.join(safe_lines).strip()
+    if len(summary) <= max_chars:
+        return summary
+    return summary[: max(0, max_chars - 3)].rstrip() + '...'
 SUBAGENT_COMPLETION_INSTRUCTIONS = '''Subagent completion protocol:
 - You are a subagent. Your task is not complete until you call the `handoff` tool.
 - When your work is complete, make `handoff` your final tool call and put your concise result in its `result` field.
@@ -364,6 +380,37 @@ class ChatGPTWeb:
         fingerprint = hashlib.sha256(identity.encode('utf-8')).hexdigest()
         return source, detail, fingerprint
 
+    def invalid_request_candidate(
+        self,
+        session: WebSession,
+        validate_request: Callable[[Any], None],
+    ) -> tuple[str, str, str] | None:
+        messages = session.page.locator(ASSISTANT_SELECTOR)
+        if messages.count() == 0:
+            return None
+        message = messages.last
+        message_id, sources = self.json_candidates_for_message(message)
+        candidates: list[tuple[int, str, str]] = []
+        for source in sources:
+            source = source.strip()
+            looks_like_toolcall = any(marker in source for marker in ('"tool"', '"calls"', '"session"'))
+            if not source or source[0] not in '[{' or not looks_like_toolcall:
+                continue
+            try:
+                request = json.loads(source)
+            except json.JSONDecodeError:
+                continue
+            try:
+                validate_request(request)
+            except ValueError as exc:
+                candidates.append((len(source), source, str(exc)))
+        if not candidates:
+            return None
+        _, source, detail = min(candidates, key=lambda item: item[0])
+        identity = (message_id or '') + '\0invalid-request\0' + source
+        fingerprint = hashlib.sha256(identity.encode('utf-8')).hexdigest()
+        return source, detail, fingerprint
+
     def latest_message_is_assistant(self, session: WebSession) -> bool:
         messages = session.page.locator('[data-message-author-role]')
         if messages.count() == 0:
@@ -586,6 +633,16 @@ class WebSessionWatcher:
         if isinstance(request, dict) and isinstance(request.get('calls'), list):
             return request['calls']
         return [request]
+
+    def accepts_routing_session_id(self, routing_session_id: str | None) -> bool:
+        if self.root_session_id is None:
+            return True
+        if routing_session_id is None:
+            return False
+        return (
+            routing_session_id == self.root_session_id
+            or routing_session_id.startswith(self.root_session_id + '::')
+        )
 
     def subagent_name(self, routing_session_id: str | None) -> str | None:
         if routing_session_id is None or self.root_session_id is None:
@@ -813,10 +870,36 @@ class WebSessionWatcher:
                 session.settling_fingerprint = None
                 return False
             invalid_json = self.interface.invalid_json_candidate(session)
+            invalid_request = None
             if invalid_json is None:
+                invalid_request = self.interface.invalid_request_candidate(session, self.validate_request)
+                if invalid_request is not None and self.root_session_id is not None:
+                    source, _, _ = invalid_request
+                    try:
+                        parsed_request = json.loads(source)
+                    except json.JSONDecodeError:
+                        parsed_request = None
+                    routing_session_id = self.request_session_id(parsed_request)
+                    if routing_session_id is not None and not self.accepts_routing_session_id(routing_session_id):
+                        invalid_request = None
+            if invalid_json is None and invalid_request is None:
                 session.settling_fingerprint = None
                 return False
-            _, detail, fingerprint = invalid_json
+            if invalid_json is not None:
+                _, detail, fingerprint = invalid_json
+                diagnostic = f'invalid JSON: {detail}'
+                message = (
+                    "I couldn't execute that tool call because its JSON was invalid "
+                    f"({detail}). Please resend the tool call as valid JSON in a single fenced `json` block."
+                )
+            else:
+                assert invalid_request is not None
+                _, detail, fingerprint = invalid_request
+                diagnostic = f'invalid tool call: {detail}'
+                message = (
+                    "I couldn't execute that tool call because the request was invalid "
+                    f"({detail}). Please correct the tool call and resend it."
+                )
             if fingerprint in session.seen_fingerprints:
                 session.settling_fingerprint = None
                 return False
@@ -829,10 +912,7 @@ class WebSessionWatcher:
 
             session.seen_fingerprints.add(fingerprint)
             session.settling_fingerprint = None
-            message = (
-                "I couldn't execute that tool call because its JSON was invalid "
-                f"({detail}). Please resend the tool call as valid JSON in a single fenced `json` block."
-            )
+            print(f'  [web:{session.label}] {diagnostic}', flush=True)
             response_progress = ResponseProgress(prefix=self.progress_prefix(session.routing_session_id))
             session.pending_responses.append(PendingResponse(message, message, progress=response_progress))
             response_progress.set_status('[pending]')
@@ -1104,7 +1184,7 @@ class WebSessionWatcher:
             except Exception as exc:
                 delay = self.schedule_delivery_retry(session, now)
                 print(
-                    f'  [web:{session.label}] delivery error: {exc} [retry in {delay:g}s]',
+                    f'  [web:{session.label}] delivery error: {terminal_error_summary(exc)} [retry in {delay:g}s]',
                     flush=True,
                 )
 

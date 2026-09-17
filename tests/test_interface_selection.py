@@ -124,6 +124,17 @@ class InterfaceSelectionTests(unittest.TestCase):
             )
         )
 
+    def test_bootstrap_prompt_discourages_redundant_cwd_overrides(self) -> None:
+        self.assertIn(
+            'Local tools already execute from the current working directory.',
+            pgc.BOOTSTRAP_PROMPT,
+        )
+        self.assertIn(
+            'Omit `cwd` unless you intentionally need to operate in a different directory.',
+            pgc.BOOTSTRAP_PROMPT,
+        )
+        self.assertIn('cwd? (only to change directories)', pgc.BOOTSTRAP_PROMPT)
+
     def test_bootstrap_prompt_uses_timeout_seconds(self) -> None:
         self.assertIn('timeout_seconds?', pgc.BOOTSTRAP_PROMPT)
         self.assertNotIn('timeout?', pgc.BOOTSTRAP_PROMPT)
