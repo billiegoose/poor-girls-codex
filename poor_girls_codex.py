@@ -14,6 +14,8 @@ import sys
 import termios
 import time
 import tty
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Protocol
@@ -32,6 +34,9 @@ WEB_ORCHESTRATION_TOOLS = {"subagent", "handoff"}
 SUPPORTED_TOOLS = LOCAL_TOOLS | WEB_ORCHESTRATION_TOOLS
 SESSION_DIR = ".pgc"
 SESSION_FILE = os.path.join(SESSION_DIR, "session")
+NTFY_TOPIC_FILE = os.path.join(SESSION_DIR, "ntfy")
+DEFAULT_NTFY_SERVER = "https://ntfy.sh"
+NTFY_TIMEOUT_SECONDS = 5.0
 
 
 class WatcherPhase(Enum):
@@ -284,12 +289,13 @@ def ensure_session_ignored(cwd: str = ".") -> None:
             lines = {line.strip() for line in exclude_file}
     except FileNotFoundError:
         lines = set()
-    if SESSION_FILE in lines:
+    missing = [path for path in (SESSION_FILE, NTFY_TOPIC_FILE) if path not in lines]
+    if not missing:
         return
     with open(exclude_path, "a", encoding="utf-8") as exclude_file:
         if os.path.exists(exclude_path) and os.path.getsize(exclude_path) > 0:
             exclude_file.write("\n")
-        exclude_file.write(SESSION_FILE + "\n")
+        exclude_file.write("\n".join(missing) + "\n")
 
 
 def load_or_create_session_id(cwd: str = ".") -> str:
@@ -309,6 +315,19 @@ def load_or_create_session_id(cwd: str = ".") -> str:
     return session_id
 
 
+def load_ntfy_topic(cwd: str = ".", home: str | None = None) -> str:
+    local_path = os.path.join(cwd, NTFY_TOPIC_FILE)
+    home_dir = os.path.expanduser("~") if home is None else home
+    global_path = os.path.join(home_dir, NTFY_TOPIC_FILE)
+    for path in (local_path, global_path):
+        try:
+            with open(path, encoding="utf-8") as topic_file:
+                return topic_file.read().strip()
+        except FileNotFoundError:
+            continue
+    return ""
+
+
 def web_bootstrap_prompt(session_id: str, *, role: str) -> str:
     if role not in {"root", "subagent"}:
         raise ValueError(f"unsupported web bootstrap role: {role!r}")
@@ -318,15 +337,11 @@ def web_bootstrap_prompt(session_id: str, *, role: str) -> str:
         "- subagent {name,prompt} - create a fresh ChatGPT subagent conversation; "
         "name may contain letters, digits, '-' and '_', and must start with a letter or digit."
     )
-    if role == "subagent":
-        additional_tools += (
-            "\n- handoff {result} - send your completed result back to your immediate parent conversation."
-        )
 
     role_instructions = (
         "You are the root agent for this Poor Girl's Codex session. Finish normally in this conversation."
         if role == "root"
-        else "You are a subagent. When your assigned work is complete, return it to your immediate parent with handoff {result}."
+        else "You are a subagent. Continue using tools while work remains; when the assignment is complete, finish normally with a concise prose response. Poor Girl's Codex will forward that terminal response to your parent automatically."
     )
 
     return BOOTSTRAP_PROMPT + f'''\n\nAgent role:\n{role_instructions}\n\n{additional_tools}\n\nWeb session routing:\nEvery executable Poor Girl's Codex request MUST include the exact top-level field \"session\": \"{session_id}\". This applies to both single-call objects and {{\"calls\":[...]}} batches. This watcher accepts this session and descendant sessions beginning with \"{session_id}::\". Requests outside that session tree are inert and will be ignored. When merely discussing or showing example JSON, do not include this session value unless you intend the example to execute.'''
@@ -343,6 +358,48 @@ def root_web_bootstrap_prompt(session_id: str, cwd: str = ".") -> str:
         f"Working directory: {working_directory}\n\n"
         f"{web_bootstrap_prompt(session_id, role='root')}"
     )
+
+
+def terminal_response_summary(text: str, max_chars: int = 160) -> str:
+    paragraphs = [part.strip() for part in re.split(r'\n\s*\n', text.strip()) if part.strip()]
+    if not paragraphs:
+        return ''
+
+    paragraph = paragraphs[-1]
+    paragraph = re.sub(r'^#+\s*', '', paragraph)
+    paragraph = re.sub(r'^>\s*', '', paragraph)
+    paragraph = re.sub(r'^[-*]\s*', '', paragraph)
+    paragraph = re.sub(r'\s+', ' ', paragraph).strip()
+
+    match = re.match(r'(.+?[.!?])(?:\s|$)', paragraph)
+    summary = match.group(1).strip() if match else paragraph
+    if len(summary) > max_chars:
+        summary = summary[: max_chars - 1].rstrip() + '…'
+    return summary
+
+
+def publish_ntfy_completion(
+    *,
+    topic: str,
+    title: str,
+    message: str,
+    server: str = DEFAULT_NTFY_SERVER,
+) -> None:
+    topic = topic.strip()
+    if not topic:
+        return
+    url = server.rstrip('/') + '/' + urllib.parse.quote(topic, safe='')
+    request = urllib.request.Request(
+        url,
+        data=message.encode('utf-8'),
+        headers={
+            'Title': title,
+            'Tags': 'white_check_mark',
+        },
+        method='POST',
+    )
+    with urllib.request.urlopen(request, timeout=NTFY_TIMEOUT_SECONDS) as response:
+        response.read()
 
 
 def web_session_matches(session: Any, session_id: str) -> bool:
@@ -747,7 +804,13 @@ def latest_valid_request(root):
     return source, request, fingerprint
 
 
-def show_startup_ui(bootstrap_prompt: str, *, clipboard_write, web_managed: bool = False) -> None:
+def show_startup_ui(
+    bootstrap_prompt: str,
+    *,
+    clipboard_write,
+    web_managed: bool = False,
+    ntfy_topic: str | None = None,
+) -> None:
     border = "+================================================================+"
     print(color(border, "1;36"))
     print(
@@ -766,6 +829,11 @@ def show_startup_ui(bootstrap_prompt: str, *, clipboard_write, web_managed: bool
         print(f"  {color('[1]', '1;35')} Open a regular ChatGPT conversation in the configured frontend.")
         print(f"  {color('[2]', '1;35')} Paste the bootstrap prompt already on your clipboard.")
         print(f"  {color('[3]', '1;35')} Leave me running; I'll handle tool calls in the background.")
+    if ntfy_topic is not None:
+        topic = ntfy_topic.strip()
+        status = color(topic, '1;36') if topic else color('off', '2')
+        print()
+        print(f"  {color('notifications', '1;35')}  ntfy {color('·', '36')} {status}")
     print()
     clipboard_write(bootstrap_prompt)
 
@@ -944,6 +1012,11 @@ def main() -> None:
         default=None,
         help="Chromium CDP endpoint for --interface chatgpt-web",
     )
+    parser.add_argument(
+        "--ntfy-server",
+        default=os.environ.get("PGC_NTFY_SERVER", DEFAULT_NTFY_SERVER),
+        help="ntfy server base URL (default: https://ntfy.sh)",
+    )
     args = parser.parse_args()
 
     if args.interface == "chatgpt-web":
@@ -952,6 +1025,7 @@ def main() -> None:
         from chatgpt_web import DEFAULT_CDP_URL, run_web_watcher
 
         session_id = load_or_create_session_id()
+        ntfy_topic = load_ntfy_topic()
         bootstrap_prompt = root_web_bootstrap_prompt(session_id)
         show_startup_ui(
             bootstrap_prompt,
@@ -959,6 +1033,7 @@ def main() -> None:
                 ["pbcopy"], input=text, text=True, check=True
             ),
             web_managed=True,
+            ntfy_topic=ntfy_topic,
         )
         run_web_watcher(
             cdp_url=args.cdp_url or DEFAULT_CDP_URL,
@@ -975,6 +1050,16 @@ def main() -> None:
             fenced_result=fenced_result,
             too_long_fallback=too_long_fallback_for_request,
             bootstrap_prompt_for_session=subagent_web_bootstrap_prompt,
+            on_root_terminal=lambda session, text: publish_ntfy_completion(
+                topic=ntfy_topic,
+                server=args.ntfy_server,
+                title=(
+                    'Task complete ('
+                    + (os.path.basename(os.path.abspath('.')) or os.path.abspath('.'))
+                    + ')'
+                ),
+                message=terminal_response_summary(text) or 'Task completed successfully.',
+            ),
         )
         return
 

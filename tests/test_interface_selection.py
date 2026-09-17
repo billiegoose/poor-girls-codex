@@ -66,12 +66,113 @@ class InterfaceSelectionTests(unittest.TestCase):
             self.assertTrue(first)
             with open(os.path.join(cwd, '.pgc', 'session'), encoding='utf-8') as session_file:
                 self.assertEqual(session_file.read().strip(), first)
-            ignored = subprocess.run(
-                ['git', 'check-ignore', '-q', '.pgc/session'],
-                cwd=cwd,
-                check=False,
+            for path in ('.pgc/session', '.pgc/ntfy'):
+                ignored = subprocess.run(
+                    ['git', 'check-ignore', '-q', path],
+                    cwd=cwd,
+                    check=False,
+                )
+                self.assertEqual(ignored.returncode, 0)
+
+    def test_web_startup_ui_prints_ntfy_topic_aesthetically(self) -> None:
+        clipboard_write = mock.Mock()
+        with mock.patch('builtins.print') as printed:
+            pgc.show_startup_ui(
+                'BOOTSTRAP',
+                clipboard_write=clipboard_write,
+                web_managed=True,
+                ntfy_topic='poor_girls_codex_billiegoose',
             )
-            self.assertEqual(ignored.returncode, 0)
+        output = '\n'.join(str(call) for call in printed.call_args_list)
+        self.assertIn('notifications', output)
+        self.assertIn('ntfy', output)
+        self.assertIn('poor_girls_codex_billiegoose', output)
+        clipboard_write.assert_called_once_with('BOOTSTRAP')
+
+    def test_web_startup_ui_prints_ntfy_off_when_disabled(self) -> None:
+        with mock.patch('builtins.print') as printed:
+            pgc.show_startup_ui(
+                'BOOTSTRAP',
+                clipboard_write=mock.Mock(),
+                web_managed=True,
+                ntfy_topic='',
+            )
+        output = '\n'.join(str(call) for call in printed.call_args_list)
+        self.assertIn('notifications', output)
+        self.assertIn('ntfy', output)
+        self.assertIn('off', output)
+
+    def test_ntfy_topic_falls_back_to_home_config(self) -> None:
+        with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, '.pgc'))
+            with open(os.path.join(home, '.pgc', 'ntfy'), 'w', encoding='utf-8') as topic_file:
+                topic_file.write('global-topic\n')
+            self.assertEqual(pgc.load_ntfy_topic(cwd, home), 'global-topic')
+
+    def test_local_ntfy_topic_overrides_home_config(self) -> None:
+        with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(cwd, '.pgc'))
+            os.makedirs(os.path.join(home, '.pgc'))
+            with open(os.path.join(home, '.pgc', 'ntfy'), 'w', encoding='utf-8') as topic_file:
+                topic_file.write('global-topic\n')
+            with open(os.path.join(cwd, '.pgc', 'ntfy'), 'w', encoding='utf-8') as topic_file:
+                topic_file.write('local-topic\n')
+            self.assertEqual(pgc.load_ntfy_topic(cwd, home), 'local-topic')
+
+    def test_empty_local_ntfy_topic_disables_home_config(self) -> None:
+        with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(cwd, '.pgc'))
+            os.makedirs(os.path.join(home, '.pgc'))
+            with open(os.path.join(home, '.pgc', 'ntfy'), 'w', encoding='utf-8') as topic_file:
+                topic_file.write('global-topic\n')
+            with open(os.path.join(cwd, '.pgc', 'ntfy'), 'w', encoding='utf-8') as topic_file:
+                topic_file.write('\n')
+            self.assertEqual(pgc.load_ntfy_topic(cwd, home), '')
+
+    def test_missing_ntfy_topic_disables_notifications(self) -> None:
+        with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as home:
+            self.assertEqual(pgc.load_ntfy_topic(cwd, home), '')
+
+    def test_terminal_response_summary_uses_first_sentence_of_final_paragraph(self) -> None:
+        text = (
+            'Implemented the requested change.\n\n'
+            'Tests are all passing. The branch is clean and ready.'
+        )
+        self.assertEqual(pgc.terminal_response_summary(text), 'Tests are all passing.')
+
+    def test_terminal_response_summary_truncates_sentence(self) -> None:
+        text = 'Earlier paragraph.\n\n' + ('x' * 200) + '.'
+        summary = pgc.terminal_response_summary(text, max_chars=40)
+        self.assertEqual(len(summary), 40)
+        self.assertTrue(summary.endswith('…'))
+
+    def test_publish_ntfy_completion_posts_short_message_to_topic(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        with mock.patch.object(pgc.urllib.request, 'urlopen', return_value=response) as urlopen:
+            pgc.publish_ntfy_completion(
+                topic='poor girls/codex',
+                title='Task complete (poor-girls-codex)',
+                message='Finished.',
+                server='https://notify.example/base/',
+            )
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, 'https://notify.example/base/poor%20girls%2Fcodex')
+        self.assertEqual(request.data, b'Finished.')
+        self.assertEqual(request.method, 'POST')
+        self.assertEqual(request.headers['Title'], 'Task complete (poor-girls-codex)')
+        urlopen.assert_called_once_with(request, timeout=pgc.NTFY_TIMEOUT_SECONDS)
+        response.read.assert_called_once_with()
+
+    def test_publish_ntfy_completion_empty_topic_is_disabled(self) -> None:
+        with mock.patch.object(pgc.urllib.request, 'urlopen') as urlopen:
+            pgc.publish_ntfy_completion(
+                topic='  ',
+                title='Task complete (repo)',
+                message='Finished.',
+            )
+        urlopen.assert_not_called()
 
     def test_web_session_validation_accepts_current_session_and_descendants(self) -> None:
         pgc.validate_web_session_request({'session': 'abc', 'id': 'x', 'tool': 'status'}, 'abc')
@@ -90,7 +191,9 @@ class InterfaceSelectionTests(unittest.TestCase):
         self.assertIn('"session": "abc123"', prompt)
         self.assertIn('abc123::', prompt)
         self.assertIn('subagent {name,prompt}', prompt)
-        self.assertIn('handoff {result}', prompt)
+        self.assertIn('finish normally with a concise prose response', prompt)
+        self.assertIn('forward that terminal response to your parent automatically', prompt)
+        self.assertNotIn('handoff {result}', prompt)
         self.assertIn('Requests outside that session tree are inert', prompt)
         self.assertNotIn('subagent {name,prompt}', pgc.BOOTSTRAP_PROMPT)
 

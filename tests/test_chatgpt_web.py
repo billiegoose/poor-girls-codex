@@ -55,12 +55,14 @@ class FakePage:
         code=None,
         message_id='message-1',
         message_roles=None,
+        message_role_ids=None,
     ):
         self.url = url
         self._title = title
         self.code = code or []
         self.message_id = message_id
         self.message_roles = list(message_roles or [])
+        self.message_role_ids = list(message_role_ids or [None] * len(self.message_roles))
 
     def title(self):
         return self._title
@@ -71,6 +73,7 @@ class FakePage:
         if selector == '[data-message-author-role]':
             return FakeLocator(
                 [''] * len(self.message_roles),
+                message_id=self.message_role_ids,
                 author_role=self.message_roles,
             )
         return FakeLocator([])
@@ -672,6 +675,39 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIsNone(interface.invalid_json_candidate(valid_json))
         self.assertIsNone(interface.invalid_json_candidate(malformed_non_tool_json))
 
+    def test_normalize_message_text_matches_fenced_submit_to_rendered_code_block(self) -> None:
+        interface = web.ChatGPTWeb()
+
+        submitted = '```\n[\n  {"id": "status", "ok": true}\n]\n```\n'
+        rendered = '[\n\u00a0 {"id": "status", "ok": true}\n]'
+
+        self.assertEqual(
+            interface.normalize_message_text(submitted),
+            interface.normalize_message_text(rendered),
+        )
+
+    def test_terminal_response_candidate_requires_tool_result_user_turn_immediately_before_assistant(self) -> None:
+        interface = web.ChatGPTWeb()
+        session = web.WebSession(
+            'a',
+            'Cats',
+            FakePage(
+                'https' + '://chatgpt.com/c/a',
+                code=['Finished normally.'],
+                message_id='assistant-final',
+                message_roles=['user', 'assistant', 'user', 'assistant'],
+                message_role_ids=['user-1', 'assistant-1', 'tool-user', 'assistant-final'],
+            ),
+        )
+
+        candidate = interface.terminal_response_candidate(session, 'tool-user')
+
+        self.assertIsNotNone(candidate)
+        text, fingerprint = candidate
+        self.assertEqual(text, 'Finished normally.')
+        self.assertTrue(fingerprint)
+        self.assertIsNone(interface.terminal_response_candidate(session, 'other-user'))
+
     def test_latest_message_is_assistant_uses_actual_final_conversation_turn(self) -> None:
         interface = web.ChatGPTWeb()
         assistant_last = web.WebSession(
@@ -1098,9 +1134,9 @@ class ChatGPTWebTests(unittest.TestCase):
             ),
         )
         prompt = interface.create_conversation.call_args.kwargs['prompt']
-        self.assertIn('not complete until you call the `handoff` tool', prompt)
-        self.assertIn('Do not finish with a prose-only response', prompt)
-        self.assertIn('make `handoff` your final tool call', prompt)
+        self.assertIn('finish normally with a concise prose response', prompt)
+        self.assertIn('forwards it to your parent', prompt)
+        self.assertNotIn('not complete until you call the `handoff` tool', prompt)
 
     def test_duplicate_subagent_session_is_rejected(self) -> None:
         interface = mock.Mock()
@@ -1530,6 +1566,321 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIn("invalid tool call: call 0 has unsupported tool 'script'", output)
         self.assertEqual(len(session.pending_responses), 1)
 
+    def test_seen_previous_toolcall_does_not_cancel_terminal_expectation(self) -> None:
+        interface = mock.Mock()
+        session = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            seen_fingerprints={'previous-tool-fp'},
+            terminal_expectation=web.TerminalExpectation('RESULT\n', 'previous-user', 'tool-user'),
+        )
+        interface.valid_request.return_value = (
+            '{}',
+            {'tool': 'status'},
+            'previous-tool-fp',
+        )
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+
+        self.assertFalse(watcher.scan_session(session, 0.0))
+
+        self.assertIsNotNone(session.terminal_expectation)
+        self.assertEqual(session.terminal_expectation.user_message_id, 'tool-user')
+
+    def test_terminal_response_after_tool_result_prints_complete_without_repair(self) -> None:
+        interface = mock.Mock()
+        session = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            routing_session_id='root',
+            terminal_expectation=web.TerminalExpectation('RESULT\n', 'previous-user', 'tool-user'),
+        )
+        interface.valid_request.return_value = None
+        interface.is_generating.return_value = False
+        interface.latest_user_message.return_value = ('tool-user', 'RESULT\n')
+        interface.invalid_json_candidate.return_value = None
+        interface.invalid_request_candidate.return_value = None
+        interface.terminal_response_candidate.return_value = ('Done.', 'terminal-fp')
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            settle_seconds=0.0,
+        )
+
+        with mock.patch('builtins.print') as printed:
+            self.assertFalse(watcher.scan_session(session, 0.0))
+            self.assertTrue(watcher.scan_session(session, 0.0))
+
+        output = '\n'.join(str(call) for call in printed.call_args_list)
+        self.assertIn('terminal response [complete]', output)
+        self.assertIsNone(session.terminal_expectation)
+        self.assertEqual(session.seen_fingerprints, {'terminal-fp'})
+        self.assertEqual(
+            interface.invalid_json_candidate.call_args_list,
+            [mock.call(session), mock.call(session)],
+        )
+        self.assertEqual(
+            interface.invalid_request_candidate.call_args_list,
+            [
+                mock.call(session, watcher.validate_request),
+                mock.call(session, watcher.validate_request),
+            ],
+        )
+
+    def test_root_terminal_response_invokes_completion_callback_once(self) -> None:
+        interface = mock.Mock()
+        session = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            routing_session_id='root',
+            terminal_expectation=web.TerminalExpectation('RESULT\n', 'previous-user', 'tool-user'),
+        )
+        interface.valid_request.return_value = None
+        interface.is_generating.return_value = False
+        interface.latest_user_message.return_value = ('tool-user', 'RESULT\n')
+        interface.terminal_response_candidate.return_value = ('Done.', 'root-terminal-fp')
+        interface.invalid_json_candidate.return_value = None
+        interface.invalid_request_candidate.return_value = None
+        callback = mock.Mock()
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            on_root_terminal=callback,
+            settle_seconds=0.0,
+        )
+
+        self.assertFalse(watcher.scan_session(session, 0.0))
+        self.assertTrue(watcher.scan_session(session, 0.0))
+        self.assertFalse(watcher.scan_session(session, 1.0))
+
+        callback.assert_called_once_with(session, 'Done.')
+
+    def test_root_terminal_notification_failure_does_not_rearm_completion(self) -> None:
+        interface = mock.Mock()
+        session = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            routing_session_id='root',
+            terminal_expectation=web.TerminalExpectation('RESULT\n', 'previous-user', 'tool-user'),
+        )
+        interface.valid_request.return_value = None
+        interface.is_generating.return_value = False
+        interface.latest_user_message.return_value = ('tool-user', 'RESULT\n')
+        interface.terminal_response_candidate.return_value = ('Done.', 'root-terminal-fp')
+        interface.invalid_json_candidate.return_value = None
+        interface.invalid_request_candidate.return_value = None
+        callback = mock.Mock(side_effect=RuntimeError('ntfy offline'))
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            on_root_terminal=callback,
+            settle_seconds=0.0,
+        )
+
+        self.assertFalse(watcher.scan_session(session, 0.0))
+        with mock.patch('builtins.print') as printed:
+            self.assertTrue(watcher.scan_session(session, 0.0))
+        self.assertFalse(watcher.scan_session(session, 1.0))
+
+        callback.assert_called_once_with(session, 'Done.')
+        output = '\n'.join(str(call) for call in printed.call_args_list)
+        self.assertIn('terminal notification error: ntfy offline', output)
+        self.assertIsNone(session.terminal_expectation)
+
+    def test_malformed_toolcall_after_tool_result_gets_repair_response(self) -> None:
+        interface = mock.Mock()
+        session = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            routing_session_id='root',
+            terminal_expectation=web.TerminalExpectation('RESULT\n', 'previous-user', 'tool-user'),
+        )
+        interface.valid_request.return_value = None
+        interface.is_generating.return_value = False
+        interface.latest_user_message.return_value = ('tool-user', 'RESULT\n')
+        interface.invalid_json_candidate.return_value = (
+            '{"tool":"status",}',
+            'bad json',
+            'invalid-fp',
+        )
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            settle_seconds=0.0,
+        )
+
+        self.assertFalse(watcher.scan_session(session, 0.0))
+        self.assertTrue(watcher.scan_session(session, 0.0))
+
+        self.assertEqual(session.seen_fingerprints, {'invalid-fp'})
+        self.assertIsNone(session.terminal_expectation)
+        self.assertEqual(len(session.pending_responses), 1)
+        self.assertFalse(session.pending_responses[0].arms_terminal)
+        self.assertIn("couldn't execute that tool call", session.pending_responses[0].result)
+        interface.terminal_response_candidate.assert_not_called()
+
+        self.assertTrue(watcher.deliver_session(session, 1.0))
+        self.assertIsNone(session.terminal_expectation)
+
+    def test_terminal_expectation_resolves_fenced_submit_against_unfenced_rendered_user_turn(self) -> None:
+        interface = mock.Mock()
+        interface.normalize_message_text.side_effect = web.ChatGPTWeb.normalize_message_text
+        interface.latest_user_message.return_value = ('tool-user', '[\n  {"ok": true}\n]')
+        session = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            terminal_expectation=web.TerminalExpectation(
+                '```\n[\n  {"ok": true}\n]\n```\n',
+                'previous-user',
+            ),
+        )
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+
+        watcher.resolve_terminal_expectation(session)
+
+        self.assertIsNotNone(session.terminal_expectation)
+        self.assertEqual(session.terminal_expectation.user_message_id, 'tool-user')
+
+    def test_terminal_expectation_survives_constant_rendered_user_count(self) -> None:
+        interface = mock.Mock()
+        session = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            routing_session_id='root',
+            pending_responses=[web.PendingResponse('RESULT', 'FALLBACK')],
+        )
+        interface.latest_user_message.side_effect = [
+            ('old-user', 'old prompt'),
+            ('tool-user', 'RESULT\n'),
+            ('tool-user', 'RESULT\n'),
+            ('tool-user', 'RESULT\n'),
+        ]
+        interface.valid_request.return_value = None
+        interface.is_generating.return_value = False
+        interface.invalid_json_candidate.return_value = None
+        interface.invalid_request_candidate.return_value = None
+        interface.terminal_response_candidate.return_value = ('Done.', 'terminal-fp')
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            settle_seconds=0.0,
+        )
+
+        self.assertTrue(watcher.deliver_session(session, 0.0))
+        self.assertIsNotNone(session.terminal_expectation)
+        self.assertIsNone(session.terminal_expectation.user_message_id)
+        self.assertEqual(session.terminal_expectation.previous_user_message_id, 'old-user')
+
+        self.assertFalse(watcher.scan_session(session, 0.0))
+        self.assertEqual(session.terminal_expectation.user_message_id, 'tool-user')
+        self.assertTrue(watcher.scan_session(session, 0.0))
+        self.assertIsNone(session.terminal_expectation)
+
+    def test_intervening_regular_user_turn_cancels_terminal_expectation(self) -> None:
+        interface = mock.Mock()
+        session = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            terminal_expectation=web.TerminalExpectation('RESULT\n', 'previous-user', 'tool-user'),
+        )
+        interface.valid_request.return_value = None
+        interface.is_generating.return_value = False
+        interface.latest_user_message.return_value = ('human-user', 'hello')
+        interface.invalid_json_candidate.return_value = None
+        interface.invalid_request_candidate.return_value = None
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            settle_seconds=0.0,
+        )
+
+        self.assertFalse(watcher.scan_session(session, 0.0))
+
+        self.assertIsNone(session.terminal_expectation)
+        interface.terminal_response_candidate.assert_not_called()
+
+    def test_subagent_terminal_response_forwards_to_parent_and_retires(self) -> None:
+        interface = mock.Mock()
+        parent = web.WebSession('parent-c', 'Parent', mock.Mock(), routing_session_id='root')
+        child_page = mock.Mock()
+        child = web.WebSession(
+            'child-c',
+            'Child',
+            child_page,
+            routing_session_id='root::worker',
+            terminal_expectation=web.TerminalExpectation('RESULT\n', 'previous-user', 'tool-user'),
+        )
+        interface.valid_request.return_value = None
+        interface.is_generating.return_value = False
+        interface.latest_user_message.return_value = ('tool-user', 'RESULT\n')
+        interface.invalid_json_candidate.return_value = None
+        interface.invalid_request_candidate.return_value = None
+        interface.terminal_response_candidate.return_value = ('Finished work.', 'child-terminal-fp')
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            settle_seconds=0.0,
+        )
+        watcher.sessions = {'parent-c': parent, 'child-c': child}
+        watcher.sessions_by_routing_id = {'root': parent, 'root::worker': child}
+
+        self.assertFalse(watcher.scan_session(child, 0.0))
+        self.assertTrue(watcher.scan_session(child, 0.0))
+
+        self.assertEqual(len(parent.pending_responses), 1)
+        self.assertIn('Finished work.', parent.pending_responses[0].result)
+        self.assertIn('completed with terminal response', parent.pending_responses[0].result)
+        interface.archive_conversation.assert_called_once_with(child)
+        child_page.close.assert_called_once_with()
+        self.assertNotIn('child-c', watcher.sessions)
+        self.assertNotIn('root::worker', watcher.sessions_by_routing_id)
+
     def test_invalid_request_is_printed_and_sent_back_once_after_settling(self) -> None:
         interface = mock.Mock()
         session = web.WebSession('a', 'Cats', mock.Mock())
@@ -1792,6 +2143,7 @@ class ChatGPTWebTests(unittest.TestCase):
             mock.patch.object(web, 'ChatGPTWeb', return_value=interface),
             mock.patch.object(web, 'WebSessionWatcher', return_value=watcher) as watcher_type,
         ):
+            callback = mock.Mock()
             web.run_web_watcher(
                 cdp_url='http' + '://127.0.0.1:9222',
                 session_id='root',
@@ -1800,11 +2152,13 @@ class ChatGPTWebTests(unittest.TestCase):
                 execute_request=mock.Mock(),
                 fenced_result=str,
                 too_long_fallback=lambda request, result: 'FALLBACK',
+                on_root_terminal=callback,
             )
 
         interface.connect.assert_called_once_with()
         interface.close.assert_called_once_with()
         watcher_type.assert_called_once()
+        self.assertIs(watcher_type.call_args.kwargs['on_root_terminal'], callback)
         watcher.run.assert_called_once_with(bootstrap_prompt='BOOTSTRAP')
 
     def test_inspect_web_sessions_is_read_only_and_detaches(self) -> None:

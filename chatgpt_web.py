@@ -49,10 +49,9 @@ def terminal_error_summary(exc: BaseException, max_chars: int = TERMINAL_ERROR_M
         return summary
     return summary[: max(0, max_chars - 3)].rstrip() + '...'
 SUBAGENT_COMPLETION_INSTRUCTIONS = '''Subagent completion protocol:
-- You are a subagent. Your task is not complete until you call the `handoff` tool.
-- When your work is complete, make `handoff` your final tool call and put your concise result in its `result` field.
-- Do not finish with a prose-only response, summary, or status update instead of calling `handoff`.
-- If more work remains, continue using the available tools. After a successful `handoff`, stop.'''
+- You are a subagent. Continue using tools while work remains.
+- When your assigned work is complete, finish normally with a concise prose response.
+- Poor Girl's Codex detects that terminal response after a tool-result turn, forwards it to your parent, and retires this conversation automatically.'''
 
 
 class MessageTooLongError(RuntimeError):
@@ -69,6 +68,7 @@ class PendingResponse:
     fallback: str
     progress: ResponseProgress | None = None
     compact: bool = False
+    arms_terminal: bool = True
 
     def render(self) -> str:
         return self.fallback if self.compact else self.result
@@ -76,6 +76,13 @@ class PendingResponse:
     def set_status(self, status: str) -> None:
         if self.progress is not None:
             self.progress.set_status(status)
+
+
+@dataclass
+class TerminalExpectation:
+    submitted_text: str
+    previous_user_message_id: str | None
+    user_message_id: str | None = None
 
 
 @dataclass
@@ -95,6 +102,7 @@ class WebSession:
     delivered: int = 0
     routing_session_id: str | None = None
     retire_requested: bool = False
+    terminal_expectation: TerminalExpectation | None = None
     cdp_session: Any | None = None
 
     @property
@@ -417,6 +425,52 @@ class ChatGPTWeb:
             return False
         return messages.last.get_attribute('data-message-author-role') == 'assistant'
 
+    @staticmethod
+    def normalize_message_text(text: str) -> str:
+        normalized = text.replace('\u00a0', ' ').strip()
+        if normalized.startswith('```') and normalized.endswith('```'):
+            first_newline = normalized.find('\n')
+            if first_newline != -1:
+                normalized = normalized[first_newline + 1 : -3].strip()
+        return normalized
+
+    def latest_user_message(self, session: WebSession) -> tuple[str | None, str] | None:
+        messages = session.page.locator('[data-message-author-role]')
+        for index in range(messages.count() - 1, -1, -1):
+            message = messages.nth(index)
+            if message.get_attribute('data-message-author-role') != 'user':
+                continue
+            return message.get_attribute('data-message-id'), message.inner_text()
+        return None
+
+    def terminal_response_candidate(
+        self,
+        session: WebSession,
+        expected_user_message_id: str,
+    ) -> tuple[str, str] | None:
+        messages = session.page.locator('[data-message-author-role]')
+        count = messages.count()
+        if count < 2:
+            return None
+        user_message = messages.nth(count - 2)
+        assistant_message = messages.nth(count - 1)
+        if user_message.get_attribute('data-message-author-role') != 'user':
+            return None
+        if assistant_message.get_attribute('data-message-author-role') != 'assistant':
+            return None
+        if user_message.get_attribute('data-message-id') != expected_user_message_id:
+            return None
+
+        assistant_messages = session.page.locator(ASSISTANT_SELECTOR)
+        if assistant_messages.count() == 0:
+            return None
+        message = assistant_messages.last
+        text = message.inner_text().strip()
+        message_id = message.get_attribute('data-message-id') or ''
+        identity = message_id + '\0terminal-response\0' + text
+        fingerprint = hashlib.sha256(identity.encode('utf-8')).hexdigest()
+        return text, fingerprint
+
     def recent_valid_request(
         self,
         session: WebSession,
@@ -604,6 +658,7 @@ class WebSessionWatcher:
         too_long_fallback: Callable[[Any, Any], str],
         root_session_id: str | None = None,
         bootstrap_prompt_for_session: Callable[[str], str] | None = None,
+        on_root_terminal: Callable[[WebSession, str], None] | None = None,
         settle_seconds: float = DEFAULT_SETTLE_SECONDS,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
@@ -615,6 +670,7 @@ class WebSessionWatcher:
         self.too_long_fallback = too_long_fallback
         self.root_session_id = root_session_id
         self.bootstrap_prompt_for_session = bootstrap_prompt_for_session
+        self.on_root_terminal = on_root_terminal
         self.settle_seconds = settle_seconds
         self.poll_seconds = poll_seconds
         self.clock = clock
@@ -863,14 +919,36 @@ class WebSessionWatcher:
                 if session.routing_session_id is not None:
                     self.sessions_by_routing_id.pop(session.routing_session_id, None)
 
+    def resolve_terminal_expectation(self, session: WebSession) -> None:
+        expectation = session.terminal_expectation
+        if expectation is None:
+            return
+        latest = self.interface.latest_user_message(session)
+        if not isinstance(latest, tuple) or len(latest) != 2:
+            return
+        message_id, text = latest
+        if expectation.user_message_id is None:
+            if message_id == expectation.previous_user_message_id:
+                return
+            if message_id is None or self.interface.normalize_message_text(text) != self.interface.normalize_message_text(expectation.submitted_text):
+                session.terminal_expectation = None
+                return
+            expectation.user_message_id = message_id
+            return
+        if message_id != expectation.user_message_id:
+            session.terminal_expectation = None
+
     def scan_session(self, session: WebSession, now: float) -> bool:
+        self.resolve_terminal_expectation(session)
         candidate = self.interface.valid_request(session, self.validate_request)
         if candidate is None:
             if self.interface.is_generating(session) is True:
                 session.settling_fingerprint = None
                 return False
+
             invalid_json = self.interface.invalid_json_candidate(session)
             invalid_request = None
+            foreign_invalid_request = False
             if invalid_json is None:
                 invalid_request = self.interface.invalid_request_candidate(session, self.validate_request)
                 if invalid_request is not None and self.root_session_id is not None:
@@ -881,42 +959,118 @@ class WebSessionWatcher:
                         parsed_request = None
                     routing_session_id = self.request_session_id(parsed_request)
                     if routing_session_id is not None and not self.accepts_routing_session_id(routing_session_id):
+                        foreign_invalid_request = True
                         invalid_request = None
-            if invalid_json is None and invalid_request is None:
+
+            if invalid_json is not None or invalid_request is not None:
+                session.terminal_expectation = None
+                if invalid_json is not None:
+                    _, detail, fingerprint = invalid_json
+                    diagnostic = f'invalid JSON: {detail}'
+                    message = (
+                        "I couldn't execute that tool call because its JSON was invalid "
+                        f"({detail}). Please resend the tool call as valid JSON in a single fenced `json` block."
+                    )
+                else:
+                    assert invalid_request is not None
+                    _, detail, fingerprint = invalid_request
+                    diagnostic = f'invalid tool call: {detail}'
+                    message = (
+                        "I couldn't execute that tool call because the request was invalid "
+                        f"({detail}). Please correct the tool call and resend it."
+                    )
+                if fingerprint in session.seen_fingerprints:
+                    session.settling_fingerprint = None
+                    return False
+                if session.settling_fingerprint != fingerprint:
+                    session.settling_fingerprint = fingerprint
+                    session.settle_deadline = now + self.settle_seconds
+                    return False
+                if now < session.settle_deadline:
+                    return False
+
+                session.seen_fingerprints.add(fingerprint)
                 session.settling_fingerprint = None
-                return False
-            if invalid_json is not None:
-                _, detail, fingerprint = invalid_json
-                diagnostic = f'invalid JSON: {detail}'
-                message = (
-                    "I couldn't execute that tool call because its JSON was invalid "
-                    f"({detail}). Please resend the tool call as valid JSON in a single fenced `json` block."
+                print(f'  [web:{session.label}] {diagnostic}', flush=True)
+                response_progress = ResponseProgress(prefix=self.progress_prefix(session.routing_session_id))
+                session.pending_responses.append(
+                    PendingResponse(
+                        message,
+                        message,
+                        progress=response_progress,
+                        arms_terminal=False,
+                    )
                 )
-            else:
-                assert invalid_request is not None
-                _, detail, fingerprint = invalid_request
-                diagnostic = f'invalid tool call: {detail}'
-                message = (
-                    "I couldn't execute that tool call because the request was invalid "
-                    f"({detail}). Please correct the tool call and resend it."
-                )
-            if fingerprint in session.seen_fingerprints:
+                response_progress.set_status('[pending]')
+                return True
+
+            if foreign_invalid_request:
                 session.settling_fingerprint = None
-                return False
-            if session.settling_fingerprint != fingerprint:
-                session.settling_fingerprint = fingerprint
-                session.settle_deadline = now + self.settle_seconds
-                return False
-            if now < session.settle_deadline:
                 return False
 
-            session.seen_fingerprints.add(fingerprint)
+            expectation = session.terminal_expectation
+            if expectation is not None and expectation.user_message_id is not None:
+                terminal = self.interface.terminal_response_candidate(
+                    session,
+                    expectation.user_message_id,
+                )
+                if terminal is not None:
+                    text, fingerprint = terminal
+                    if fingerprint in session.seen_fingerprints:
+                        session.terminal_expectation = None
+                        session.settling_fingerprint = None
+                        return False
+                    if session.settling_fingerprint != fingerprint:
+                        session.settling_fingerprint = fingerprint
+                        session.settle_deadline = now + self.settle_seconds
+                        return False
+                    if now < session.settle_deadline:
+                        return False
+
+                    routing_session_id = session.routing_session_id
+                    parent = None
+                    if routing_session_id is not None and '::' in routing_session_id:
+                        parent_session_id = routing_session_id.rsplit('::', 1)[0]
+                        parent = self.sessions_by_routing_id.get(parent_session_id)
+                        if parent is None:
+                            raise RuntimeError(
+                                f'parent session is not attached: {parent_session_id}'
+                            )
+
+                    session.seen_fingerprints.add(fingerprint)
+                    session.terminal_expectation = None
+                    session.settling_fingerprint = None
+                    progress_prefix = self.progress_prefix(routing_session_id)
+                    header_prefix = f'{progress_prefix} ' if progress_prefix is not None else ''
+                    ResponseProgress.commit_live()
+                    print(flush=True)
+                    print(
+                        f"{header_prefix}{progress_color('terminal response [complete]', '1;32')}",
+                        flush=True,
+                    )
+
+                    if parent is not None:
+                        message = (
+                            f'Subagent {routing_session_id} completed with terminal response:\n\n'
+                            + text.rstrip()
+                            + '\n'
+                        )
+                        parent.pending_responses.append(PendingResponse(message, message))
+                        session.retire_requested = True
+                        self.retire_subagent(session)
+                    elif self.on_root_terminal is not None:
+                        try:
+                            self.on_root_terminal(session, text)
+                        except Exception as exc:
+                            print(
+                                f'  [web:{session.label}] terminal notification error: '
+                                f'{terminal_error_summary(exc)}',
+                                flush=True,
+                            )
+                    return True
+
             session.settling_fingerprint = None
-            print(f'  [web:{session.label}] {diagnostic}', flush=True)
-            response_progress = ResponseProgress(prefix=self.progress_prefix(session.routing_session_id))
-            session.pending_responses.append(PendingResponse(message, message, progress=response_progress))
-            response_progress.set_status('[pending]')
-            return True
+            return False
 
         _, request, fingerprint = candidate
         routing_session_id = self.request_session_id(request)
@@ -928,6 +1082,7 @@ class WebSessionWatcher:
         if fingerprint in session.seen_fingerprints:
             session.settling_fingerprint = None
             return False
+        session.terminal_expectation = None
 
         if session.settling_fingerprint != fingerprint:
             session.settling_fingerprint = fingerprint
@@ -1006,6 +1161,7 @@ class WebSessionWatcher:
 
         restored = session.last_submitted_responses
         session.last_submitted_responses = []
+        session.terminal_expectation = None
         for response in restored:
             response.compact = True
             response.set_status('Message too large [retry with summary]')
@@ -1054,9 +1210,17 @@ class WebSessionWatcher:
         if now < session.next_delivery_at:
             return False
 
+        latest_user_before = self.interface.latest_user_message(session)
+        previous_user_message_id = (
+            latest_user_before[0]
+            if isinstance(latest_user_before, tuple) and len(latest_user_before) == 2
+            else None
+        )
+        arms_terminal = any(response.arms_terminal for response in session.pending_responses)
         rendered = '\n'.join(
             response.render().rstrip('\n') for response in session.pending_responses
         ) + '\n'
+        submitted_text = rendered
         try:
             self.interface.submit(session, rendered)
         except MessageTooLongError:
@@ -1068,6 +1232,7 @@ class WebSessionWatcher:
             ) + '\n'
             try:
                 self.interface.submit(session, fallback)
+                submitted_text = fallback
             except RuntimeError:
                 self.schedule_delivery_retry(session, now)
                 return False
@@ -1087,6 +1252,14 @@ class WebSessionWatcher:
         session.next_delivery_at = 0.0
         session.delivery_failure_started_at = None
         session.delivered += 1
+        session.terminal_expectation = (
+            TerminalExpectation(
+                submitted_text=submitted_text,
+                previous_user_message_id=previous_user_message_id,
+            )
+            if arms_terminal
+            else None
+        )
         return True
 
     def rate_limit_remaining(self) -> float:
@@ -1258,6 +1431,7 @@ def run_web_watcher(
     fenced_result: Callable[[Any], str],
     too_long_fallback: Callable[[Any, Any], str],
     bootstrap_prompt_for_session: Callable[[str], str] | None = None,
+    on_root_terminal: Callable[[WebSession, str], None] | None = None,
 ) -> None:
     interface = ChatGPTWeb(cdp_url)
     interface.connect()
@@ -1270,6 +1444,7 @@ def run_web_watcher(
             too_long_fallback=too_long_fallback,
             root_session_id=session_id,
             bootstrap_prompt_for_session=bootstrap_prompt_for_session,
+            on_root_terminal=on_root_terminal,
         ).run(bootstrap_prompt=bootstrap_prompt)
     finally:
         interface.close()
