@@ -635,6 +635,36 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertNotEqual(first[2], second[2])
 
+    def test_scan_session_reads_latest_assistant_once_for_valid_and_invalid_classification(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        assistant_messages = mock.Mock()
+        message = mock.Mock()
+        assistant_messages.count.return_value = 1
+        assistant_messages.last = message
+        page.locator.side_effect = lambda selector: (
+            assistant_messages if selector == web.ASSISTANT_SELECTOR else mock.Mock(count=lambda: 0)
+        )
+        interface.json_candidates_for_message = mock.Mock(return_value=(
+            'assistant-1',
+            ['{"session":"root","tool":"not-real"}'],
+        ))
+        interface.is_generating = mock.Mock(return_value=False)
+        session = web.WebSession('a', 'Cats', page)
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: (_ for _ in ()).throw(ValueError('unsupported tool')),
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            settle_seconds=0.35,
+        )
+
+        self.assertFalse(watcher.scan_session(session, 0.0))
+
+        interface.json_candidates_for_message.assert_called_once_with(message)
+        self.assertEqual(session.settling_fingerprint is not None, True)
+
     def test_invalid_json_candidate_reports_json_shaped_parse_error(self) -> None:
         interface = web.ChatGPTWeb()
         session = web.WebSession(

@@ -78,6 +78,12 @@ class PendingResponse:
             self.progress.set_status(status)
 
 
+@dataclass(frozen=True)
+class AssistantSnapshot:
+    message_id: str | None
+    sources: tuple[str, ...]
+
+
 @dataclass
 class TerminalExpectation:
     submitted_text: str
@@ -324,11 +330,16 @@ class ChatGPTWeb:
                 candidates.append(text)
         return message_id, candidates
 
-    def latest_json_candidates(self, session: WebSession) -> tuple[str | None, list[str]]:
+    def latest_assistant_snapshot(self, session: WebSession) -> AssistantSnapshot:
         messages = session.page.locator(ASSISTANT_SELECTOR)
         if messages.count() == 0:
-            return None, []
-        return self.json_candidates_for_message(messages.last)
+            return AssistantSnapshot(None, ())
+        message_id, sources = self.json_candidates_for_message(messages.last)
+        return AssistantSnapshot(message_id, tuple(sources))
+
+    def latest_json_candidates(self, session: WebSession) -> tuple[str | None, list[str]]:
+        snapshot = self.latest_assistant_snapshot(session)
+        return snapshot.message_id, list(snapshot.sources)
 
     def valid_request_from_message(
         self,
@@ -354,24 +365,42 @@ class ChatGPTWeb:
         fingerprint = hashlib.sha256(identity.encode('utf-8')).hexdigest()
         return source, request, fingerprint
 
+    def valid_request_from_snapshot(
+        self,
+        snapshot: AssistantSnapshot,
+        validate_request: Callable[[Any], None],
+    ) -> tuple[str, Any, str] | None:
+        candidates: list[tuple[int, str, Any]] = []
+        for source in snapshot.sources:
+            source = source.strip()
+            if not source:
+                continue
+            try:
+                request = json.loads(source)
+                validate_request(request)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            candidates.append((len(source), source, request))
+        if not candidates:
+            return None
+        _, source, request = min(candidates, key=lambda item: item[0])
+        identity = (snapshot.message_id or '') + '\0' + source
+        fingerprint = hashlib.sha256(identity.encode('utf-8')).hexdigest()
+        return source, request, fingerprint
+
     def valid_request(
         self,
         session: WebSession,
         validate_request: Callable[[Any], None],
     ) -> tuple[str, Any, str] | None:
-        messages = session.page.locator(ASSISTANT_SELECTOR)
-        if messages.count() == 0:
-            return None
-        return self.valid_request_from_message(messages.last, validate_request)
+        return self.valid_request_from_snapshot(
+            self.latest_assistant_snapshot(session),
+            validate_request,
+        )
 
-    def invalid_json_candidate(self, session: WebSession) -> tuple[str, str, str] | None:
-        messages = session.page.locator(ASSISTANT_SELECTOR)
-        if messages.count() == 0:
-            return None
-        message = messages.last
-        message_id, sources = self.json_candidates_for_message(message)
+    def invalid_json_from_snapshot(self, snapshot: AssistantSnapshot) -> tuple[str, str, str] | None:
         candidates: list[tuple[int, str, str]] = []
-        for source in sources:
+        for source in snapshot.sources:
             source = source.strip()
             looks_like_toolcall = any(marker in source for marker in ('"tool"', '"calls"', '"session"'))
             if not source or source[0] not in '[{' or not looks_like_toolcall:
@@ -384,22 +413,20 @@ class ChatGPTWeb:
         if not candidates:
             return None
         _, source, detail = min(candidates, key=lambda item: item[0])
-        identity = (message_id or '') + '\0invalid-json\0' + source
+        identity = (snapshot.message_id or '') + '\0invalid-json\0' + source
         fingerprint = hashlib.sha256(identity.encode('utf-8')).hexdigest()
         return source, detail, fingerprint
 
-    def invalid_request_candidate(
+    def invalid_json_candidate(self, session: WebSession) -> tuple[str, str, str] | None:
+        return self.invalid_json_from_snapshot(self.latest_assistant_snapshot(session))
+
+    def invalid_request_from_snapshot(
         self,
-        session: WebSession,
+        snapshot: AssistantSnapshot,
         validate_request: Callable[[Any], None],
     ) -> tuple[str, str, str] | None:
-        messages = session.page.locator(ASSISTANT_SELECTOR)
-        if messages.count() == 0:
-            return None
-        message = messages.last
-        message_id, sources = self.json_candidates_for_message(message)
         candidates: list[tuple[int, str, str]] = []
-        for source in sources:
+        for source in snapshot.sources:
             source = source.strip()
             looks_like_toolcall = any(marker in source for marker in ('"tool"', '"calls"', '"session"'))
             if not source or source[0] not in '[{' or not looks_like_toolcall:
@@ -415,9 +442,19 @@ class ChatGPTWeb:
         if not candidates:
             return None
         _, source, detail = min(candidates, key=lambda item: item[0])
-        identity = (message_id or '') + '\0invalid-request\0' + source
+        identity = (snapshot.message_id or '') + '\0invalid-request\0' + source
         fingerprint = hashlib.sha256(identity.encode('utf-8')).hexdigest()
         return source, detail, fingerprint
+
+    def invalid_request_candidate(
+        self,
+        session: WebSession,
+        validate_request: Callable[[Any], None],
+    ) -> tuple[str, str, str] | None:
+        return self.invalid_request_from_snapshot(
+            self.latest_assistant_snapshot(session),
+            validate_request,
+        )
 
     def latest_message_is_assistant(self, session: WebSession) -> bool:
         messages = session.page.locator('[data-message-author-role]')
@@ -942,17 +979,34 @@ class WebSessionWatcher:
 
     def scan_session(self, session: WebSession, now: float) -> bool:
         self.resolve_terminal_expectation(session)
-        candidate = self.interface.valid_request(session, self.validate_request)
+        snapshot = (
+            self.interface.latest_assistant_snapshot(session)
+            if isinstance(self.interface, ChatGPTWeb)
+            else None
+        )
+        candidate = (
+            self.interface.valid_request_from_snapshot(snapshot, self.validate_request)
+            if snapshot is not None
+            else self.interface.valid_request(session, self.validate_request)
+        )
         if candidate is None:
             if self.interface.is_generating(session) is True:
                 session.settling_fingerprint = None
                 return False
 
-            invalid_json = self.interface.invalid_json_candidate(session)
+            invalid_json = (
+                self.interface.invalid_json_from_snapshot(snapshot)
+                if snapshot is not None
+                else self.interface.invalid_json_candidate(session)
+            )
             invalid_request = None
             foreign_invalid_request = False
             if invalid_json is None:
-                invalid_request = self.interface.invalid_request_candidate(session, self.validate_request)
+                invalid_request = (
+                    self.interface.invalid_request_from_snapshot(snapshot, self.validate_request)
+                    if snapshot is not None
+                    else self.interface.invalid_request_candidate(session, self.validate_request)
+                )
                 if invalid_request is not None and self.root_session_id is not None:
                     source, _, _ = invalid_request
                     try:
