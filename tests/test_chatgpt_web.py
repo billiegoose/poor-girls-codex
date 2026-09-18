@@ -76,6 +76,14 @@ class FakePage:
                 message_id=self.message_role_ids,
                 author_role=self.message_roles,
             )
+        if selector == '[data-message-author-role="user"]':
+            texts = []
+            message_ids = []
+            for role, message_id in zip(self.message_roles, self.message_role_ids):
+                if role == 'user':
+                    texts.append('')
+                    message_ids.append(message_id)
+            return FakeLocator(texts, message_id=message_ids, author_role=['user'] * len(texts))
         return FakeLocator([])
 
 
@@ -396,6 +404,24 @@ class ChatGPTWebTests(unittest.TestCase):
 
         interface.instrument_conversations_responses.assert_called_once_with(page)
 
+    def test_refresh_sessions_does_not_re_read_title_for_existing_session(self) -> None:
+        interface = mock.Mock()
+        page = FakePage('https' + '://chatgpt.com/c/a', title='Renamed')
+        interface.pages.return_value = [page]
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+        watcher.sessions['a'] = web.WebSession('a', 'Cached title', page)
+
+        watcher.refresh_sessions()
+
+        self.assertEqual(watcher.sessions['a'].label, 'Cached title')
+        interface.describe_page.assert_not_called()
+
     def test_create_conversation_uses_plain_chatgpt_root_url(self) -> None:
         interface = web.ChatGPTWeb()
         page = mock.Mock()
@@ -707,6 +733,17 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertEqual(text, 'Finished normally.')
         self.assertTrue(fingerprint)
         self.assertIsNone(interface.terminal_response_candidate(session, 'other-user'))
+
+    def test_latest_user_message_queries_user_turns_directly(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = FakePage(
+            'https' + '://chatgpt.com/c/a',
+            message_roles=['user', 'assistant', 'user', 'assistant'],
+            message_role_ids=['user-1', 'assistant-1', 'user-2', 'assistant-2'],
+        )
+        session = web.WebSession('a', 'A', page)
+
+        self.assertEqual(interface.latest_user_message(session), ('user-2', ''))
 
     def test_latest_message_is_assistant_uses_actual_final_conversation_turn(self) -> None:
         interface = web.ChatGPTWeb()
@@ -2412,6 +2449,20 @@ class ChatGPTWebTests(unittest.TestCase):
         )
         self.assertEqual(session.pending_responses, [])
         self.assertEqual(session.delivered, 1)
+
+    def test_rejected_submission_skips_dom_search_without_submitted_responses(self) -> None:
+        interface = mock.Mock()
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+        session = web.WebSession('a', 'Cats', mock.Mock())
+
+        self.assertFalse(watcher.recover_rejected_submission(session))
+        interface.latest_too_long_error_id.assert_not_called()
 
     def test_post_submit_too_long_error_queues_compact_retry_without_reexecution(self) -> None:
         interface = mock.Mock()

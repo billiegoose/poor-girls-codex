@@ -70,14 +70,6 @@ class ModelInterface(Protocol):
 INTERFACE: ModelInterface | None = None
 
 
-def create_interface(name: str) -> ModelInterface:
-    if name == "chatgpt-macos":
-        from macos_desktop_app import MacOSDesktopApp
-
-        return MacOSDesktopApp()
-    raise ValueError(f"unknown interface: {name}")
-
-
 def current_interface() -> ModelInterface:
     if INTERFACE is None:
         raise RuntimeError("model interface has not been configured")
@@ -1003,7 +995,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--interface",
-        choices=("chatgpt-macos", "chatgpt-web"),
+        choices=("chatgpt-web",),
         default="chatgpt-web",
         help="model-facing interface to use (default: chatgpt-web)",
     )
@@ -1062,35 +1054,6 @@ def main() -> None:
             ),
         )
         return
-
-    INTERFACE = create_interface(args.interface)
-    if not current_interface().trusted():
-        raise SystemExit("The configured ChatGPT interface is not available or authorized")
-
-    if args.mode == "watch":
-        watch_loop()
-        return
-
-    app, root = current_interface().root()
-    if args.source_file:
-        with open(args.source_file, encoding="utf-8") as source_file:
-            source = source_file.read()
-        request = unwrap_json(source)
-    else:
-        source, request = latest_assistant_toolcall(root)
-
-    if args.mode == "copy":
-        print(source, end="")
-        return
-    result = execute_request(request)
-    rendered = fenced_result(result)
-
-    if args.mode == "execute":
-        print(rendered, end="")
-        return
-
-    paste_result_into_composer(app, root, rendered, send=args.mode == "once")
-    print(rendered, end="")
 
 
 if __name__ == "__main__":

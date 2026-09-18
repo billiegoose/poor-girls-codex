@@ -435,13 +435,11 @@ class ChatGPTWeb:
         return normalized
 
     def latest_user_message(self, session: WebSession) -> tuple[str | None, str] | None:
-        messages = session.page.locator('[data-message-author-role]')
-        for index in range(messages.count() - 1, -1, -1):
-            message = messages.nth(index)
-            if message.get_attribute('data-message-author-role') != 'user':
-                continue
-            return message.get_attribute('data-message-id'), message.inner_text()
-        return None
+        messages = session.page.locator('[data-message-author-role="user"]')
+        if messages.count() == 0:
+            return None
+        message = messages.last
+        return message.get_attribute('data-message-id'), message.inner_text()
 
     def terminal_response_candidate(
         self,
@@ -872,16 +870,21 @@ class WebSessionWatcher:
         live: set[str] = set()
         for page in self.interface.pages():
             self.interface.instrument_conversations_responses(page)
-            try:
-                conversation_id, label = self.interface.describe_page(page)
-            except RuntimeError:
-                # A tab can navigate away from /c/<id> between pages() filtering it
-                # and this refresh pass describing it (for example back to '/').
-                # Treat it as no longer live instead of crashing the watcher.
-                continue
+            conversation_id = ChatGPTWeb.conversation_id_for_url(str(page.url))
+            label = None
+            if conversation_id is None:
+                try:
+                    conversation_id, label = self.interface.describe_page(page)
+                except RuntimeError:
+                    # A tab can navigate away from /c/<id> between pages() filtering it
+                    # and this refresh pass examining it (for example back to '/').
+                    # Treat it as no longer live instead of crashing the watcher.
+                    continue
             live.add(conversation_id)
             session = self.sessions.get(conversation_id)
             if session is None:
+                if label is None:
+                    _, label = self.interface.describe_page(page)
                 previous_id = next(
                     (
                         existing_id
@@ -911,7 +914,6 @@ class WebSessionWatcher:
                                 session.seen_fingerprints.add(fingerprint)
             else:
                 session.page = page
-                session.label = label
 
         for conversation_id in list(self.sessions):
             if conversation_id not in live:
@@ -1152,12 +1154,12 @@ class WebSessionWatcher:
         return True
 
     def recover_rejected_submission(self, session: WebSession) -> bool:
+        if not session.last_submitted_responses:
+            return False
         error_id = self.interface.latest_too_long_error_id(session)
         if error_id is None or error_id == session.last_too_long_error_id:
             return False
         session.last_too_long_error_id = error_id
-        if not session.last_submitted_responses:
-            return False
 
         restored = session.last_submitted_responses
         session.last_submitted_responses = []

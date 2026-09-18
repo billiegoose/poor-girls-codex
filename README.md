@@ -2,7 +2,7 @@
 
 # Poor Girl's Codex
 
-Poor Girl's Codex is a tiny, semi-ridiculous coding-agent harness for the ChatGPT desktop app on macOS.
+Poor Girl's Codex is a tiny, semi-ridiculous coding-agent harness for ChatGPT in a Chromium browser.
 
 It started as a workaround; I'd run out of Codex credits, and needed to keep working. Originally, I switched to Chat mode and said: "You do the thinking and coding, and I will be your "tool call" executor by manually executing code snippets in a terminal and pasting the results".
 
@@ -36,7 +36,7 @@ sequenceDiagram
 
 That worked surprisingly well. More importantly, it made the mechanics of an AI coding agent impossible to miss: the model writes structured data, ordinary software validates and executes it, the result is appended to the chat, and the model gets another turn.
 
-From there, it was pretty easy to remove the human-in-the-loop. By using accessibility APIs to watch and operate the ChatGPT app in the background, we're able to react to tool calls without hijacking the mouse, keyboard, or clipboard.
+From there, it was pretty easy to remove the human-in-the-loop. The current harness connects to a Chromium browser over CDP, watches ChatGPT conversations in the background, and reacts to tool calls without hijacking the mouse or keyboard.
 
 ```mermaid
 sequenceDiagram
@@ -61,7 +61,7 @@ Run:
 The default `watch` mode:
 
 1. copies a bootstrap prompt to the clipboard,
-2. watches the current ChatGPT conversation through macOS Accessibility,
+2. watches attached ChatGPT browser conversations through Playwright/CDP,
 3. detects the newest valid Poor Girl's Codex JSON tool request,
 4. waits briefly to avoid executing a partially streamed response,
 5. executes the request in-process using `toolcall_lib`,
@@ -179,52 +179,25 @@ It parses requests, validates arguments, dispatches tools, captures results, bou
 
 This file is also preserved almost verbatim as the second commit in the repository's history, where it originally existed as the standalone `toolcall` program.
 
-### `poor_girls_codex.py`
+### `poor_girls_codex.py` and `chatgpt_web.py`
 
-The autonomous bridge to ChatGPT desktop.
+The autonomous bridge to ChatGPT in Chromium. `poor_girls_codex.py` owns the protocol, tool execution, bootstrap prompt, and CLI while `chatgpt_web.py` owns browser/session discovery and transport.
 
-It:
+Together they:
 
-- discovers the running ChatGPT application,
-- walks the Accessibility tree,
-- locates the conversation and most recent assistant response,
-- reconstructs JSON code from Accessibility text nodes,
-- validates requests before considering them executable,
-- fingerprints calls so they are not repeatedly executed,
-- waits for streamed output to settle,
-- invokes `toolcall_lib` directly,
-- injects results into the composer,
-- and submits them with a PID-targeted Return event.
-
-### `probe_chatgpt.py`
-
-A diagnostic tool used while reverse-engineering the ChatGPT desktop Accessibility tree.
-
-It can dump Accessibility attributes, actions, candidate selectors, window information, and the tree itself. It remains in the repository because the desktop application's exposed structure may change, and because the probe documents how the bridge was discovered.
-
-## Debug modes
-
-`poor_girls_codex.py` also retains several smaller modes used while developing and diagnosing the bridge:
-
-```text
-watch    continuous autonomous loop; the default
-copy     print the newest detected toolcall JSON
-execute  execute a detected request and print its result
-paste    put a result into the composer without submitting
-once     execute, insert, and submit one request
-```
-
-A `--source-file` option can provide toolcall JSON directly instead of reading the current conversation.
+- connect to Chromium over CDP,
+- track ChatGPT conversation tabs and subagents,
+- inspect the newest assistant response for tool-call JSON,
+- validate requests before considering them executable,
+- fingerprint calls so they are not repeatedly executed,
+- wait for streamed output to settle,
+- invoke `toolcall_lib` directly,
+- inject results into the composer,
+- and submit them back to ChatGPT.
 
 ## Requirements
 
-Poor Girl's Codex currently targets macOS and the ChatGPT desktop application.
-
-The project uses Python 3.14 and PyObjC bindings for:
-
-- Cocoa,
-- Quartz,
-- ApplicationServices.
+Poor Girl's Codex currently uses Python 3.14, Playwright, and a Chromium browser launched with a CDP endpoint.
 
 Install dependencies with the project's normal `uv` workflow, then grant Accessibility permission to the terminal application from which Poor Girl's Codex is launched:
 
