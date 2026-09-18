@@ -82,6 +82,7 @@ class PendingResponse:
 class AssistantSnapshot:
     message_id: str | None
     sources: tuple[str, ...]
+    text: str = ''
 
 
 @dataclass
@@ -334,8 +335,9 @@ class ChatGPTWeb:
         messages = session.page.locator(ASSISTANT_SELECTOR)
         if messages.count() == 0:
             return AssistantSnapshot(None, ())
-        message_id, sources = self.json_candidates_for_message(messages.last)
-        return AssistantSnapshot(message_id, tuple(sources))
+        message = messages.last
+        message_id, sources = self.json_candidates_for_message(message)
+        return AssistantSnapshot(message_id, tuple(sources), message.inner_text().strip())
 
     def latest_json_candidates(self, session: WebSession) -> tuple[str | None, list[str]]:
         snapshot = self.latest_assistant_snapshot(session)
@@ -478,11 +480,14 @@ class ChatGPTWeb:
         message = messages.last
         return message.get_attribute('data-message-id'), message.inner_text()
 
-    def terminal_response_candidate(
+    def terminal_response_from_snapshot(
         self,
         session: WebSession,
+        snapshot: AssistantSnapshot,
         expected_user_message_id: str,
     ) -> tuple[str, str] | None:
+        if snapshot.message_id is None:
+            return None
         messages = session.page.locator('[data-message-author-role]')
         count = messages.count()
         if count < 2:
@@ -495,16 +500,24 @@ class ChatGPTWeb:
             return None
         if user_message.get_attribute('data-message-id') != expected_user_message_id:
             return None
-
-        assistant_messages = session.page.locator(ASSISTANT_SELECTOR)
-        if assistant_messages.count() == 0:
+        if assistant_message.get_attribute('data-message-id') != snapshot.message_id:
             return None
-        message = assistant_messages.last
-        text = message.inner_text().strip()
-        message_id = message.get_attribute('data-message-id') or ''
-        identity = message_id + '\0terminal-response\0' + text
+
+        text = snapshot.text
+        identity = (snapshot.message_id or '') + '\0terminal-response\0' + text
         fingerprint = hashlib.sha256(identity.encode('utf-8')).hexdigest()
         return text, fingerprint
+
+    def terminal_response_candidate(
+        self,
+        session: WebSession,
+        expected_user_message_id: str,
+    ) -> tuple[str, str] | None:
+        return self.terminal_response_from_snapshot(
+            session,
+            self.latest_assistant_snapshot(session),
+            expected_user_message_id,
+        )
 
     def recent_valid_request(
         self,
@@ -1066,9 +1079,17 @@ class WebSessionWatcher:
 
             expectation = session.terminal_expectation
             if expectation is not None and expectation.user_message_id is not None:
-                terminal = self.interface.terminal_response_candidate(
-                    session,
-                    expectation.user_message_id,
+                terminal = (
+                    self.interface.terminal_response_from_snapshot(
+                        session,
+                        snapshot,
+                        expectation.user_message_id,
+                    )
+                    if snapshot is not None
+                    else self.interface.terminal_response_candidate(
+                        session,
+                        expectation.user_message_id,
+                    )
                 )
                 if terminal is not None:
                     text, fingerprint = terminal

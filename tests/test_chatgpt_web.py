@@ -764,6 +764,28 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertTrue(fingerprint)
         self.assertIsNone(interface.terminal_response_candidate(session, 'other-user'))
 
+    def test_terminal_response_from_snapshot_requires_same_rendered_assistant(self) -> None:
+        interface = web.ChatGPTWeb()
+        session = web.WebSession(
+            'a',
+            'Cats',
+            FakePage(
+                'https' + '://chatgpt.com/c/a',
+                code=['Finished normally.'],
+                message_id='assistant-final',
+                message_roles=['user', 'assistant', 'user', 'assistant'],
+                message_role_ids=['user-1', 'assistant-1', 'tool-user', 'assistant-final'],
+            ),
+        )
+        snapshot = web.AssistantSnapshot('assistant-final', (), 'Finished normally.')
+
+        candidate = interface.terminal_response_from_snapshot(session, snapshot, 'tool-user')
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate[0], 'Finished normally.')
+        stale = web.AssistantSnapshot('assistant-stale', (), 'Stale response.')
+        self.assertIsNone(interface.terminal_response_from_snapshot(session, stale, 'tool-user'))
+
     def test_latest_user_message_queries_user_turns_directly(self) -> None:
         interface = web.ChatGPTWeb()
         page = FakePage(
@@ -1659,6 +1681,45 @@ class ChatGPTWebTests(unittest.TestCase):
 
         self.assertIsNotNone(session.terminal_expectation)
         self.assertEqual(session.terminal_expectation.user_message_id, 'tool-user')
+
+    def test_real_interface_terminal_response_uses_single_assistant_snapshot(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = FakePage(
+            'https' + '://chatgpt.com/c/a',
+            code=['Done.'],
+            message_id='assistant-final',
+            message_roles=['user', 'assistant', 'user', 'assistant'],
+            message_role_ids=['user-1', 'assistant-1', 'tool-user', 'assistant-final'],
+        )
+        session = web.WebSession(
+            'a',
+            'Cats',
+            page,
+            routing_session_id='root',
+            terminal_expectation=web.TerminalExpectation('RESULT\n', 'previous-user', 'tool-user'),
+        )
+        interface.latest_user_message = mock.Mock(return_value=('tool-user', 'RESULT\n'))
+        interface.is_generating = mock.Mock(return_value=False)
+        callback = mock.Mock()
+        original_snapshot = interface.latest_assistant_snapshot
+        interface.latest_assistant_snapshot = mock.Mock(side_effect=original_snapshot)
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: (_ for _ in ()).throw(ValueError('not a tool call')),
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            on_root_terminal=callback,
+            settle_seconds=0.0,
+        )
+
+        self.assertFalse(watcher.scan_session(session, 0.0))
+        self.assertTrue(watcher.scan_session(session, 0.0))
+
+        callback.assert_called_once_with(session, 'Done.')
+        self.assertEqual(interface.latest_assistant_snapshot.call_count, 2)
+        self.assertIsNone(session.terminal_expectation)
 
     def test_terminal_response_after_tool_result_prints_complete_without_repair(self) -> None:
         interface = mock.Mock()
