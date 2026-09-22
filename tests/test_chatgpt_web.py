@@ -886,6 +886,46 @@ class ChatGPTWebTests(unittest.TestCase):
         interface.instrument_conversations_responses.assert_called_once_with(page)
         interface.latest_too_long_error_id.assert_not_called()
 
+    def test_binding_routing_session_remembers_attached_conversation_once(self) -> None:
+        interface = mock.Mock()
+        attached = mock.Mock()
+        session = web.WebSession('a', 'Cats', mock.Mock())
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            on_session_attached=attached,
+        )
+
+        watcher.bind_routing_session(session, 'root')
+
+        attached.assert_called_once_with(session)
+        self.assertEqual(session.routing_session_id, 'root')
+
+    def test_refresh_does_not_remember_unbound_open_conversation(self) -> None:
+        interface = mock.Mock()
+        page = FakePage('https' + '://chatgpt.com/c/a', title='Cats')
+        interface.pages.return_value = [page]
+        interface.describe_page.return_value = ('a', 'Cats')
+        interface.latest_too_long_error_id.return_value = None
+        attached = mock.Mock()
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            on_session_attached=attached,
+        )
+
+        watcher.refresh_sessions(prime_new=False)
+
+        attached.assert_not_called()
+        self.assertEqual(watcher.sessions['a'].label, 'Cats')
+
     def test_refresh_gives_each_conversation_independent_state(self) -> None:
         interface = mock.Mock()
         pages = [
@@ -997,6 +1037,28 @@ class ChatGPTWebTests(unittest.TestCase):
         watcher.refresh_sessions()
 
         self.assertEqual(watcher.sessions['a'].seen_fingerprints, {'older-toolcall'})
+
+    def test_ensure_root_session_opens_saved_conversation_when_tab_is_closed(self) -> None:
+        interface = mock.Mock()
+        resumed = web.WebSession('saved-chat', 'Saved chat', mock.Mock())
+        interface.open_conversation.return_value = resumed
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            root_conversation_id='saved-chat',
+        )
+
+        root = watcher.ensure_root_session('BOOTSTRAP')
+
+        self.assertIs(root, resumed)
+        interface.open_conversation.assert_called_once_with('saved-chat')
+        interface.create_root_conversation.assert_not_called()
+        self.assertIs(watcher.sessions['saved-chat'], resumed)
+        self.assertEqual(resumed.routing_session_id, 'root')
 
     def test_ensure_root_session_reuses_chat_with_recent_root_toolcall(self) -> None:
         interface = mock.Mock()
@@ -2272,6 +2334,7 @@ class ChatGPTWebTests(unittest.TestCase):
             mock.patch.object(web, 'WebSessionWatcher', return_value=watcher) as watcher_type,
         ):
             callback = mock.Mock()
+            attached = mock.Mock()
             web.run_web_watcher(
                 cdp_url='http' + '://127.0.0.1:9222',
                 session_id='root',
@@ -2281,13 +2344,65 @@ class ChatGPTWebTests(unittest.TestCase):
                 fenced_result=str,
                 too_long_fallback=lambda request, result: 'FALLBACK',
                 on_root_terminal=callback,
+                root_conversation_id='saved-chat',
+                on_session_attached=attached,
             )
 
         interface.connect.assert_called_once_with()
         interface.close.assert_called_once_with()
         watcher_type.assert_called_once()
         self.assertIs(watcher_type.call_args.kwargs['on_root_terminal'], callback)
+        self.assertEqual(watcher_type.call_args.kwargs['root_conversation_id'], 'saved-chat')
+        self.assertIs(watcher_type.call_args.kwargs['on_session_attached'], attached)
         watcher.run.assert_called_once_with(bootstrap_prompt='BOOTSTRAP')
+
+    def test_focus_open_root_conversation_focuses_matching_root_tab(self) -> None:
+        root_page = FakePage(
+            'https' + '://chatgpt.com/c/root-chat',
+            title='Root',
+            code=['{"session":"root","id":"x","tool":"status"}'],
+        )
+        other_page = FakePage(
+            'https' + '://chatgpt.com/c/other-chat',
+            title='Other',
+            code=['{"session":"other","id":"x","tool":"status"}'],
+        )
+        root_page.bring_to_front = mock.Mock()
+        other_page.bring_to_front = mock.Mock()
+        interface = mock.Mock()
+        interface.pages.return_value = [other_page, root_page]
+        interface.describe_page.side_effect = [('other-chat', 'Other'), ('root-chat', 'Root')]
+        interface.recent_valid_request.side_effect = [
+            ('source', {'session': 'other'}, 'fp-other'),
+            ('source', {'session': 'root'}, 'fp-root'),
+        ]
+        with mock.patch.object(web, 'ChatGPTWeb', return_value=interface):
+            conversation_id = web.focus_open_root_conversation(
+                cdp_url='http' + '://127.0.0.1:9222',
+                session_id='root',
+                validate_request=lambda request: None,
+            )
+        self.assertEqual(conversation_id, 'root-chat')
+        root_page.bring_to_front.assert_called_once_with()
+        other_page.bring_to_front.assert_not_called()
+        interface.close.assert_called_once_with()
+
+    def test_focus_open_root_conversation_returns_none_without_match(self) -> None:
+        page = FakePage('https' + '://chatgpt.com/c/other-chat', title='Other')
+        page.bring_to_front = mock.Mock()
+        interface = mock.Mock()
+        interface.pages.return_value = [page]
+        interface.describe_page.return_value = ('other-chat', 'Other')
+        interface.recent_valid_request.return_value = ('source', {'session': 'other'}, 'fp')
+        with mock.patch.object(web, 'ChatGPTWeb', return_value=interface):
+            conversation_id = web.focus_open_root_conversation(
+                cdp_url='http' + '://127.0.0.1:9222',
+                session_id='root',
+                validate_request=lambda request: None,
+            )
+        self.assertIsNone(conversation_id)
+        page.bring_to_front.assert_not_called()
+        interface.close.assert_called_once_with()
 
     def test_inspect_web_sessions_is_read_only_and_detaches(self) -> None:
         page = FakePage('https' + '://chatgpt.com/c/a', title='Cats')

@@ -669,6 +669,30 @@ class ChatGPTWeb:
             raise RuntimeError('connected Chrome browser has no usable context')
         return self._create_conversation(contexts[0], label=None, prompt=prompt)
 
+    def open_conversation(self, conversation_id: str) -> WebSession:
+        if self._browser is None:
+            raise RuntimeError('chatgpt-web is not connected')
+        contexts = self._browser.contexts
+        if not contexts:
+            raise RuntimeError('connected Chrome browser has no usable context')
+        page = contexts[0].new_page()
+        self.instrument_conversations_responses(page)
+        try:
+            page.goto(
+                'https' + f'://chatgpt.com/c/{conversation_id}',
+                wait_until='domcontentloaded',
+            )
+            page.locator(COMPOSER_SELECTOR).last.wait_for(state='visible', timeout=15_000)
+            actual_id, label = self.describe_page(page)
+            if actual_id != conversation_id:
+                raise RuntimeError(
+                    f'expected ChatGPT conversation {conversation_id}, opened {actual_id}'
+                )
+            return WebSession(actual_id, label, page)
+        except Exception:
+            page.close()
+            raise
+
     def archive_conversation(self, session: WebSession) -> None:
         page = session.page
         more = page.locator('button[data-testid="conversation-options-button"]')
@@ -707,6 +731,8 @@ class WebSessionWatcher:
         root_session_id: str | None = None,
         bootstrap_prompt_for_session: Callable[[str], str] | None = None,
         on_root_terminal: Callable[[WebSession, str], None] | None = None,
+        root_conversation_id: str | None = None,
+        on_session_attached: Callable[[WebSession], None] | None = None,
         settle_seconds: float = DEFAULT_SETTLE_SECONDS,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
@@ -719,12 +745,18 @@ class WebSessionWatcher:
         self.root_session_id = root_session_id
         self.bootstrap_prompt_for_session = bootstrap_prompt_for_session
         self.on_root_terminal = on_root_terminal
+        self.root_conversation_id = root_conversation_id
+        self.on_session_attached = on_session_attached
         self.settle_seconds = settle_seconds
         self.poll_seconds = poll_seconds
         self.clock = clock
         self.sessions: dict[str, WebSession] = {}
         self.sessions_by_routing_id: dict[str, WebSession] = {}
         self.rate_limit_suspended = False
+
+    def note_session_attached(self, session: WebSession) -> None:
+        if self.on_session_attached is not None:
+            self.on_session_attached(session)
 
     @staticmethod
     def request_session_id(request: Any) -> str | None:
@@ -790,6 +822,7 @@ class WebSessionWatcher:
             )
         session.routing_session_id = routing_session_id
         self.sessions_by_routing_id[routing_session_id] = session
+        self.note_session_attached(session)
         if (
             self.root_session_id is not None
             and (
@@ -819,6 +852,14 @@ class WebSessionWatcher:
         attached = self.sessions_by_routing_id.get(self.root_session_id)
         if attached is not None:
             return attached
+
+        if self.root_conversation_id is not None:
+            preferred = self.sessions.get(self.root_conversation_id)
+            if preferred is None:
+                preferred = self.interface.open_conversation(self.root_conversation_id)
+                self.sessions[preferred.conversation_id] = preferred
+            self.bind_routing_session(preferred, self.root_session_id)
+            return preferred
 
         for session in self.sessions.values():
             recent = self.interface.recent_valid_request(session, self.validate_request)
@@ -880,9 +921,8 @@ class WebSessionWatcher:
                 label=f'subagent:{name}',
                 prompt=prompt,
             )
-            child.routing_session_id = child_session_id
             self.sessions[child.conversation_id] = child
-            self.sessions_by_routing_id[child_session_id] = child
+            self.bind_routing_session(child, child_session_id)
             return {
                 **base,
                 'ok': True,
@@ -953,15 +993,15 @@ class WebSessionWatcher:
                     session = WebSession(conversation_id=conversation_id, label=label, page=page)
                     session.last_too_long_error_id = self.interface.latest_too_long_error_id(session)
                     self.sessions[conversation_id] = session
-                    if prime_new:
-                        existing = self.interface.recent_valid_request(session, self.validate_request)
-                        if existing is not None:
-                            _, request, fingerprint = existing
-                            routing_session_id = self.request_session_id(request)
-                            if routing_session_id is not None:
-                                self.bind_routing_session(session, routing_session_id)
-                            if not self.should_replay_recovered_request(session, fingerprint):
-                                session.seen_fingerprints.add(fingerprint)
+                if previous_id is None and prime_new:
+                    existing = self.interface.recent_valid_request(session, self.validate_request)
+                    if existing is not None:
+                        _, request, fingerprint = existing
+                        routing_session_id = self.request_session_id(request)
+                        if routing_session_id is not None:
+                            self.bind_routing_session(session, routing_session_id)
+                        if not self.should_replay_recovered_request(session, fingerprint):
+                            session.seen_fingerprints.add(fingerprint)
             else:
                 session.page = page
 
@@ -1484,6 +1524,32 @@ class WebSessionWatcher:
         print("\nPoor Girl's Codex web watcher stopped.")
 
 
+def focus_open_root_conversation(
+    *,
+    cdp_url: str,
+    session_id: str,
+    validate_request: Callable[[Any], None],
+) -> str | None:
+    """Focus and return an already-open conversation bound to this PGC root."""
+    interface = ChatGPTWeb(cdp_url)
+    interface.connect()
+    try:
+        for page in interface.pages():
+            conversation_id, label = interface.describe_page(page)
+            session = WebSession(conversation_id, label, page)
+            recent = interface.recent_valid_request(session, validate_request)
+            if recent is None:
+                continue
+            _, request, _ = recent
+            if WebSessionWatcher.request_session_id(request) != session_id:
+                continue
+            page.bring_to_front()
+            return conversation_id
+        return None
+    finally:
+        interface.close()
+
+
 def inspect_web_sessions(*, cdp_url: str) -> list[tuple[str, str, str]]:
     """Return conversation id, title/label, and URL without modifying any page."""
     interface = ChatGPTWeb(cdp_url)
@@ -1509,6 +1575,8 @@ def run_web_watcher(
     too_long_fallback: Callable[[Any, Any], str],
     bootstrap_prompt_for_session: Callable[[str], str] | None = None,
     on_root_terminal: Callable[[WebSession, str], None] | None = None,
+    root_conversation_id: str | None = None,
+    on_session_attached: Callable[[WebSession], None] | None = None,
 ) -> None:
     interface = ChatGPTWeb(cdp_url)
     interface.connect()
@@ -1522,6 +1590,8 @@ def run_web_watcher(
             root_session_id=session_id,
             bootstrap_prompt_for_session=bootstrap_prompt_for_session,
             on_root_terminal=on_root_terminal,
+            root_conversation_id=root_conversation_id,
+            on_session_attached=on_session_attached,
         ).run(bootstrap_prompt=bootstrap_prompt)
     finally:
         interface.close()

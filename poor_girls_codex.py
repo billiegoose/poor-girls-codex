@@ -35,6 +35,7 @@ SUPPORTED_TOOLS = LOCAL_TOOLS | WEB_ORCHESTRATION_TOOLS
 SESSION_DIR = ".pgc"
 SESSION_FILE = os.path.join(SESSION_DIR, "session")
 NTFY_TOPIC_FILE = os.path.join(SESSION_DIR, "ntfy")
+CONVERSATIONS_FILE = os.path.join(SESSION_DIR, "conversations.json")
 DEFAULT_NTFY_SERVER = "https://ntfy.sh"
 NTFY_TIMEOUT_SECONDS = 5.0
 
@@ -281,7 +282,11 @@ def ensure_session_ignored(cwd: str = ".") -> None:
             lines = {line.strip() for line in exclude_file}
     except FileNotFoundError:
         lines = set()
-    missing = [path for path in (SESSION_FILE, NTFY_TOPIC_FILE) if path not in lines]
+    missing = [
+        path
+        for path in (SESSION_FILE, NTFY_TOPIC_FILE, CONVERSATIONS_FILE)
+        if path not in lines
+    ]
     if not missing:
         return
     with open(exclude_path, "a", encoding="utf-8") as exclude_file:
@@ -305,6 +310,86 @@ def load_or_create_session_id(cwd: str = ".") -> str:
         raise RuntimeError(f"empty PGC session id: {session_path}")
     ensure_session_ignored(cwd)
     return session_id
+
+
+def load_conversation_history(cwd: str = ".") -> list[dict[str, Any]]:
+    path = os.path.join(cwd, CONVERSATIONS_FILE)
+    try:
+        with open(path, encoding="utf-8") as history_file:
+            payload = json.load(history_file)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(payload, list):
+        return []
+    history: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        conversation_id = item.get("conversation_id")
+        title = item.get("title")
+        last_seen = item.get("last_seen")
+        if not isinstance(conversation_id, str) or not conversation_id:
+            continue
+        history.append(
+            {
+                "conversation_id": conversation_id,
+                "title": title if isinstance(title, str) and title else f"chat-{conversation_id[:8]}",
+                "last_seen": last_seen if isinstance(last_seen, (int, float)) else 0.0,
+            }
+        )
+    history.sort(key=lambda item: float(item.get("last_seen", 0.0)), reverse=True)
+    return history
+
+
+def remember_conversation(
+    conversation_id: str,
+    title: str,
+    *,
+    cwd: str = ".",
+    now: float | None = None,
+) -> None:
+    history = load_conversation_history(cwd)
+    history = [item for item in history if item["conversation_id"] != conversation_id]
+    history.insert(
+        0,
+        {
+            "conversation_id": conversation_id,
+            "title": title or f"chat-{conversation_id[:8]}",
+            "last_seen": time.time() if now is None else now,
+        },
+    )
+    os.makedirs(os.path.join(cwd, SESSION_DIR), exist_ok=True)
+    path = os.path.join(cwd, CONVERSATIONS_FILE)
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as history_file:
+        json.dump(history, history_file, indent=2)
+        history_file.write("\n")
+    os.replace(temp_path, path)
+    ensure_session_ignored(cwd)
+
+
+def choose_saved_conversation(history: list[dict[str, Any]]) -> str | None:
+    if not history:
+        return None
+    print()
+    print(color("Resume a previous ChatGPT conversation?", "1;35"))
+    print(f"  {color('[Enter]', '1;36')} New conversation")
+    for index, item in enumerate(history, start=1):
+        title = str(item["title"])
+        conversation_id = str(item["conversation_id"])
+        print(f"  {color(f'[{index}]', '1;36')} {title} ({conversation_id[:8]})")
+    while True:
+        choice = input("Select conversation: ").strip()
+        if not choice:
+            return None
+        try:
+            index = int(choice)
+        except ValueError:
+            print("Please enter a number, or press Enter for a new conversation.")
+            continue
+        if 1 <= index <= len(history):
+            return str(history[index - 1]["conversation_id"])
+        print("Please choose one of the listed conversations.")
 
 
 def load_ntfy_topic(cwd: str = ".", home: str | None = None) -> str:
@@ -1014,10 +1099,19 @@ def main() -> None:
     if args.interface == "chatgpt-web":
         if args.mode != "watch":
             raise SystemExit("chatgpt-web currently supports watch mode only")
-        from chatgpt_web import DEFAULT_CDP_URL, run_web_watcher
+        from chatgpt_web import DEFAULT_CDP_URL, focus_open_root_conversation, run_web_watcher
 
         session_id = load_or_create_session_id()
         ntfy_topic = load_ntfy_topic()
+        cdp_url = args.cdp_url or DEFAULT_CDP_URL
+        root_conversation_id = focus_open_root_conversation(
+            cdp_url=cdp_url,
+            session_id=session_id,
+            validate_request=lambda request: validate_web_session_request(request, session_id),
+        )
+        if root_conversation_id is None:
+            conversation_history = load_conversation_history()
+            root_conversation_id = choose_saved_conversation(conversation_history)
         bootstrap_prompt = root_web_bootstrap_prompt(session_id)
         show_startup_ui(
             bootstrap_prompt,
@@ -1028,7 +1122,7 @@ def main() -> None:
             ntfy_topic=ntfy_topic,
         )
         run_web_watcher(
-            cdp_url=args.cdp_url or DEFAULT_CDP_URL,
+            cdp_url=cdp_url,
             session_id=session_id,
             bootstrap_prompt=bootstrap_prompt,
             validate_request=lambda request: validate_web_session_request(request, session_id),
@@ -1051,6 +1145,11 @@ def main() -> None:
                     + ')'
                 ),
                 message=terminal_response_summary(text) or 'Task completed successfully.',
+            ),
+            root_conversation_id=root_conversation_id,
+            on_session_attached=lambda session: remember_conversation(
+                session.conversation_id,
+                session.label,
             ),
         )
         return

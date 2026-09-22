@@ -26,13 +26,50 @@ class InterfaceSelectionTests(unittest.TestCase):
             self.assertTrue(first)
             with open(os.path.join(cwd, '.pgc', 'session'), encoding='utf-8') as session_file:
                 self.assertEqual(session_file.read().strip(), first)
-            for path in ('.pgc/session', '.pgc/ntfy'):
+            for path in ('.pgc/session', '.pgc/ntfy', '.pgc/conversations.json'):
                 ignored = subprocess.run(
                     ['git', 'check-ignore', '-q', path],
                     cwd=cwd,
                     check=False,
                 )
                 self.assertEqual(ignored.returncode, 0)
+
+    def test_conversation_history_round_trips_and_updates_last_seen(self) -> None:
+        with tempfile.TemporaryDirectory() as cwd:
+            pgc.remember_conversation('a', 'Cats', cwd=cwd, now=1.0)
+            pgc.remember_conversation('b', 'Dogs', cwd=cwd, now=2.0)
+            pgc.remember_conversation('a', 'Cats renamed', cwd=cwd, now=3.0)
+            history = pgc.load_conversation_history(cwd)
+            self.assertEqual(
+                history,
+                [
+                    {'conversation_id': 'a', 'title': 'Cats renamed', 'last_seen': 3.0},
+                    {'conversation_id': 'b', 'title': 'Dogs', 'last_seen': 2.0},
+                ],
+            )
+            with open(os.path.join(cwd, '.pgc', 'conversations.json'), encoding='utf-8') as history_file:
+                self.assertIn('Cats renamed', history_file.read())
+
+    def test_choose_saved_conversation_defaults_to_new_and_accepts_index(self) -> None:
+        history = [
+            {'conversation_id': 'a', 'title': 'Cats', 'last_seen': 2.0},
+            {'conversation_id': 'b', 'title': 'Dogs', 'last_seen': 1.0},
+        ]
+        with mock.patch('builtins.input', return_value=''):
+            self.assertIsNone(pgc.choose_saved_conversation(history))
+        with mock.patch('builtins.input', return_value='2'):
+            self.assertEqual(pgc.choose_saved_conversation(history), 'b')
+
+    def test_choose_saved_conversation_reprompts_after_invalid_choice(self) -> None:
+        history = [
+            {'conversation_id': 'a', 'title': 'Cats', 'last_seen': 1.0},
+        ]
+        with mock.patch('builtins.input', side_effect=['bogus', '9', '1']):
+            with mock.patch('builtins.print') as printed:
+                self.assertEqual(pgc.choose_saved_conversation(history), 'a')
+        output = '\n'.join(str(call) for call in printed.call_args_list)
+        self.assertIn('Please enter a number', output)
+        self.assertIn('Please choose one of the listed conversations', output)
 
     def test_web_startup_ui_prints_ntfy_topic_aesthetically(self) -> None:
         clipboard_write = mock.Mock()
@@ -252,6 +289,52 @@ class InterfaceSelectionTests(unittest.TestCase):
                 {'session': 'abc', 'id': 'h', 'tool': 'handoff', 'result': ''},
                 'abc',
             )
+
+    def test_main_uses_open_root_without_showing_saved_conversation_picker(self) -> None:
+        import chatgpt_web
+
+        with (
+            mock.patch.object(sys, 'argv', ['poor_girls_codex.py']),
+            mock.patch.object(pgc, 'load_or_create_session_id', return_value='root'),
+            mock.patch.object(pgc, 'load_ntfy_topic', return_value=''),
+            mock.patch.object(pgc, 'load_conversation_history') as load_history,
+            mock.patch.object(pgc, 'choose_saved_conversation') as choose_saved,
+            mock.patch.object(pgc, 'show_startup_ui'),
+            mock.patch.object(chatgpt_web, 'focus_open_root_conversation', return_value='open-chat') as focus_open,
+            mock.patch.object(chatgpt_web, 'run_web_watcher') as run_watcher,
+        ):
+            pgc.main()
+
+        focus_open.assert_called_once()
+        load_history.assert_not_called()
+        choose_saved.assert_not_called()
+        self.assertEqual(run_watcher.call_args.kwargs['root_conversation_id'], 'open-chat')
+
+    def test_main_shows_saved_conversation_picker_when_no_root_tab_is_open(self) -> None:
+        import chatgpt_web
+
+        selected = {'conversation_id': 'saved-chat', 'title': 'Saved chat', 'last_seen': 1.0}
+        with (
+            mock.patch.object(sys, 'argv', ['poor_girls_codex.py']),
+            mock.patch.object(pgc, 'load_or_create_session_id', return_value='root'),
+            mock.patch.object(pgc, 'load_ntfy_topic', return_value=''),
+            mock.patch.object(pgc, 'load_conversation_history', return_value=[selected]) as load_history,
+            mock.patch.object(pgc, 'choose_saved_conversation', return_value='saved-chat') as choose_saved,
+            mock.patch.object(pgc, 'show_startup_ui'),
+            mock.patch.object(pgc, 'remember_conversation') as remember,
+            mock.patch.object(chatgpt_web, 'focus_open_root_conversation', return_value=None),
+            mock.patch.object(chatgpt_web, 'run_web_watcher') as run_watcher,
+        ):
+            pgc.main()
+
+            load_history.assert_called_once_with()
+            choose_saved.assert_called_once_with([selected])
+            kwargs = run_watcher.call_args.kwargs
+            self.assertEqual(kwargs['root_conversation_id'], 'saved-chat')
+            callback = kwargs['on_session_attached']
+            session = mock.Mock(conversation_id='saved-chat', label='Saved chat')
+            callback(session)
+            remember.assert_called_once_with('saved-chat', 'Saved chat')
 
     def test_web_execution_strips_session_from_single_call(self) -> None:
         with mock.patch.object(pgc.toolcall_lib, 'execute', return_value={'ok': True}) as execute:
