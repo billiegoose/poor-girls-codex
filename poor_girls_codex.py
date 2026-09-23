@@ -12,6 +12,7 @@ import select
 import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 import urllib.parse
@@ -628,6 +629,8 @@ def tool_call_line(
     status: str | None = None,
     *,
     prefix: str | None = None,
+    timeout: int | None = None,
+    elapsed: int | None = None,
 ) -> str:
     if isinstance(call, dict):
         tool_name = f"{str(call.get('tool', '?')):<8}"
@@ -641,6 +644,10 @@ def tool_call_line(
     if status is not None:
         status_code = "1;32" if status == "done" else "1;33"
         line += f" {color(f'[{status}]', status_code)}"
+        if timeout is not None:
+            line += f" {color(f'[limit {timeout}s]', '2')}"
+        if elapsed is not None and elapsed >= 10:
+            line += f" {color(f'[elapsed: {elapsed}s]', '2')}"
     return line
 
 
@@ -655,18 +662,39 @@ class ToolCallProgress:
         for index, call in enumerate(self.calls):
             print(tool_call_line(call, index, prefix=self.prefix), flush=True)
 
-    def set_status(self, index: int, status: str) -> None:
+    def set_status(
+        self,
+        index: int,
+        status: str,
+        *,
+        elapsed: int | None = None,
+    ) -> None:
         self.statuses[index] = status
-        line = tool_call_line(self.calls[index], index, status, prefix=self.prefix)
+        call = self.calls[index]
+        timeout = None
+        if isinstance(call, dict) and call.get("tool") in {"run", "find", "tree"}:
+            timeout = toolcall_lib.timeout_seconds(call)
+        elapsed_bucket = None if elapsed is None else (elapsed // 10) * 10
+        line = tool_call_line(
+            call,
+            index,
+            status,
+            prefix=self.prefix,
+            timeout=timeout,
+            elapsed=elapsed_bucket,
+        )
 
         if not sys.stdout.isatty():
             print(line, flush=True)
             return
 
         if status == "running":
-            if self.active_index is not None:
-                sys.stdout.write("\n")
-            sys.stdout.write(line)
+            if self.active_index == index:
+                sys.stdout.write(f"\r\033[2K{line}")
+            else:
+                if self.active_index is not None:
+                    sys.stdout.write("\n")
+                sys.stdout.write(line)
             sys.stdout.flush()
             self.active_index = index
             return
@@ -694,6 +722,39 @@ def skipped_result(call: Any, index: int) -> dict[str, Any]:
         "skipped": True,
         "error": "skipped because an earlier call failed with stop_on_error enabled",
     }
+
+
+def execute_with_progress_updates(
+    executor,
+    tool_input: dict[str, Any],
+    index: int,
+    progress: ToolCallProgress,
+) -> tuple[dict[str, Any], int]:
+    completed = threading.Event()
+    outcome: dict[str, Any] = {}
+
+    def run_tool() -> None:
+        try:
+            outcome["result"] = executor(tool_input, index)
+        except BaseException as exc:
+            outcome["exception"] = exc
+        finally:
+            completed.set()
+
+    started = time.monotonic()
+    worker = threading.Thread(target=run_tool, daemon=True)
+    worker.start()
+    next_update = 10
+    while not completed.wait(timeout=10):
+        elapsed = int(time.monotonic() - started)
+        elapsed_bucket = max(next_update, (elapsed // 10) * 10)
+        progress.set_status(index, "running", elapsed=elapsed_bucket)
+        next_update = elapsed_bucket + 10
+    worker.join()
+    elapsed = int(time.monotonic() - started)
+    if "exception" in outcome:
+        raise outcome["exception"]
+    return outcome["result"], elapsed
 
 
 def execute_request(
@@ -739,11 +800,20 @@ def execute_request(
             tool_input = dict(call)
             tool_input.pop("stop_on_error", None)
             executor = tool_executor or toolcall_lib.execute
-            result = executor(tool_input, index)
+            if progress is not None:
+                result, elapsed = execute_with_progress_updates(
+                    executor,
+                    tool_input,
+                    index,
+                    progress,
+                )
+            else:
+                result = executor(tool_input, index)
+                elapsed = None
 
         results.append(result)
         if progress is not None:
-            progress.set_status(index, "done")
+            progress.set_status(index, "done", elapsed=elapsed)
         if not result["ok"] and (call_stop_on_error or top_level_stop_on_error):
             stopped = True
 

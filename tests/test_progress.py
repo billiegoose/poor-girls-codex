@@ -64,7 +64,9 @@ class ToolCallProgressTests(unittest.TestCase):
         self.assertIn("inspect-live-chatgpt-buttons-python [running]", visible)
         self.assertIn("inspect-live-chatgpt-buttons-python [done]", visible)
         self.assertIn("inspect-streaming-tests-for-completion-mocks [running]", visible)
-        self.assertTrue(visible.endswith("inspect-streaming-tests-for-completion-mocks [done]\n"))
+        self.assertTrue(
+            visible.endswith("inspect-streaming-tests-for-completion-mocks [done]\n")
+        )
         self.assertEqual(output.count("\r\x1b[2K"), 2)
         self.assertNotIn("\x1b[2A", output)
 
@@ -79,7 +81,9 @@ class ToolCallProgressTests(unittest.TestCase):
         visible = visible_text(output)
         self.assertIn("[closure-parity] > run", visible)
         self.assertIn("[running]", visible)
-        self.assertTrue(visible.endswith("[done]\n"))
+        self.assertTrue(
+            visible.endswith(f"[done] [limit {pgc.toolcall_lib.DEFAULT_TIMEOUT}s]\n")
+        )
         self.assertEqual(output.count("\r\x1b[2K"), 1)
 
     def test_non_tty_progress_remains_append_only(self) -> None:
@@ -90,8 +94,10 @@ class ToolCallProgressTests(unittest.TestCase):
             progress.set_status(0, "done")
 
         output = stdout.getvalue()
-        self.assertIn("[running]\n", output)
-        self.assertTrue(output.endswith("[done]\n"))
+        self.assertIn(f"[running] [limit {pgc.toolcall_lib.DEFAULT_TIMEOUT}s]\n", output)
+        self.assertTrue(
+            output.endswith(f"[done] [limit {pgc.toolcall_lib.DEFAULT_TIMEOUT}s]\n")
+        )
         self.assertNotIn("\r\x1b[2K", output)
 
     def test_response_status_colors_sent_green_on_tty(self) -> None:
@@ -223,6 +229,46 @@ class ToolCallProgressTests(unittest.TestCase):
             pgc.validate_request({"calls": [{"id": "a", "tool": "read"}], "stop_on_error": "yes"})
         with self.assertRaisesRegex(ValueError, "call 0 stop_on_error must be a boolean"):
             pgc.validate_request({"calls": [{"id": "a", "tool": "read", "stop_on_error": "yes"}]})
+
+    def test_progress_includes_effective_timeout_without_elapsed_for_fast_call(self) -> None:
+        stdout = io.StringIO()
+        call = {"id": "fast", "tool": "run", "timeout_seconds": 420}
+        with mock.patch.object(pgc.sys, "stdout", stdout):
+            progress = pgc.ToolCallProgress([call])
+            progress.set_status(0, "running")
+            progress.set_status(0, "done", elapsed=9)
+        output = visible_text(stdout.getvalue())
+        self.assertIn("[running] [limit 420s]", output)
+        self.assertIn("[done] [limit 420s]", output)
+        self.assertNotIn("elapsed", output)
+
+    def test_progress_shows_elapsed_after_ten_seconds(self) -> None:
+        stdout = FakeTTY()
+        call = {"id": "slow", "tool": "run", "timeout_seconds": 420}
+        with mock.patch.object(pgc.sys, "stdout", stdout):
+            progress = pgc.ToolCallProgress([call])
+            progress.set_status(0, "running")
+            progress.set_status(0, "running", elapsed=10)
+            progress.set_status(0, "running", elapsed=20)
+            progress.set_status(0, "done", elapsed=23)
+        output = visible_text(stdout.getvalue())
+        self.assertIn("[running] [limit 420s] [elapsed: 10s]", output)
+        self.assertIn("[running] [limit 420s] [elapsed: 20s]", output)
+        self.assertTrue(output.endswith("[done] [limit 420s] [elapsed: 20s]\n"))
+
+    def test_progress_uses_default_effective_timeout_for_timeout_capable_tool(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch.object(pgc.sys, "stdout", stdout):
+            progress = pgc.ToolCallProgress([{"id": "run", "tool": "run"}])
+            progress.set_status(0, "running")
+        self.assertIn(f"[limit {pgc.toolcall_lib.DEFAULT_TIMEOUT}s]", visible_text(stdout.getvalue()))
+
+    def test_progress_does_not_claim_timeout_for_read_tool(self) -> None:
+        stdout = io.StringIO()
+        with mock.patch.object(pgc.sys, "stdout", stdout):
+            progress = pgc.ToolCallProgress([{"id": "read", "tool": "read"}])
+            progress.set_status(0, "running")
+        self.assertNotIn("[limit ", visible_text(stdout.getvalue()))
 
     def test_execute_request_marks_each_call_running_then_done(self) -> None:
         stdout = FakeTTY()
