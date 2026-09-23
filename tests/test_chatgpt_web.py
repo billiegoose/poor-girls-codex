@@ -67,6 +67,9 @@ class FakePage:
     def title(self):
         return self._title
 
+    def close(self):
+        self.closed = True
+
     def locator(self, selector):
         if selector == web.ASSISTANT_SELECTOR:
             return FakeLocator(self.code, message_id=self.message_id)
@@ -1249,6 +1252,7 @@ class ChatGPTWebTests(unittest.TestCase):
             FakePage('https' + '://chatgpt.com/c/child-conversation'),
         )
         interface.create_conversation.return_value = child
+        interface.latest_user_message.return_value = ('child-bootstrap-user', 'Investigate this')
         watcher = web.WebSessionWatcher(
             interface,
             validate_request=lambda request: None,
@@ -1276,6 +1280,9 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertTrue(result['ok'])
         self.assertEqual(result['session'], 'root::worker2')
         self.assertIs(watcher.sessions_by_routing_id['root::worker2'], child)
+        self.assertIsNotNone(child.terminal_expectation)
+        self.assertEqual(child.terminal_expectation.user_message_id, 'child-bootstrap-user')
+        self.assertEqual(child.terminal_expectation.previous_user_message_id, None)
         interface.create_conversation.assert_called_once_with(
             origin=parent,
             label='subagent:worker2',
@@ -1783,6 +1790,56 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertEqual(interface.latest_assistant_snapshot.call_count, 2)
         self.assertIsNone(session.terminal_expectation)
 
+    def test_terminal_response_allows_multiple_assistant_nodes_after_tool_result(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = FakePage(
+            'https' + '://chatgpt.com/c/a',
+            code=['Finished work.'],
+            message_id='assistant-final',
+            message_roles=['user', 'assistant', 'user', 'assistant', 'assistant'],
+            message_role_ids=[
+                'user-1',
+                'assistant-1',
+                'tool-user',
+                'assistant-preamble',
+                'assistant-final',
+            ],
+        )
+        session = web.WebSession('a', 'Cats', page)
+        snapshot = interface.latest_assistant_snapshot(session)
+
+        terminal = interface.terminal_response_from_snapshot(
+            session,
+            snapshot,
+            'tool-user',
+        )
+
+        self.assertIsNotNone(terminal)
+        self.assertEqual(terminal[0], 'Finished work.')
+
+    def test_terminal_response_rejects_newer_user_turn(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = FakePage(
+            'https' + '://chatgpt.com/c/a',
+            code=['Not terminal for the old tool result.'],
+            message_id='assistant-final',
+            message_roles=['user', 'assistant', 'user', 'assistant', 'user', 'assistant'],
+            message_role_ids=[
+                'user-1',
+                'assistant-1',
+                'tool-user',
+                'assistant-after-tool',
+                'new-user',
+                'assistant-final',
+            ],
+        )
+        session = web.WebSession('a', 'Cats', page)
+        snapshot = interface.latest_assistant_snapshot(session)
+
+        self.assertIsNone(
+            interface.terminal_response_from_snapshot(session, snapshot, 'tool-user')
+        )
+
     def test_terminal_response_after_tool_result_prints_complete_without_repair(self) -> None:
         interface = mock.Mock()
         session = web.WebSession(
@@ -2030,6 +2087,54 @@ class ChatGPTWebTests(unittest.TestCase):
 
         self.assertIsNone(session.terminal_expectation)
         interface.terminal_response_candidate.assert_not_called()
+
+    def test_zero_tool_subagent_terminal_response_forwards_to_parent_and_retires(self) -> None:
+        interface = web.ChatGPTWeb()
+        parent = web.WebSession('parent-c', 'Parent', mock.Mock(), routing_session_id='root')
+        child_page = FakePage(
+            'https' + '://chatgpt.com/c/child-c',
+            code=['Terminal handoff works.'],
+            message_id='assistant-final',
+            message_roles=['user', 'assistant'],
+            message_role_ids=['child-bootstrap-user', 'assistant-final'],
+        )
+        child = web.WebSession(
+            'child-c',
+            'Child',
+            child_page,
+            routing_session_id='root::worker',
+            terminal_expectation=web.TerminalExpectation(
+                'bootstrap prompt',
+                None,
+                'child-bootstrap-user',
+            ),
+        )
+        interface.is_generating = mock.Mock(return_value=False)
+        interface.invalid_json_from_snapshot = mock.Mock(return_value=None)
+        interface.invalid_request_from_snapshot = mock.Mock(return_value=None)
+        interface.archive_conversation = mock.Mock()
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: (_ for _ in ()).throw(ValueError('not a tool call')),
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            settle_seconds=0.0,
+        )
+        watcher.sessions = {'parent-c': parent, 'child-c': child}
+        watcher.sessions_by_routing_id = {'root': parent, 'root::worker': child}
+
+        self.assertFalse(watcher.scan_session(child, 0.0))
+        self.assertTrue(watcher.scan_session(child, 0.0))
+
+        self.assertEqual(len(parent.pending_responses), 1)
+        self.assertIn('Terminal handoff works.', parent.pending_responses[0].result)
+        self.assertIn('completed with terminal response', parent.pending_responses[0].result)
+        interface.archive_conversation.assert_called_once_with(child)
+        self.assertTrue(child_page.closed)
+        self.assertNotIn('child-c', watcher.sessions)
+        self.assertNotIn('root::worker', watcher.sessions_by_routing_id)
 
     def test_subagent_terminal_response_forwards_to_parent_and_retires(self) -> None:
         interface = mock.Mock()
@@ -2402,6 +2507,217 @@ class ChatGPTWebTests(unittest.TestCase):
             )
         self.assertIsNone(conversation_id)
         page.bring_to_front.assert_not_called()
+        interface.close.assert_called_once_with()
+
+    def test_conversation_id_from_reference_accepts_url_or_bare_id(self) -> None:
+        self.assertEqual(
+            web.conversation_id_from_reference('https' + '://chatgpt.com/c/abc123'),
+            'abc123',
+        )
+        self.assertEqual(web.conversation_id_from_reference('abc123'), 'abc123')
+        with self.assertRaises(ValueError):
+            web.conversation_id_from_reference('https' + '://chatgpt.com/share/abc123')
+        with self.assertRaises(ValueError):
+            web.conversation_id_from_reference('https' + '://example.com/c/abc123')
+        with self.assertRaises(ValueError):
+            web.conversation_id_from_reference('abc123?foo=bar')
+        with self.assertRaises(ValueError):
+            web.conversation_id_from_reference('abc123#fragment')
+
+    def test_active_conversation_messages_preserves_visible_branch_order_and_text(self) -> None:
+        payload = {
+            'current_node': 'result',
+            'mapping': {
+                'root': {'parent': None, 'message': None},
+                'user': {
+                    'parent': 'root',
+                    'message': {
+                        'id': 'm-user',
+                        'author': {'role': 'user'},
+                        'create_time': 1.0,
+                        'content': {'content_type': 'text', 'parts': ['hello  ', '\nworld']},
+                        'metadata': {'x': 1},
+                    },
+                },
+                'reasoning-recap': {
+                    'parent': 'user',
+                    'message': {
+                        'id': 'm-reasoning',
+                        'author': {'role': 'assistant'},
+                        'create_time': 1.5,
+                        'content': {'content_type': 'reasoning_recap'},
+                        'metadata': {'cot_version': 'hidden'},
+                    },
+                },
+                'request': {
+                    'parent': 'reasoning-recap',
+                    'message': {
+                        'id': 'm-request',
+                        'author': {'role': 'assistant'},
+                        'create_time': 2.0,
+                        'content': {
+                            'content_type': 'text',
+                            'parts': ['```json\n{"tool": nope,}\n```\ntrailing UI text'],
+                        },
+                        'metadata': {},
+                    },
+                },
+                'result': {
+                    'parent': 'request',
+                    'message': {
+                        'id': 'm-result',
+                        'author': {'role': 'user'},
+                        'create_time': 3.0,
+                        'content': {
+                            'content_type': 'text',
+                            'parts': ['```\n{"ok":false,"error":"timeout"}\n```'],
+                        },
+                        'metadata': {'pgc': True},
+                    },
+                },
+                'hidden-regeneration': {
+                    'parent': 'user',
+                    'message': {
+                        'id': 'hidden',
+                        'author': {'role': 'assistant'},
+                        'create_time': 2.5,
+                        'content': {'content_type': 'text', 'parts': ['not on active branch']},
+                        'metadata': {},
+                    },
+                },
+            },
+        }
+        records = web.active_conversation_messages(payload)
+        self.assertEqual([record['message_id'] for record in records], ['m-user', 'm-request', 'm-result'])
+        self.assertEqual([record['position'] for record in records], [0, 1, 2])
+        self.assertEqual(records[0]['text'], 'hello  \nworld')
+        self.assertEqual(
+            records[1]['text'],
+            '```json\n{"tool": nope,}\n```\ntrailing UI text',
+        )
+        self.assertEqual(records[2]['message_id'], 'm-result')
+
+    def test_export_conversation_supports_text_and_markdown_without_normalizing_raw_text(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        payload = {
+            'current_node': 'message',
+            'mapping': {
+                'message': {
+                    'parent': None,
+                    'message': {
+                        'id': 'm1',
+                        'author': {'role': 'assistant'},
+                        'create_time': 4.0,
+                        'content': {
+                            'content_type': 'text',
+                            'parts': ['first  line\n', '```json\n{bad json}\n```  '],
+                        },
+                        'metadata': {},
+                    },
+                }
+            },
+        }
+        interface = mock.Mock()
+        interface.fetch_conversation_payload.return_value = payload
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            web, 'ChatGPTWeb', return_value=interface
+        ):
+            for format_name in ('txt', 'md'):
+                output = Path(tmp) / f'conversation.{format_name}'
+                web.export_conversation('abc', str(output), format=format_name)
+                rendered = output.read_text(encoding='utf-8')
+                self.assertIn('first  line\n```json\n{bad json}\n```  ', rendered)
+
+    def test_fetch_conversation_payload_uses_access_token_without_opening_page(self) -> None:
+        interface = web.ChatGPTWeb()
+        session_response = mock.Mock(ok=True, status=200)
+        session_response.json.return_value = {'accessToken': 'secret-token'}
+        conversation_response = mock.Mock(ok=True, status=200)
+        conversation_response.json.return_value = {'current_node': 'x', 'mapping': {}}
+        context = mock.Mock()
+        context.request.get.side_effect = [session_response, conversation_response]
+        context.new_page = mock.Mock()
+        interface._browser = mock.Mock(contexts=[context])
+
+        payload = interface.fetch_conversation_payload('abc')
+
+        self.assertEqual(payload, {'current_node': 'x', 'mapping': {}})
+        self.assertEqual(
+            context.request.get.call_args_list,
+            [
+                mock.call('https' + '://chatgpt.com/api/auth/session'),
+                mock.call(
+                    'https' + '://chatgpt.com/backend-api/conversation/abc',
+                    headers={'Authorization': 'Bearer secret-token'},
+                ),
+            ],
+        )
+        context.new_page.assert_not_called()
+
+    def test_fetch_conversation_payload_rejects_missing_access_token(self) -> None:
+        interface = web.ChatGPTWeb()
+        session_response = mock.Mock(ok=True, status=200)
+        session_response.json.return_value = {'user': {'id': 'u'}}
+        context = mock.Mock()
+        context.request.get.return_value = session_response
+        interface._browser = mock.Mock(contexts=[context])
+
+        with self.assertRaisesRegex(RuntimeError, 'did not provide an access token'):
+            interface.fetch_conversation_payload('abc')
+
+        context.request.get.assert_called_once_with(
+            'https' + '://chatgpt.com/api/auth/session'
+        )
+
+    def test_fetch_conversation_payload_reports_session_http_failure(self) -> None:
+        interface = web.ChatGPTWeb()
+        session_response = mock.Mock(ok=False, status=401)
+        context = mock.Mock()
+        context.request.get.return_value = session_response
+        interface._browser = mock.Mock(contexts=[context])
+
+        with self.assertRaisesRegex(RuntimeError, 'session fetch failed with HTTP 401'):
+            interface.fetch_conversation_payload('abc')
+
+    def test_export_conversation_writes_compact_jsonl_without_opening_page(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        payload = {
+            'current_node': 'message',
+            'mapping': {
+                'message': {
+                    'parent': None,
+                    'message': {
+                        'id': 'm1',
+                        'author': {'role': 'assistant'},
+                        'create_time': 4.0,
+                        'content': {'content_type': 'text', 'parts': ['raw text']},
+                        'metadata': {},
+                    },
+                }
+            },
+        }
+        interface = mock.Mock()
+        interface.fetch_conversation_payload.return_value = payload
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            web, 'ChatGPTWeb', return_value=interface
+        ):
+            output = str(Path(tmp) / 'conversation.jsonl')
+            result = web.export_conversation(
+                'https' + '://chatgpt.com/c/abc',
+                output,
+            )
+            records = [json.loads(line) for line in Path(output).read_text(encoding='utf-8').splitlines()]
+
+        self.assertEqual(result['conversation_id'], 'abc')
+        self.assertEqual(result['message_count'], 1)
+        self.assertEqual(records[0]['text'], 'raw text')
+        interface.connect.assert_called_once_with()
+        interface.fetch_conversation_payload.assert_called_once_with('abc')
         interface.close.assert_called_once_with()
 
     def test_inspect_web_sessions_is_read_only_and_detaches(self) -> None:

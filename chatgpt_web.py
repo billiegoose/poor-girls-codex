@@ -232,6 +232,40 @@ class ChatGPTWeb:
         label = title or f'chat-{conversation_id[:8]}'
         return conversation_id, label
 
+    def fetch_conversation_payload(self, conversation_id: str) -> dict[str, Any]:
+        """Fetch one conversation through the authenticated browser context without opening a page."""
+        if self._browser is None:
+            raise RuntimeError('chatgpt-web is not connected')
+        contexts = self._browser.contexts
+        if not contexts:
+            raise RuntimeError('connected Chrome browser has no usable context')
+
+        request = contexts[0].request
+        session_response = request.get('https' + '://chatgpt.com/api/auth/session')
+        if not session_response.ok:
+            raise RuntimeError(
+                f'ChatGPT session fetch failed with HTTP {session_response.status}'
+            )
+        session_payload = session_response.json()
+        if not isinstance(session_payload, dict):
+            raise RuntimeError('ChatGPT session fetch returned a non-object payload')
+        access_token = session_payload.get('accessToken')
+        if not isinstance(access_token, str) or not access_token:
+            raise RuntimeError('ChatGPT session did not provide an access token')
+
+        response = request.get(
+            'https' + f'://chatgpt.com/backend-api/conversation/{conversation_id}',
+            headers={'Authorization': f'Bearer {access_token}'},
+        )
+        if not response.ok:
+            raise RuntimeError(
+                f'conversation fetch failed with HTTP {response.status}: {conversation_id}'
+            )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError('conversation fetch returned a non-object payload')
+        return payload
+
     @staticmethod
     def is_conversations_response_url(url: str) -> bool:
         try:
@@ -490,17 +524,24 @@ class ChatGPTWeb:
             return None
         messages = session.page.locator('[data-message-author-role]')
         count = messages.count()
-        if count < 2:
+        expected_user_index = None
+        snapshot_index = None
+        for index in range(count - 1, -1, -1):
+            message = messages.nth(index)
+            message_id = message.get_attribute('data-message-id')
+            role = message.get_attribute('data-message-author-role')
+            if snapshot_index is None and role == 'assistant' and message_id == snapshot.message_id:
+                snapshot_index = index
+            if role == 'user':
+                if message_id == expected_user_message_id:
+                    expected_user_index = index
+                    break
+                # A newer user turn means this terminal expectation is stale.
+                return None
+
+        if expected_user_index is None or snapshot_index is None:
             return None
-        user_message = messages.nth(count - 2)
-        assistant_message = messages.nth(count - 1)
-        if user_message.get_attribute('data-message-author-role') != 'user':
-            return None
-        if assistant_message.get_attribute('data-message-author-role') != 'assistant':
-            return None
-        if user_message.get_attribute('data-message-id') != expected_user_message_id:
-            return None
-        if assistant_message.get_attribute('data-message-id') != snapshot.message_id:
+        if snapshot_index <= expected_user_index:
             return None
 
         text = snapshot.text
@@ -536,6 +577,22 @@ class ChatGPTWeb:
         return None
 
     def set_composer_text(self, session: WebSession, text: str) -> None:
+        session.page.bring_to_front()
+        if session.cdp_session is None:
+            session.cdp_session = self.emulate_active_page(session.page)
+        else:
+            try:
+                session.cdp_session.send(
+                    'Emulation.setFocusEmulationEnabled',
+                    {'enabled': True},
+                )
+                session.cdp_session.send(
+                    'Page.setWebLifecycleState',
+                    {'state': 'active'},
+                )
+            except Exception as exc:
+                print(f'  [web:{session.label}] active-page emulation error: {exc}', flush=True)
+
         composer = session.page.locator(COMPOSER_SELECTOR).last
         if composer.count() == 0:
             raise RuntimeError(f'{session.label}: ChatGPT composer not found')
@@ -923,6 +980,17 @@ class WebSessionWatcher:
             )
             self.sessions[child.conversation_id] = child
             self.bind_routing_session(child, child_session_id)
+            initial_user = self.interface.latest_user_message(child)
+            initial_user_message_id = (
+                initial_user[0]
+                if isinstance(initial_user, tuple) and len(initial_user) == 2
+                else None
+            )
+            child.terminal_expectation = TerminalExpectation(
+                submitted_text=prompt,
+                previous_user_message_id=None,
+                user_message_id=initial_user_message_id,
+            )
             return {
                 **base,
                 'ok': True,
@@ -1522,6 +1590,119 @@ class WebSessionWatcher:
             signal.signal(signal.SIGINT, previous_sigint)
 
         print("\nPoor Girl's Codex web watcher stopped.")
+
+
+def conversation_id_from_reference(value: str) -> str:
+    value = value.strip()
+    parsed = urlparse(value)
+    if parsed.hostname == 'chatgpt.com':
+        parts = [part for part in parsed.path.split('/') if part]
+        if len(parts) == 2 and parts[0] == 'c' and parts[1]:
+            return parts[1]
+        raise ValueError(f'invalid ChatGPT conversation reference: {value!r}')
+    if parsed.scheme or not value or '/' in value or '?' in value or '#' in value:
+        raise ValueError(f'invalid ChatGPT conversation reference: {value!r}')
+    return value
+
+
+def conversation_raw_text(message: dict[str, Any]) -> tuple[str, list[Any]]:
+    content = message.get('content')
+    if not isinstance(content, dict):
+        return '', []
+    parts = content.get('parts')
+    if not isinstance(parts, list):
+        return '', []
+    raw_parts = list(parts)
+    return ''.join(part for part in raw_parts if isinstance(part, str)), raw_parts
+
+
+def active_conversation_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    mapping = payload.get('mapping')
+    current_node = payload.get('current_node')
+    if not isinstance(mapping, dict) or not isinstance(current_node, str):
+        raise RuntimeError('conversation payload is missing mapping/current_node')
+
+    node_ids: list[str] = []
+    seen: set[str] = set()
+    node_id: str | None = current_node
+    while node_id is not None:
+        if node_id in seen:
+            raise RuntimeError('conversation mapping contains a parent cycle')
+        seen.add(node_id)
+        node = mapping.get(node_id)
+        if not isinstance(node, dict):
+            raise RuntimeError(f'conversation mapping is missing node {node_id!r}')
+        node_ids.append(node_id)
+        parent = node.get('parent')
+        node_id = parent if isinstance(parent, str) else None
+    node_ids.reverse()
+
+    records: list[dict[str, Any]] = []
+    for node_id in node_ids:
+        node = mapping[node_id]
+        message = node.get('message')
+        if not isinstance(message, dict):
+            continue
+        author = message.get('author')
+        role = author.get('role') if isinstance(author, dict) else None
+        if role not in {'user', 'assistant'}:
+            continue
+        content = message.get('content')
+        if not isinstance(content, dict) or content.get('content_type') != 'text':
+            continue
+        parts = content.get('parts')
+        if not isinstance(parts, list) or not all(isinstance(part, str) for part in parts):
+            continue
+        text = ''.join(parts)
+        if not text:
+            continue
+        records.append(
+            {
+                'position': len(records),
+                'message_id': message.get('id'),
+                'role': role,
+                'timestamp': message.get('create_time'),
+                'text': text,
+            }
+        )
+    return records
+
+
+def export_conversation(
+    conversation_reference: str,
+    output_path: str,
+    *,
+    cdp_url: str = DEFAULT_CDP_URL,
+    format: str = 'jsonl',
+) -> dict[str, Any]:
+    conversation_id = conversation_id_from_reference(conversation_reference)
+    interface = ChatGPTWeb(cdp_url)
+    interface.connect()
+    try:
+        payload = interface.fetch_conversation_payload(conversation_id)
+    finally:
+        interface.close()
+
+    messages = active_conversation_messages(payload)
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if format == 'jsonl':
+        with path.open('w', encoding='utf-8') as handle:
+            for message in messages:
+                handle.write(json.dumps(message, ensure_ascii=False) + '\n')
+    elif format in {'txt', 'md'}:
+        blocks = []
+        for record in messages:
+            blocks.append(f"[{record['position']}] {record['role']} {record['message_id']}\n{record['text']}")
+        path.write_text('\n\n'.join(blocks) + '\n', encoding='utf-8')
+    else:
+        raise ValueError(f'unsupported conversation export format: {format}')
+    return {
+        'conversation_id': conversation_id,
+        'output_path': str(path),
+        'format': format,
+        'message_count': len(messages),
+    }
 
 
 def focus_open_root_conversation(

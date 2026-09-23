@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import re
+import threading
 import unittest
 from unittest import mock
 
@@ -269,6 +270,23 @@ class ToolCallProgressTests(unittest.TestCase):
             progress = pgc.ToolCallProgress([{"id": "read", "tool": "read"}])
             progress.set_status(0, "running")
         self.assertNotIn("[limit ", visible_text(stdout.getvalue()))
+
+    def test_execute_request_runs_executor_on_calling_thread(self) -> None:
+        caller_thread = threading.get_ident()
+        seen_threads = []
+
+        def execute(call, index):
+            seen_threads.append(threading.get_ident())
+            return {"id": call["id"], "tool": call["tool"], "ok": True}
+
+        result = pgc.execute_request(
+            {"id": "thread-affinity", "tool": "read"},
+            announce=True,
+            tool_executor=execute,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(seen_threads, [caller_thread])
 
     def test_execute_request_marks_each_call_running_then_done(self) -> None:
         stdout = FakeTTY()

@@ -290,6 +290,45 @@ class InterfaceSelectionTests(unittest.TestCase):
                 'abc',
             )
 
+    def test_main_export_conversation_is_read_only_cli_path(self) -> None:
+        import chatgpt_web
+
+        with (
+            mock.patch.object(
+                sys,
+                'argv',
+                [
+                    'poor_girls_codex.py',
+                    'export-conversation',
+                    'https://chatgpt.com/c/abc',
+                    '--output',
+                    '/tmp/export.jsonl',
+                ],
+            ),
+            mock.patch.object(
+                chatgpt_web,
+                'export_conversation',
+                return_value={
+                    'conversation_id': 'abc',
+                    'output_path': '/tmp/export.jsonl',
+                    'format': 'jsonl',
+                    'message_count': 3,
+                },
+            ) as export,
+            mock.patch.object(chatgpt_web, 'run_web_watcher') as run_watcher,
+            mock.patch('builtins.print') as printed,
+        ):
+            pgc.main()
+
+        export.assert_called_once_with(
+            'https://chatgpt.com/c/abc',
+            '/tmp/export.jsonl',
+            cdp_url=chatgpt_web.DEFAULT_CDP_URL,
+            format='jsonl',
+        )
+        run_watcher.assert_not_called()
+        self.assertIn('"message_count": 3', printed.call_args.args[0])
+
     def test_main_uses_open_root_without_showing_saved_conversation_picker(self) -> None:
         import chatgpt_web
 

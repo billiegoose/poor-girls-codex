@@ -731,30 +731,25 @@ def execute_with_progress_updates(
     progress: ToolCallProgress,
 ) -> tuple[dict[str, Any], int]:
     completed = threading.Event()
-    outcome: dict[str, Any] = {}
-
-    def run_tool() -> None:
-        try:
-            outcome["result"] = executor(tool_input, index)
-        except BaseException as exc:
-            outcome["exception"] = exc
-        finally:
-            completed.set()
-
     started = time.monotonic()
-    worker = threading.Thread(target=run_tool, daemon=True)
-    worker.start()
-    next_update = 10
-    while not completed.wait(timeout=10):
-        elapsed = int(time.monotonic() - started)
-        elapsed_bucket = max(next_update, (elapsed // 10) * 10)
-        progress.set_status(index, "running", elapsed=elapsed_bucket)
-        next_update = elapsed_bucket + 10
-    worker.join()
+
+    def update_progress() -> None:
+        next_update = 10
+        while not completed.wait(timeout=10):
+            elapsed = int(time.monotonic() - started)
+            elapsed_bucket = max(next_update, (elapsed // 10) * 10)
+            progress.set_status(index, "running", elapsed=elapsed_bucket)
+            next_update = elapsed_bucket + 10
+
+    ticker = threading.Thread(target=update_progress, daemon=True)
+    ticker.start()
+    try:
+        result = executor(tool_input, index)
+    finally:
+        completed.set()
+        ticker.join()
     elapsed = int(time.monotonic() - started)
-    if "exception" in outcome:
-        raise outcome["exception"]
-    return outcome["result"], elapsed
+    return result, elapsed
 
 
 def execute_request(
@@ -1140,9 +1135,24 @@ def main() -> None:
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=("watch", "copy", "execute", "paste", "once"),
+        choices=("watch", "copy", "execute", "paste", "once", "export-conversation"),
         default="watch",
-        help="watch=continuous background harness; copy/execute/paste/once are debugging modes",
+        help="watch=continuous background harness; copy/execute/paste/once are debugging modes; export-conversation writes a read-only transcript",
+    )
+    parser.add_argument(
+        "conversation_reference",
+        nargs="?",
+        help="ChatGPT conversation URL or id for export-conversation",
+    )
+    parser.add_argument(
+        "--output",
+        help="output path for export-conversation",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("jsonl", "txt", "md"),
+        default="jsonl",
+        help="conversation export format (default: jsonl, one message per line)",
     )
     parser.add_argument(
         "--source-file",
@@ -1165,6 +1175,25 @@ def main() -> None:
         help="ntfy server base URL (default: https://ntfy.sh)",
     )
     args = parser.parse_args()
+
+    if args.mode == "export-conversation":
+        if not args.conversation_reference:
+            parser.error("export-conversation requires a conversation URL or id")
+        if not args.output:
+            parser.error("export-conversation requires --output")
+        from chatgpt_web import DEFAULT_CDP_URL, export_conversation
+
+        result = export_conversation(
+            args.conversation_reference,
+            args.output,
+            cdp_url=args.cdp_url or DEFAULT_CDP_URL,
+            format=args.format,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    if args.conversation_reference is not None:
+        parser.error("conversation_reference is only valid with export-conversation")
 
     if args.interface == "chatgpt-web":
         if args.mode != "watch":
