@@ -56,6 +56,7 @@ class FakePage:
         message_id='message-1',
         message_roles=None,
         message_role_ids=None,
+        message_texts=None,
     ):
         self.url = url
         self._title = title
@@ -63,6 +64,7 @@ class FakePage:
         self.message_id = message_id
         self.message_roles = list(message_roles or [])
         self.message_role_ids = list(message_role_ids or [None] * len(self.message_roles))
+        self.message_texts = list(message_texts or [''] * len(self.message_roles))
 
     def title(self):
         return self._title
@@ -75,16 +77,20 @@ class FakePage:
             return FakeLocator(self.code, message_id=self.message_id)
         if selector == '[data-message-author-role]':
             return FakeLocator(
-                [''] * len(self.message_roles),
+                self.message_texts,
                 message_id=self.message_role_ids,
                 author_role=self.message_roles,
             )
         if selector == '[data-message-author-role="user"]':
             texts = []
             message_ids = []
-            for role, message_id in zip(self.message_roles, self.message_role_ids):
+            for role, message_id, text in zip(
+                self.message_roles,
+                self.message_role_ids,
+                self.message_texts,
+            ):
                 if role == 'user':
-                    texts.append('')
+                    texts.append(text)
                     message_ids.append(message_id)
             return FakeLocator(texts, message_id=message_ids, author_role=['user'] * len(texts))
         return FakeLocator([])
@@ -222,6 +228,34 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertEqual(interface.rate_limit_remaining(100.0), 60.0)
         response.all_headers.assert_not_called()
 
+    def test_sidebar_conversations_429_does_not_pause_pgc(self) -> None:
+        for origin_param in ('conversation_origin', 'exclude_conversation_origin'):
+            with self.subTest(origin_param=origin_param):
+                interface = web.ChatGPTWeb()
+                page = mock.Mock()
+                page.url = 'https' + '://chatgpt.com/c/abcdef123456'
+                response = mock.Mock()
+                response.url = (
+                    'https' + '://chatgpt.com/backend-api/conversations?'
+                    'limit=20&offset=0&is_archived=false&is_starred=false&'
+                    'order=updated&expand=false&hide_snorlax=false&'
+                    f'{origin_param}=tpp'
+                )
+                response.status = 429
+                response.request.method = 'GET'
+
+                interface.dismiss_rate_limit_dialog = mock.Mock(return_value=False)
+                with (
+                    mock.patch.object(web.time, 'monotonic', return_value=100.0),
+                    mock.patch('builtins.print') as printed,
+                ):
+                    interface.log_conversations_response(page, response)
+
+                interface.dismiss_rate_limit_dialog.assert_called_once_with(page)
+                printed.assert_not_called()
+                self.assertEqual(interface.rate_limit_remaining(100.0), 0.0)
+                response.all_headers.assert_not_called()
+
     def test_conversations_response_success_is_silent_and_does_not_read_headers(self) -> None:
         interface = web.ChatGPTWeb()
         page = mock.Mock()
@@ -294,41 +328,43 @@ class ChatGPTWebTests(unittest.TestCase):
 
     def test_rate_limit_backoff_coalesces_burst_and_doubles_after_retry(self) -> None:
         interface = web.ChatGPTWeb()
+        url = 'https' + '://chatgpt.com/backend-api/conversations'
 
         with mock.patch.object(web.time, 'monotonic', return_value=100.0):
-            interface.note_rate_limit(
-                method='GET',
-                url='https://chatgpt.com/backend-api/conversations',
-            )
+            interface.note_rate_limit(method='GET', url=url)
         self.assertEqual(interface.rate_limit_remaining(100.0), 60.0)
 
         # More 429s from the same burst must not extend or exponentiate the pause.
         with mock.patch.object(web.time, 'monotonic', return_value=110.0):
-            interface.note_rate_limit(
-                method='GET',
-                url='https://chatgpt.com/backend-api/conversations',
-            )
+            interface.note_rate_limit(method='GET', url=url)
         self.assertEqual(interface.rate_limit_remaining(110.0), 50.0)
 
-        # If traffic is still rejected after the pause expires, back off harder.
-        with mock.patch.object(web.time, 'monotonic', return_value=161.0):
-            interface.note_rate_limit(
-                method='GET',
-                url='https://chatgpt.com/backend-api/conversations',
-            )
-        self.assertEqual(interface.rate_limit_remaining(161.0), 120.0)
+        # If traffic is still rejected exactly when the pause expires, back off harder.
+        with mock.patch.object(web.time, 'monotonic', return_value=160.0):
+            interface.note_rate_limit(method='GET', url=url)
+        self.assertEqual(interface.rate_limit_remaining(160.0), 120.0)
 
-    def test_rate_limit_backoff_resets_after_quiet_period(self) -> None:
+    def test_rate_limit_backoff_decays_gradually_from_max_after_quiet_time(self) -> None:
         interface = web.ChatGPTWeb()
-        with mock.patch.object(web.time, 'monotonic', return_value=100.0):
-            interface.note_rate_limit(method='GET', url='https://chatgpt.com/backend-api/conversations')
-        with mock.patch.object(web.time, 'monotonic', return_value=161.0):
-            interface.note_rate_limit(method='GET', url='https://chatgpt.com/backend-api/conversations')
-        self.assertEqual(interface.rate_limit_remaining(161.0), 120.0)
+        url = 'https' + '://chatgpt.com/backend-api/conversations'
 
-        with mock.patch.object(web.time, 'monotonic', return_value=1_062.0):
-            interface.note_rate_limit(method='GET', url='https://chatgpt.com/backend-api/conversations')
-        self.assertEqual(interface.rate_limit_remaining(1_062.0), 60.0)
+        # Repeated failures at each pause boundary reach the 300s ceiling.
+        for now, expected in ((100.0, 60.0), (160.0, 120.0), (280.0, 240.0), (520.0, 300.0)):
+            with mock.patch.object(web.time, 'monotonic', return_value=now):
+                interface.note_rate_limit(method='GET', url=url)
+            self.assertEqual(interface.rate_limit_remaining(now), expected)
+
+        # The 300s pause ends at t=820. After 7.5 quiet minutes, the next pause has
+        # decayed halfway from 300s back toward the 60s initial value: 180s.
+        with mock.patch.object(web.time, 'monotonic', return_value=1270.0):
+            interface.note_rate_limit(method='GET', url=url)
+        self.assertEqual(interface.rate_limit_remaining(1270.0), 180.0)
+
+        # That 180s pause ends at t=1450. After 15 quiet minutes, recovery is
+        # complete and the next pause is back to the initial 60s.
+        with mock.patch.object(web.time, 'monotonic', return_value=2350.0):
+            interface.note_rate_limit(method='GET', url=url)
+        self.assertEqual(interface.rate_limit_remaining(2350.0), 60.0)
 
     def test_dismiss_rate_limit_dialog_clicks_got_it(self) -> None:
         interface = web.ChatGPTWeb()
@@ -429,7 +465,10 @@ class ChatGPTWebTests(unittest.TestCase):
         interface = web.ChatGPTWeb()
         page = mock.Mock()
         page.url = 'https' + '://chatgpt.com/c/child'
-        page.locator.return_value.last.wait_for.return_value = None
+        present = mock.Mock()
+        present.count.return_value = 1
+        present.last.wait_for.return_value = None
+        page.locator.return_value = present
         page.wait_for_url.return_value = None
         context = mock.Mock()
         context.new_page.return_value = page
@@ -446,12 +485,12 @@ class ChatGPTWebTests(unittest.TestCase):
         )
 
         page.on.assert_called_once_with('response', mock.ANY)
-        page.goto.assert_called_once_with('https' + '://chatgpt.com/', wait_until='domcontentloaded')
+        page.goto.assert_called_once_with('https' + '://chatgpt.com/', wait_until='commit')
         self.assertLess(
             page.method_calls.index(mock.call.on('response', mock.ANY)),
-            page.method_calls.index(mock.call.goto('https' + '://chatgpt.com/', wait_until='domcontentloaded')),
+            page.method_calls.index(mock.call.goto('https' + '://chatgpt.com/', wait_until='commit')),
         )
-        page.locator.assert_any_call(web.ASSISTANT_SELECTOR)
+        page.locator.assert_any_call(web.ASSISTANT_START_SELECTOR)
         page.locator.return_value.last.wait_for.assert_any_call(state='attached', timeout=30_000)
         self.assertEqual(child.conversation_id, 'child')
 
@@ -459,7 +498,10 @@ class ChatGPTWebTests(unittest.TestCase):
         interface = web.ChatGPTWeb()
         page = mock.Mock()
         page.url = 'https' + '://chatgpt.com/c/child'
-        page.locator.return_value.last.wait_for.return_value = None
+        present = mock.Mock()
+        present.count.return_value = 1
+        present.last.wait_for.return_value = None
+        page.locator.return_value = present
         page.wait_for_url.return_value = None
         cdp_session = mock.Mock()
         context = mock.Mock()
@@ -520,6 +562,7 @@ class ChatGPTWebTests(unittest.TestCase):
         more.count.return_value = 0
         page = mock.Mock()
         page.locator.return_value = more
+        page.get_by_role.return_value = more
         session = web.WebSession('conversation-123', 'Child', page)
 
         with self.assertRaisesRegex(RuntimeError, 'conversation options button not found'):
@@ -541,6 +584,58 @@ class ChatGPTWebTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, 'archive did not navigate away'):
             interface.archive_conversation(session)
+
+    def test_set_composer_text_does_not_focus_when_background_fill_works(self) -> None:
+        interface = web.ChatGPTWeb()
+        composer_element = mock.Mock()
+        composer = mock.Mock()
+        composer.count.return_value = 1
+        composer.last = composer_element
+        page = mock.Mock()
+        session = web.WebSession('a', 'Background', page)
+        interface.composer = mock.Mock(return_value=composer)
+        interface.emulate_active_page = mock.Mock(return_value=mock.Mock())
+
+        interface.set_composer_text(session, 'result')
+
+        page.bring_to_front.assert_not_called()
+        composer_element.fill.assert_called_once_with('result')
+        interface.emulate_active_page.assert_called_once_with(page)
+
+    def test_set_composer_text_focuses_and_retries_only_after_background_fill_fails(self) -> None:
+        interface = web.ChatGPTWeb()
+        composer_element = mock.Mock()
+        composer_element.fill.side_effect = [RuntimeError('background fill failed'), None]
+        composer = mock.Mock()
+        composer.count.return_value = 1
+        composer.last = composer_element
+        page = mock.Mock()
+        session = web.WebSession('a', 'Background', page)
+        interface.composer = mock.Mock(return_value=composer)
+        interface.emulate_active_page = mock.Mock(return_value=mock.Mock())
+
+        interface.set_composer_text(session, 'result')
+
+        page.bring_to_front.assert_called_once_with()
+        self.assertEqual(composer_element.fill.call_args_list, [mock.call('result'), mock.call('result')])
+
+    def test_set_composer_text_focuses_only_after_background_composer_is_missing(self) -> None:
+        interface = web.ChatGPTWeb()
+        missing = mock.Mock()
+        missing.count.return_value = 0
+        composer_element = mock.Mock()
+        present = mock.Mock()
+        present.count.return_value = 1
+        present.last = composer_element
+        page = mock.Mock()
+        session = web.WebSession('a', 'Background', page)
+        interface.composer = mock.Mock(side_effect=[missing, present])
+        interface.emulate_active_page = mock.Mock(return_value=mock.Mock())
+
+        interface.set_composer_text(session, 'result')
+
+        page.bring_to_front.assert_called_once_with()
+        composer_element.fill.assert_called_once_with('result')
 
     def test_submit_uses_dom_click_without_playwright_actionability(self) -> None:
         interface = web.ChatGPTWeb()
@@ -574,6 +669,7 @@ class ChatGPTWebTests(unittest.TestCase):
         page.get_by_role.return_value = missing
         session = web.WebSession('a', 'Background', page)
         interface.set_composer_text = mock.Mock()
+        interface.composer_text = mock.Mock(return_value=None)
 
         interface.submit(session, 'result')
 
@@ -596,6 +692,111 @@ class ChatGPTWebTests(unittest.TestCase):
 
         page.bring_to_front.assert_not_called()
         button.evaluate.assert_called_once_with('element => element.click()')
+
+    def test_submit_refills_once_when_new_dom_hydration_restores_stale_draft(self) -> None:
+        interface = web.ChatGPTWeb()
+        disabled_button = mock.Mock()
+        disabled_button.is_enabled.return_value = False
+        disabled = mock.Mock()
+        disabled.count.return_value = 1
+        disabled.last = disabled_button
+        enabled_button = mock.Mock()
+        enabled_button.is_enabled.return_value = True
+        enabled = mock.Mock()
+        enabled.count.return_value = 1
+        enabled.last = enabled_button
+        page = mock.Mock()
+        session = web.WebSession('a', 'Hydrating', page)
+        interface.set_composer_text = mock.Mock()
+        interface.composer_text = mock.Mock(side_effect=['stale draft', 'result'])
+        interface.send_button = mock.Mock(side_effect=[disabled, enabled])
+
+        interface.submit(session, 'result')
+
+        self.assertEqual(
+            interface.set_composer_text.call_args_list,
+            [mock.call(session, 'result'), mock.call(session, 'result')],
+        )
+        enabled_button.evaluate.assert_called_once_with('element => element.click()')
+        page.bring_to_front.assert_not_called()
+
+    def test_latest_too_long_error_id_uses_assistant_message_id_when_error_is_in_message(self) -> None:
+        interface = web.ChatGPTWeb()
+        match = mock.Mock()
+        match.is_visible.return_value = True
+        match.evaluate.return_value = 'assistant-message-id'
+        matches = mock.Mock()
+        matches.count.return_value = 1
+        matches.nth.return_value = match
+        page = mock.Mock()
+        page.get_by_text.return_value = matches
+        session = web.WebSession('a', 'Cats', page)
+
+        self.assertEqual(
+            interface.latest_too_long_error_id(session),
+            'assistant:assistant-message-id',
+        )
+        interface.latest_user_message = mock.Mock()
+        interface.latest_user_message.assert_not_called()
+
+    def test_latest_too_long_error_id_uses_latest_user_for_standalone_banner(self) -> None:
+        interface = web.ChatGPTWeb()
+        match = mock.Mock()
+        match.is_visible.return_value = True
+        match.evaluate.return_value = None
+        matches = mock.Mock()
+        matches.count.return_value = 1
+        matches.nth.return_value = match
+        page = mock.Mock()
+        page.get_by_text.return_value = matches
+        session = web.WebSession('a', 'Cats', page)
+        interface.latest_user_message = mock.Mock(return_value=('failed-user-message-id', 'payload'))
+
+        self.assertEqual(
+            interface.latest_too_long_error_id(session),
+            'user:failed-user-message-id',
+        )
+        interface.latest_user_message.assert_called_once_with(session)
+
+    def test_latest_too_long_error_id_has_stable_fallback_for_standalone_banner_without_user_id(self) -> None:
+        interface = web.ChatGPTWeb()
+        match = mock.Mock()
+        match.is_visible.return_value = True
+        match.evaluate.return_value = None
+        matches = mock.Mock()
+        matches.count.return_value = 1
+        matches.nth.return_value = match
+        page = mock.Mock()
+        page.get_by_text.return_value = matches
+        session = web.WebSession('a', 'Cats', page)
+        interface.latest_user_message = mock.Mock(return_value=None)
+
+        self.assertEqual(
+            interface.latest_too_long_error_id(session),
+            'visible-too-long-banner',
+        )
+
+    def test_disabled_send_without_explicit_error_is_not_called_message_too_long(self) -> None:
+        interface = web.ChatGPTWeb()
+        disabled_button = mock.Mock()
+        disabled_button.is_enabled.return_value = False
+        disabled = mock.Mock()
+        disabled.count.return_value = 1
+        disabled.last = disabled_button
+        no_error = mock.Mock()
+        no_error.count.return_value = 0
+        page = mock.Mock()
+        page.get_by_text.return_value = no_error
+        session = web.WebSession('a', 'Disabled', page)
+        interface.set_composer_text = mock.Mock()
+        interface.composer_text = mock.Mock(return_value='result')
+        interface.send_button = mock.Mock(return_value=disabled)
+
+        with mock.patch.object(web, 'SUBMIT_SETTLE_TIMEOUT_SECONDS', 0.0):
+            with self.assertRaisesRegex(RuntimeError, 'send button is not available'):
+                interface.submit(session, 'result')
+
+        page.get_by_text.assert_called_once_with(web.MESSAGE_TOO_LONG_TEXT, exact=True)
 
     def test_is_generating_uses_stop_button(self) -> None:
         interface = web.ChatGPTWeb()
@@ -645,8 +846,10 @@ class ChatGPTWebTests(unittest.TestCase):
         message = mock.Mock()
         assistant_messages.count.return_value = 1
         assistant_messages.last = message
+        message.inner_text.return_value = '{"session":"root","tool":"not-real"}'
+        message.locator.return_value = FakeLocator([])
         page.locator.side_effect = lambda selector: (
-            assistant_messages if selector == web.ASSISTANT_SELECTOR else mock.Mock(count=lambda: 0)
+            assistant_messages if selector == web.ASSISTANT_SELECTOR else FakeLocator([])
         )
         interface.json_candidates_for_message = mock.Mock(return_value=(
             'assistant-1',
@@ -799,6 +1002,29 @@ class ChatGPTWebTests(unittest.TestCase):
         session = web.WebSession('a', 'A', page)
 
         self.assertEqual(interface.latest_user_message(session), ('user-2', ''))
+
+    def test_latest_user_message_excludes_collapsible_toggle_text(self) -> None:
+        interface = web.ChatGPTWeb()
+        toggle = mock.Mock()
+        toggle.inner_text.return_value = 'Show more'
+        toggles = mock.Mock()
+        toggles.count.return_value = 1
+        toggles.nth.return_value = toggle
+        message = mock.Mock()
+        message.get_attribute.return_value = 'tool-user'
+        message.inner_text.return_value = 'RESULT\n\nShow more'
+        message.locator.return_value = toggles
+        messages = mock.Mock()
+        messages.count.return_value = 1
+        messages.last = message
+        page = mock.Mock()
+        page.locator.return_value = messages
+        session = web.WebSession('a', 'A', page)
+
+        self.assertEqual(interface.latest_user_message(session), ('tool-user', 'RESULT'))
+        message.locator.assert_called_once_with(
+            'button[data-testid="collapsible-user-message-toggle"]'
+        )
 
     def test_latest_message_is_assistant_uses_actual_final_conversation_turn(self) -> None:
         interface = web.ChatGPTWeb()
@@ -1190,6 +1416,279 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertEqual(root.routing_session_id, 'root')
         self.assertIs(root.cdp_session, cdp_session)
         interface.emulate_active_page.assert_called_once_with(page)
+
+    def test_restart_recovers_finished_subagent_forwards_and_retires_without_expectation(self) -> None:
+        interface = web.ChatGPTWeb()
+        interface._browser = object()
+        parent_page = FakePage('https' + '://chatgpt.com/c/parent', title='Parent')
+        child_page = FakePage(
+            'https' + '://chatgpt.com/c/child',
+            title='Child',
+            code=['Finished work.'],
+            message_id='assistant-final',
+            message_roles=['user', 'assistant', 'user', 'assistant'],
+            message_role_ids=['bootstrap', 'request', 'result', 'assistant-final'],
+        )
+        interface.pages = mock.Mock(return_value=[parent_page, child_page])
+        interface.instrument_conversations_responses = mock.Mock()
+        interface.describe_page = mock.Mock(
+            side_effect=lambda page: (
+                ('parent', 'Parent') if page is parent_page else ('child', 'Child')
+            )
+        )
+        interface.latest_too_long_error_id = mock.Mock(return_value=None)
+        interface.emulate_active_page = mock.Mock(side_effect=[mock.Mock(), mock.Mock()])
+        interface.is_generating = mock.Mock(return_value=False)
+        interface.invalid_json_from_snapshot = mock.Mock(return_value=None)
+        interface.invalid_request_from_snapshot = mock.Mock(return_value=None)
+        interface.archive_conversation = mock.Mock()
+        parent_state = web.ConversationProtocolState(routing_session_id='root')
+        child_state = web.ConversationProtocolState(
+            routing_session_id='root::worker',
+            recent_request=(
+                '{}',
+                {'session': 'root::worker', 'id': 's', 'tool': 'status'},
+                'request-fingerprint',
+            ),
+            request_pending=False,
+            terminal_response=('Finished work.', 'terminal-fingerprint'),
+        )
+        interface.conversation_protocol_state = mock.Mock(
+            side_effect=lambda session, validate: (
+                parent_state if session.conversation_id == 'parent' else child_state
+            )
+        )
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            settle_seconds=0.0,
+        )
+
+        watcher.refresh_sessions()
+
+        parent = watcher.sessions['parent']
+        child = watcher.sessions['child']
+        self.assertEqual(child.routing_session_id, 'root::worker')
+        self.assertIsNone(child.terminal_expectation)
+        self.assertIn('request-fingerprint', child.seen_fingerprints)
+
+        self.assertFalse(watcher.scan_session(child, 0.0))
+        self.assertTrue(watcher.scan_session(child, 0.0))
+
+        self.assertEqual(len(parent.pending_responses), 1)
+        self.assertIn('Finished work.', parent.pending_responses[0].result)
+        self.assertIn('completed with terminal response', parent.pending_responses[0].result)
+        interface.archive_conversation.assert_called_once_with(child)
+        self.assertTrue(child_page.closed)
+        self.assertNotIn('child', watcher.sessions)
+        self.assertNotIn('root::worker', watcher.sessions_by_routing_id)
+
+    def test_restart_step_processes_terminal_child_even_when_root_is_also_terminal(self) -> None:
+        interface = web.ChatGPTWeb()
+        parent_page = FakePage('https' + '://chatgpt.com/c/parent', title='Parent')
+        child_page = FakePage('https' + '://chatgpt.com/c/child', title='Child')
+        interface.pages = mock.Mock(return_value=[parent_page, child_page])
+        interface.instrument_conversations_responses = mock.Mock()
+        interface.describe_page = mock.Mock(
+            side_effect=lambda page: (
+                ('parent', 'Parent') if page is parent_page else ('child', 'Child')
+            )
+        )
+        interface.latest_too_long_error_id = mock.Mock(return_value=None)
+        interface.emulate_active_page = mock.Mock(side_effect=[mock.Mock(), mock.Mock()])
+        interface.latest_assistant_snapshot = mock.Mock(
+            return_value=web.AssistantSnapshot('final', (), 'Finished work.')
+        )
+        interface.is_generating = mock.Mock(return_value=False)
+        interface.invalid_json_from_snapshot = mock.Mock(return_value=None)
+        interface.invalid_request_from_snapshot = mock.Mock(return_value=None)
+        interface.archive_conversation = mock.Mock()
+        root_state = web.ConversationProtocolState(
+            routing_session_id='root',
+            terminal_response=('Root done.', 'root-terminal'),
+        )
+        child_state = web.ConversationProtocolState(
+            routing_session_id='root::worker',
+            terminal_response=('Child done.', 'child-terminal'),
+        )
+        interface.conversation_protocol_state = mock.Mock(
+            side_effect=lambda session, validate: (
+                root_state if session.conversation_id == 'parent' else child_state
+            )
+        )
+        root_callback = mock.Mock()
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            on_root_terminal=root_callback,
+            settle_seconds=0.0,
+            clock=lambda: 0.0,
+        )
+
+        watcher.refresh_sessions()
+        self.assertEqual(
+            set(watcher.sessions_by_routing_id),
+            {'root', 'root::worker'},
+        )
+
+        self.assertFalse(watcher.step())
+        self.assertTrue(watcher.step())
+
+        root_callback.assert_called_once()
+        parent = watcher.sessions['parent']
+        self.assertEqual(len(parent.pending_responses), 1)
+        self.assertIn('Child done.', parent.pending_responses[0].result)
+        self.assertNotIn('child', watcher.sessions)
+        self.assertNotIn('root::worker', watcher.sessions_by_routing_id)
+
+    def test_recovered_terminal_ignores_stale_generating_ui_after_settling(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = FakePage(
+            'https' + '://chatgpt.com/c/child',
+            code=['Finished work.'],
+            message_id='assistant-final',
+        )
+        session = web.WebSession(
+            'child',
+            'Child',
+            page,
+            routing_session_id='root::worker',
+            recovered_from_dom=True,
+        )
+        interface.is_generating = mock.Mock(return_value=True)
+        interface.invalid_json_from_snapshot = mock.Mock()
+        interface.invalid_request_from_snapshot = mock.Mock()
+        interface.conversation_protocol_state = mock.Mock(
+            return_value=web.ConversationProtocolState(
+                routing_session_id='root::worker',
+                terminal_response=('Finished work.', 'terminal-fingerprint'),
+            )
+        )
+        parent = web.WebSession('parent', 'Parent', mock.Mock(), routing_session_id='root')
+        interface.archive_conversation = mock.Mock()
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            settle_seconds=0.35,
+        )
+        watcher.sessions = {'parent': parent, 'child': session}
+        watcher.sessions_by_routing_id = {'root': parent, 'root::worker': session}
+
+        self.assertFalse(watcher.scan_session(session, 0.0))
+        self.assertTrue(watcher.scan_session(session, 0.35))
+
+        self.assertEqual(len(parent.pending_responses), 1)
+        self.assertIn('Finished work.', parent.pending_responses[0].result)
+        interface.invalid_json_from_snapshot.assert_not_called()
+        interface.invalid_request_from_snapshot.assert_not_called()
+
+    def test_recovered_root_still_waits_for_generation_to_finish(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = FakePage(
+            'https' + '://chatgpt.com/c/root',
+            code=['Thinking'],
+            message_id='assistant-final',
+        )
+        session = web.WebSession(
+            'root',
+            'Root',
+            page,
+            routing_session_id='root',
+            recovered_from_dom=True,
+        )
+        interface.is_generating = mock.Mock(return_value=True)
+        interface.conversation_protocol_state = mock.Mock(
+            return_value=web.ConversationProtocolState(
+                routing_session_id='root',
+                terminal_response=('Thinking', 'terminal-fingerprint'),
+            )
+        )
+        callback = mock.Mock()
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            on_root_terminal=callback,
+            settle_seconds=0.0,
+        )
+
+        self.assertFalse(watcher.scan_session(session, 0.0))
+        callback.assert_not_called()
+        interface.conversation_protocol_state.assert_not_called()
+
+    def test_live_terminal_still_waits_for_generation_to_finish(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = FakePage(
+            'https' + '://chatgpt.com/c/child',
+            code=['Still writing.'],
+            message_id='assistant-final',
+        )
+        session = web.WebSession('child', 'Child', page, routing_session_id='root')
+        interface.is_generating = mock.Mock(return_value=True)
+        interface.conversation_protocol_state = mock.Mock(
+            return_value=web.ConversationProtocolState(
+                routing_session_id='root',
+                terminal_response=('Still writing.', 'terminal-fingerprint'),
+            )
+        )
+        callback = mock.Mock()
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            on_root_terminal=callback,
+            settle_seconds=0.0,
+        )
+
+        self.assertFalse(watcher.scan_session(session, 0.0))
+        callback.assert_not_called()
+        interface.conversation_protocol_state.assert_not_called()
+
+    def test_restart_rejects_transcript_route_outside_root_tree(self) -> None:
+        interface = web.ChatGPTWeb()
+        interface._browser = object()
+        page = FakePage('https' + '://chatgpt.com/c/foreign', title='Foreign')
+        interface.pages = mock.Mock(return_value=[page])
+        interface.instrument_conversations_responses = mock.Mock()
+        interface.describe_page = mock.Mock(return_value=('foreign', 'Foreign'))
+        interface.latest_too_long_error_id = mock.Mock(return_value=None)
+        interface.conversation_protocol_state = mock.Mock(
+            return_value=web.ConversationProtocolState(
+                routing_session_id='some-other-root::worker',
+                terminal_response=('Done.', 'foreign-terminal'),
+            )
+        )
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+        )
+
+        watcher.refresh_sessions()
+
+        self.assertIsNone(watcher.sessions['foreign'].routing_session_id)
+        self.assertNotIn('some-other-root::worker', watcher.sessions_by_routing_id)
 
     def test_restart_binding_restores_active_emulation_for_recovered_subagent(self) -> None:
         interface = mock.Mock()
@@ -1757,24 +2256,27 @@ class ChatGPTWebTests(unittest.TestCase):
             'https' + '://chatgpt.com/c/a',
             code=['Done.'],
             message_id='assistant-final',
-            message_roles=['user', 'assistant', 'user', 'assistant'],
-            message_role_ids=['user-1', 'assistant-1', 'tool-user', 'assistant-final'],
+            message_roles=['assistant', 'user', 'assistant'],
+            message_role_ids=['assistant-request', 'tool-user', 'assistant-final'],
+            message_texts=[
+                '{"session":"root","id":"s","tool":"status"}',
+                '{"id":"s","tool":"status","ok":true}',
+                'Done.',
+            ],
         )
         session = web.WebSession(
             'a',
             'Cats',
             page,
             routing_session_id='root',
-            terminal_expectation=web.TerminalExpectation('RESULT\n', 'previous-user', 'tool-user'),
         )
-        interface.latest_user_message = mock.Mock(return_value=('tool-user', 'RESULT\n'))
         interface.is_generating = mock.Mock(return_value=False)
         callback = mock.Mock()
         original_snapshot = interface.latest_assistant_snapshot
         interface.latest_assistant_snapshot = mock.Mock(side_effect=original_snapshot)
         watcher = web.WebSessionWatcher(
             interface,
-            validate_request=lambda request: (_ for _ in ()).throw(ValueError('not a tool call')),
+            validate_request=lambda request: None,
             execute_request=mock.Mock(),
             fenced_result=str,
             too_long_fallback=lambda request, result: 'FALLBACK',
@@ -2021,6 +2523,32 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIsNotNone(session.terminal_expectation)
         self.assertEqual(session.terminal_expectation.user_message_id, 'tool-user')
 
+    def test_terminal_expectation_resolves_collapsed_tool_result_without_ui_toggle(self) -> None:
+        interface = mock.Mock()
+        interface.normalize_message_text.side_effect = web.ChatGPTWeb.normalize_message_text
+        interface.latest_user_message.return_value = ('tool-user', '[\n  {"ok": true}\n]')
+        session = web.WebSession(
+            'a',
+            'Cats',
+            mock.Mock(),
+            terminal_expectation=web.TerminalExpectation(
+                '```\n[\n  {"ok": true}\n]\n```\n',
+                'previous-user',
+            ),
+        )
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+
+        watcher.resolve_terminal_expectation(session)
+
+        self.assertIsNotNone(session.terminal_expectation)
+        self.assertEqual(session.terminal_expectation.user_message_id, 'tool-user')
+
     def test_terminal_expectation_survives_constant_rendered_user_count(self) -> None:
         interface = mock.Mock()
         session = web.WebSession(
@@ -2097,17 +2625,17 @@ class ChatGPTWebTests(unittest.TestCase):
             message_id='assistant-final',
             message_roles=['user', 'assistant'],
             message_role_ids=['child-bootstrap-user', 'assistant-final'],
+            message_texts=[
+                'Every executable Poor Girl\'s Codex request MUST include the exact top-level field '
+                '"session": "root::worker".',
+                'Terminal handoff works.',
+            ],
         )
         child = web.WebSession(
             'child-c',
             'Child',
             child_page,
             routing_session_id='root::worker',
-            terminal_expectation=web.TerminalExpectation(
-                'bootstrap prompt',
-                None,
-                'child-bootstrap-user',
-            ),
         )
         interface.is_generating = mock.Mock(return_value=False)
         interface.invalid_json_from_snapshot = mock.Mock(return_value=None)
@@ -2323,7 +2851,7 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertEqual(a.delivered, 1)
         self.assertEqual(b.delivered, 1)
 
-    def test_rate_limit_suspends_and_restores_active_background_tabs(self) -> None:
+    def test_rate_limit_suspension_does_not_freeze_browser_tabs(self) -> None:
         interface = mock.Mock()
         interface.rate_limit_remaining.side_effect = [30.0, 20.0, 0.0]
         cdp_session = mock.Mock()
@@ -2341,18 +2869,11 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertTrue(watcher.sync_rate_limit_suspension())
         self.assertFalse(watcher.sync_rate_limit_suspension())
 
-        # One dismissal attempt when entering cooldown and one after thawing;
-        # the middle cooldown tick must not poll the DOM continuously.
+        # One dismissal attempt when entering cooldown and one when leaving it;
+        # the middle cooldown tick must not poll the DOM continuously. Rate-limit
+        # suspension is purely logical and must not alter Chromium lifecycle/focus.
         self.assertEqual(interface.dismiss_rate_limit_dialog.call_count, 2)
-        self.assertEqual(
-            cdp_session.send.call_args_list,
-            [
-                mock.call('Emulation.setFocusEmulationEnabled', {'enabled': False}),
-                mock.call('Page.setWebLifecycleState', {'state': 'frozen'}),
-                mock.call('Emulation.setFocusEmulationEnabled', {'enabled': True}),
-                mock.call('Page.setWebLifecycleState', {'state': 'active'}),
-            ],
-        )
+        cdp_session.send.assert_not_called()
         self.assertFalse(watcher.rate_limit_suspended)
 
     def test_step_does_not_refresh_scan_or_deliver_during_rate_limit_backoff(self) -> None:
@@ -2508,6 +3029,362 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIsNone(conversation_id)
         page.bring_to_front.assert_not_called()
         interface.close.assert_called_once_with()
+
+    def test_protocol_state_recovers_terminal_after_matching_tool_result(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = FakePage(
+            'https' + '://chatgpt.com/c/child',
+            message_roles=['user', 'assistant', 'user', 'assistant'],
+            message_role_ids=['bootstrap', 'request', 'result', 'final'],
+            message_texts=[
+                'Every executable Poor Girl\'s Codex request MUST include the exact top-level field '
+                '"session": "root::worker".',
+                '{"session":"root::worker","id":"s","tool":"status"}',
+                '{"id":"s","tool":"status","ok":true}',
+                'Finished work.',
+            ],
+        )
+        session = web.WebSession('child', 'Child', page)
+
+        state = interface.conversation_protocol_state(session, lambda request: None)
+
+        self.assertEqual(state.routing_session_id, 'root::worker')
+        self.assertFalse(state.request_pending)
+        self.assertIsNotNone(state.terminal_response)
+        self.assertEqual(state.terminal_response[0], 'Finished work.')
+
+    def test_protocol_state_does_not_treat_human_reply_as_tool_result(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = FakePage(
+            'https' + '://chatgpt.com/c/child',
+            message_roles=['assistant', 'user', 'assistant'],
+            message_role_ids=['request', 'human', 'final'],
+            message_texts=[
+                '{"session":"root::worker","id":"s","tool":"status"}',
+                'Actually, do something else.',
+                'Okay.',
+            ],
+        )
+        session = web.WebSession('child', 'Child', page)
+
+        state = interface.conversation_protocol_state(session, lambda request: None)
+
+        self.assertTrue(state.request_pending)
+        self.assertIsNone(state.terminal_response)
+
+    def test_protocol_state_recovers_zero_tool_subagent_terminal_from_bootstrap(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = FakePage(
+            'https' + '://chatgpt.com/c/child',
+            message_roles=['user', 'assistant'],
+            message_role_ids=['bootstrap', 'final'],
+            message_texts=[
+                'assignment\n\nEvery executable Poor Girl\'s Codex request MUST include the exact top-level field '
+                '"session": "root::worker".',
+                'Terminal handoff works.',
+            ],
+        )
+        session = web.WebSession('child', 'Child', page)
+
+        state = interface.conversation_protocol_state(session, lambda request: None)
+
+        self.assertEqual(state.routing_session_id, 'root::worker')
+        self.assertIsNone(state.recent_request)
+        self.assertIsNotNone(state.terminal_response)
+        self.assertEqual(state.terminal_response[0], 'Terminal handoff works.')
+
+    def test_protocol_state_supports_new_chatgpt_turn_units(self) -> None:
+        class NewMessage:
+            def __init__(self, role, message_id, text, turn):
+                self.role = role
+                self.message_id = message_id
+                self.text = text
+                self.turn = turn
+
+            def inner_text(self):
+                return self.text
+
+            def get_attribute(self, name):
+                if name == 'data-chatgpt-search-unit-key':
+                    suffix = '0:user' if self.role == 'user' else '2:assistant'
+                    return f'fallback-turn-{self.turn}:{suffix}'
+                if name == 'data-chatgpt-search-message-ids':
+                    return self.message_id
+                return None
+
+            def locator(self, selector):
+                return FakeLocator([])
+
+        class Collection:
+            def __init__(self, items):
+                self.items = list(items)
+
+            @property
+            def last(self):
+                return self.items[-1] if self.items else self
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+        class NewPage:
+            def __init__(self, messages):
+                self.messages = messages
+
+            def locator(self, selector):
+                if selector in {
+                    web.MESSAGE_SELECTOR,
+                    web.USER_SELECTOR,
+                    web.ASSISTANT_SELECTOR,
+                }:
+                    return Collection([])
+                if selector == web.NEW_MESSAGE_SELECTOR:
+                    return Collection(self.messages)
+                if selector == web.NEW_USER_SELECTOR:
+                    return Collection([m for m in self.messages if m.role == 'user'])
+                if selector == web.NEW_ASSISTANT_SELECTOR:
+                    return Collection([m for m in self.messages if m.role == 'assistant'])
+                return Collection([])
+
+        messages = [
+            NewMessage(
+                'user',
+                'bootstrap',
+                "Every executable Poor Girl's Codex request MUST include the exact top-level field "
+                '"session": "root::worker".',
+                0,
+            ),
+            NewMessage(
+                'assistant',
+                'request',
+                'ChatGPT said:\nJSON\n'
+                '{"session":"root::worker","id":"s","tool":"status"}',
+                0,
+            ),
+            NewMessage(
+                'user',
+                'result',
+                '{"id":"s","tool":"status","ok":true}',
+                1,
+            ),
+            NewMessage('assistant', 'final', 'ChatGPT said:\nFinished work.', 1),
+        ]
+        interface = web.ChatGPTWeb()
+        session = web.WebSession('child', 'Child', NewPage(messages))
+
+        snapshot = interface.latest_assistant_snapshot(session)
+        state = interface.conversation_protocol_state(session, lambda request: None)
+
+        self.assertEqual(snapshot.message_id, 'final')
+        self.assertEqual(snapshot.text, 'Finished work.')
+        self.assertEqual(interface.latest_user_message(session), ('result', messages[2].text))
+        self.assertTrue(interface.latest_message_is_assistant(session))
+        self.assertEqual(state.routing_session_id, 'root::worker')
+        self.assertIsNotNone(state.recent_request)
+        self.assertEqual(state.recent_request[1]['tool'], 'status')
+        self.assertFalse(state.request_pending)
+        self.assertIsNotNone(state.terminal_response)
+        self.assertEqual(state.terminal_response[0], 'Finished work.')
+
+    def test_new_dom_control_fallbacks_use_semantic_labels(self) -> None:
+        interface = web.ChatGPTWeb()
+        missing = mock.Mock()
+        missing.count.return_value = 0
+        composer = mock.Mock()
+        composer.count.return_value = 1
+        send = mock.Mock()
+        send.count.return_value = 1
+        stop = mock.Mock()
+        stop.count.return_value = 1
+        page = mock.Mock()
+
+        def locator(selector):
+            if selector == web.NEW_COMPOSER_SELECTOR:
+                return composer
+            return missing
+
+        def by_role(role, *, name, exact=True):
+            if role == 'button' and name == 'Send':
+                return send
+            if role == 'button' and name == 'Stop':
+                return stop
+            return missing
+
+        page.locator.side_effect = locator
+        page.get_by_role.side_effect = by_role
+
+        self.assertIs(interface.composer(page), composer)
+        self.assertIs(interface.send_button(page), send)
+        self.assertIs(interface.stop_button(page), stop)
+
+    def test_archive_conversation_falls_back_to_new_header_more_button(self) -> None:
+        interface = web.ChatGPTWeb()
+        missing = mock.Mock()
+        missing.count.return_value = 0
+        more_button = mock.Mock()
+        more = mock.Mock()
+        more.count.return_value = 1
+        more.last = more_button
+        archive = mock.Mock()
+        archive.count.return_value = 1
+        archive.last = archive
+        archive.is_visible.return_value = True
+        unarchive = mock.Mock()
+        unarchive.count.side_effect = [0, 1]
+        unarchive.last = unarchive
+        unarchive.is_visible.return_value = True
+        page = mock.Mock()
+        page.url = 'https' + '://chatgpt.com/c/conversation-123'
+        page.locator.return_value = missing
+
+        def by_role(role, *, name, exact=True):
+            if role == 'button' and name == 'More':
+                return more
+            if role == 'menuitem' and name == 'Archive':
+                return archive
+            if role == 'menuitem' and name == 'Unarchive':
+                return unarchive
+            return missing
+
+        page.get_by_role.side_effect = by_role
+        session = web.WebSession('conversation-123', 'Child', page)
+
+        interface.archive_conversation(session)
+
+        page.get_by_role.assert_any_call('button', name='More', exact=True)
+        page.get_by_role.assert_any_call('menuitem', name='Archive', exact=True)
+        page.get_by_role.assert_any_call('menuitem', name='Unarchive', exact=True)
+        self.assertEqual(more_button.wait_for.call_count, 2)
+        more_button.wait_for.assert_has_calls([
+            mock.call(state='visible', timeout=5_000),
+            mock.call(state='visible', timeout=5_000),
+        ])
+        self.assertGreaterEqual(more_button.click.call_count, 2)
+        archive.click.assert_called_once_with()
+        page.reload.assert_called_once_with(wait_until='domcontentloaded', timeout=30_000)
+        page.keyboard.press.assert_called_once_with('Escape')
+        page.wait_for_url.assert_not_called()
+
+    def test_new_header_archive_reopens_menu_while_archive_state_hydrates(self) -> None:
+        interface = web.ChatGPTWeb()
+        missing = mock.Mock()
+        missing.count.return_value = 0
+        missing.is_visible.return_value = False
+        more_button = mock.Mock()
+        more_button.get_attribute.return_value = 'false'
+        more = mock.Mock()
+        more.count.return_value = 1
+        more.last = more_button
+        archive_item = mock.Mock()
+        archive_item.is_visible.side_effect = [False, True]
+        archive = mock.Mock()
+        archive.count.return_value = 1
+        archive.last = archive_item
+        unarchive_item = mock.Mock()
+        unarchive_item.is_visible.side_effect = [False, False, True]
+        unarchive = mock.Mock()
+        unarchive.count.return_value = 1
+        unarchive.last = unarchive_item
+        page = mock.Mock()
+        page.url = 'https' + '://chatgpt.com/c/conversation-123'
+        page.locator.return_value = missing
+
+        def by_role(role, *, name, exact=True):
+            if role == 'button' and name == 'More':
+                return more
+            if role == 'menuitem' and name == 'Archive':
+                return archive
+            if role == 'menuitem' and name == 'Unarchive':
+                return unarchive
+            return missing
+
+        page.get_by_role.side_effect = by_role
+        session = web.WebSession('conversation-123', 'Child', page)
+
+        interface.archive_conversation(session)
+
+        self.assertGreaterEqual(more_button.click.call_count, 2)
+        archive_item.click.assert_called_once_with()
+        page.reload.assert_called_once_with(wait_until='domcontentloaded', timeout=30_000)
+        self.assertGreaterEqual(page.keyboard.press.call_count, 2)
+
+    def test_new_header_archive_is_idempotent_when_already_archived(self) -> None:
+        interface = web.ChatGPTWeb()
+        missing = mock.Mock()
+        missing.count.return_value = 0
+        more_button = mock.Mock()
+        more_button.get_attribute.return_value = 'false'
+        more = mock.Mock()
+        more.count.return_value = 1
+        more.last = more_button
+        unarchive_item = mock.Mock()
+        unarchive_item.is_visible.return_value = True
+        unarchive = mock.Mock()
+        unarchive.count.return_value = 1
+        unarchive.last = unarchive_item
+        page = mock.Mock()
+        page.url = 'https' + '://chatgpt.com/c/conversation-123'
+        page.locator.return_value = missing
+
+        def by_role(role, *, name, exact=True):
+            if role == 'button' and name == 'More':
+                return more
+            if role == 'menuitem' and name == 'Unarchive':
+                return unarchive
+            return missing
+
+        page.get_by_role.side_effect = by_role
+        session = web.WebSession('conversation-123', 'Child', page)
+
+        interface.archive_conversation(session)
+
+        unarchive_item.evaluate.assert_not_called()
+        page.reload.assert_not_called()
+        page.keyboard.press.assert_called_once_with('Escape')
+
+    def test_new_header_archive_raises_when_state_does_not_flip_to_unarchive(self) -> None:
+        interface = web.ChatGPTWeb()
+        missing = mock.Mock()
+        missing.count.return_value = 0
+        more_button = mock.Mock()
+        more_button.get_attribute.return_value = 'false'
+        more = mock.Mock()
+        more.count.return_value = 1
+        more.last = more_button
+        archive = mock.Mock()
+        archive.count.return_value = 1
+        archive.last = archive
+        archive.is_visible.return_value = True
+        unarchive = mock.Mock()
+        unarchive.count.return_value = 0
+        page = mock.Mock()
+        page.url = 'https' + '://chatgpt.com/c/conversation-123'
+        page.locator.return_value = missing
+
+        def by_role(role, *, name, exact=True):
+            if role == 'button' and name == 'More':
+                return more
+            if role == 'menuitem' and name == 'Archive':
+                return archive
+            if role == 'menuitem' and name == 'Unarchive':
+                return unarchive
+            return missing
+
+        page.get_by_role.side_effect = by_role
+        session = web.WebSession('conversation-123', 'Child', page)
+
+        with self.assertRaisesRegex(RuntimeError, 'archive state was not confirmed'):
+            interface.archive_conversation(session)
+
+    def test_conversation_url_filter_rejects_transient_local_chatgpt_id(self) -> None:
+        transient = 'https' + '://chatgpt.com/c/local-chatgpt%3A1234'
+        self.assertIsNone(web.ChatGPTWeb.conversation_id_for_url(transient))
+        self.assertEqual(
+            web.ChatGPTWeb.conversation_id_for_url('https' + '://chatgpt.com/c/real-id'),
+            'real-id',
+        )
 
     def test_conversation_id_from_reference_accepts_url_or_bare_id(self) -> None:
         self.assertEqual(

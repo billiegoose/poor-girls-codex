@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import signal
 import subprocess
 import sys
@@ -9,20 +10,32 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
 
 from progress_ui import ResponseProgress, color as progress_color
 
 
 ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]'
+MESSAGE_SELECTOR = '[data-message-author-role]'
+USER_SELECTOR = '[data-message-author-role="user"]'
+NEW_MESSAGE_SELECTOR = '[data-chatgpt-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":assistant"]'
+NEW_ASSISTANT_SELECTOR = '[data-chatgpt-search-unit-key$=":assistant"]'
+NEW_USER_SELECTOR = '[data-chatgpt-search-unit-key$=":user"]'
 COMPOSER_SELECTOR = '#prompt-textarea'
+NEW_COMPOSER_SELECTOR = '[data-chatgpt-composer] [contenteditable="true"][role="textbox"]'
 SEND_SELECTOR = 'button[data-testid="send-button"]'
 STOP_SELECTOR = 'button[data-testid="stop-button"]'
+ASSISTANT_START_SELECTOR = (
+    f'{ASSISTANT_SELECTOR}, {NEW_ASSISTANT_SELECTOR}, '
+    f'{STOP_SELECTOR}, button[aria-label="Stop"]'
+)
 DEFAULT_CDP_URL = 'http' + '://127.0.0.1:9222'
 CHROME_CDP_STARTUP_TIMEOUT_SECONDS = 10.0
 CHROME_CDP_RETRY_SECONDS = 0.25
 DEFAULT_SETTLE_SECONDS = 0.35
 DEFAULT_POLL_SECONDS = 0.25
+SUBMIT_SETTLE_TIMEOUT_SECONDS = 2.0
+SUBMIT_SETTLE_POLL_SECONDS = 0.05
 RECENT_ASSISTANT_MESSAGE_LIMIT = 10
 DELIVERY_RETRY_INITIAL_SECONDS = 0.25
 DELIVERY_RETRY_MAX_SECONDS = 8.0
@@ -92,6 +105,14 @@ class TerminalExpectation:
     user_message_id: str | None = None
 
 
+@dataclass(frozen=True)
+class ConversationProtocolState:
+    routing_session_id: str | None = None
+    recent_request: tuple[str, Any, str] | None = None
+    request_pending: bool = False
+    terminal_response: tuple[str, str] | None = None
+
+
 @dataclass
 class WebSession:
     conversation_id: str
@@ -111,6 +132,7 @@ class WebSession:
     retire_requested: bool = False
     terminal_expectation: TerminalExpectation | None = None
     cdp_session: Any | None = None
+    recovered_from_dom: bool = False
 
     @property
     def url(self) -> str:
@@ -209,7 +231,10 @@ class ChatGPTWeb:
         parts = [part for part in parsed.path.split('/') if part]
         if len(parts) != 2 or parts[0] != 'c' or not parts[1]:
             return None
-        return parts[1]
+        conversation_id = unquote(parts[1])
+        if conversation_id.startswith('local-chatgpt:'):
+            return None
+        return conversation_id
 
     def pages(self) -> list[Any]:
         if self._browser is None:
@@ -282,6 +307,34 @@ class ChatGPTWeb:
         except ValueError:
             return False
 
+    @staticmethod
+    def is_rate_limit_pause_exempt_url(url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+            if (
+                parsed.hostname != 'chatgpt.com'
+                or parsed.path != '/backend-api/conversations'
+            ):
+                return False
+            query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            origin = query.pop('conversation_origin', None)
+            excluded_origin = query.pop('exclude_conversation_origin', None)
+            if origin != 'tpp' and excluded_origin != 'tpp':
+                return False
+            if origin is not None and excluded_origin is not None:
+                return False
+            return query == {
+                'expand': 'false',
+                'hide_snorlax': 'false',
+                'is_archived': 'false',
+                'is_starred': 'false',
+                'limit': '20',
+                'order': 'updated',
+                'offset': '0',
+            }
+        except ValueError:
+            return False
+
     def rate_limit_remaining(self, now: float | None = None) -> float:
         if now is None:
             now = time.monotonic()
@@ -291,16 +344,27 @@ class ChatGPTWeb:
         now = time.monotonic()
         already_paused = now < self._rate_limit_until
         if not already_paused:
-            if (
-                self._last_rate_limit_at is None
-                or now - self._last_rate_limit_at >= RATE_LIMIT_BACKOFF_RESET_SECONDS
-            ):
-                self._rate_limit_backoff_seconds = RATE_LIMIT_BACKOFF_INITIAL_SECONDS
+            if self._last_rate_limit_at is None:
+                next_backoff = RATE_LIMIT_BACKOFF_INITIAL_SECONDS
             else:
-                self._rate_limit_backoff_seconds = min(
+                # A retry that is rejected as soon as the previous pause ends should
+                # back off harder. As PGC then runs successfully, decay that next
+                # pause continuously back toward the initial 60s over the recovery
+                # window. Measure quiet time from the end of the previous pause, not
+                # from the last 429 in its burst, so repeated responses cannot pin the
+                # backoff at 300s forever.
+                quiet_seconds = max(0.0, now - self._rate_limit_until)
+                escalated_backoff = min(
                     self._rate_limit_backoff_seconds * 2,
                     RATE_LIMIT_BACKOFF_MAX_SECONDS,
                 )
+                recovery = min(1.0, quiet_seconds / RATE_LIMIT_BACKOFF_RESET_SECONDS)
+                next_backoff = (
+                    RATE_LIMIT_BACKOFF_INITIAL_SECONDS
+                    + (escalated_backoff - RATE_LIMIT_BACKOFF_INITIAL_SECONDS)
+                    * (1.0 - recovery)
+                )
+            self._rate_limit_backoff_seconds = next_backoff
             self._rate_limit_until = now + self._rate_limit_backoff_seconds
             print(
                 f'  [web:rate-limit] {method} 429 {url} -- '
@@ -327,12 +391,14 @@ class ChatGPTWeb:
             status = int(response.status)
             if status != 429:
                 return
-            self.note_rate_limit(
-                method=str(response.request.method),
-                url=str(response.url),
-            )
-            # Try immediately; sync_rate_limit_suspension retries on every paused
-            # watcher iteration in case React has not painted the dialog yet.
+            response_url = str(response.url)
+            if not self.is_rate_limit_pause_exempt_url(response_url):
+                self.note_rate_limit(
+                    method=str(response.request.method),
+                    url=response_url,
+                )
+            # Even an exempt conversations-list 429 can surface ChatGPT's modal;
+            # dismiss it without turning that request into a global PGC pause.
             self.dismiss_rate_limit_dialog(page)
         except Exception as exc:
             print(f'  [web:conversations] instrumentation error: {exc}', flush=True)
@@ -348,8 +414,50 @@ class ChatGPTWeb:
         self._instrumented_page_ids.add(page_id)
 
     @staticmethod
-    def json_candidates_for_message(message: Any) -> tuple[str | None, list[str]]:
+    def message_id(message: Any) -> str | None:
         message_id = message.get_attribute('data-message-id')
+        if message_id:
+            return message_id
+        search_ids = message.get_attribute('data-chatgpt-search-message-ids')
+        if search_ids:
+            return search_ids.split()[0]
+        selected = message.locator('[data-chatgpt-selection-message-id]')
+        if selected.count() > 0:
+            return selected.last.get_attribute('data-chatgpt-selection-message-id')
+        return None
+
+    @staticmethod
+    def message_role(message: Any) -> str | None:
+        role = message.get_attribute('data-message-author-role')
+        if role in {'user', 'assistant'}:
+            return role
+        search_key = message.get_attribute('data-chatgpt-search-unit-key') or ''
+        if search_key.endswith(':user'):
+            return 'user'
+        if search_key.endswith(':assistant'):
+            return 'assistant'
+        return None
+
+    @staticmethod
+    def message_locator(page: Any, role: str | None = None) -> Any:
+        old_selector = {
+            None: MESSAGE_SELECTOR,
+            'user': USER_SELECTOR,
+            'assistant': ASSISTANT_SELECTOR,
+        }[role]
+        old_messages = page.locator(old_selector)
+        if old_messages.count() > 0:
+            return old_messages
+        new_selector = {
+            None: NEW_MESSAGE_SELECTOR,
+            'user': NEW_USER_SELECTOR,
+            'assistant': NEW_ASSISTANT_SELECTOR,
+        }[role]
+        return page.locator(new_selector)
+
+    @staticmethod
+    def json_candidates_for_message(message: Any) -> tuple[str | None, list[str]]:
+        message_id = ChatGPTWeb.message_id(message)
         candidates: list[str] = []
         code = message.locator('pre code')
         for index in range(code.count()):
@@ -363,15 +471,33 @@ class ChatGPTWeb:
             text = pre.nth(index).inner_text().strip()
             if text:
                 candidates.append(text)
+        if not candidates:
+            code_blocks = message.locator('[data-markdown-copy="code-block"]')
+            for index in range(code_blocks.count()):
+                text = code_blocks.nth(index).inner_text().strip()
+                if text.lower().startswith('json\n'):
+                    text = text.split('\n', 1)[1].strip()
+                if text:
+                    candidates.append(text)
+        if not candidates:
+            candidates.extend(
+                ChatGPTWeb.json_candidates_from_text(
+                    ChatGPTWeb.rendered_message_text(message)
+                )
+            )
         return message_id, candidates
 
     def latest_assistant_snapshot(self, session: WebSession) -> AssistantSnapshot:
-        messages = session.page.locator(ASSISTANT_SELECTOR)
+        messages = self.message_locator(session.page, 'assistant')
         if messages.count() == 0:
             return AssistantSnapshot(None, ())
         message = messages.last
         message_id, sources = self.json_candidates_for_message(message)
-        return AssistantSnapshot(message_id, tuple(sources), message.inner_text().strip())
+        return AssistantSnapshot(
+            message_id,
+            tuple(sources),
+            self.rendered_message_text(message).strip(),
+        )
 
     def latest_json_candidates(self, session: WebSession) -> tuple[str | None, list[str]]:
         snapshot = self.latest_assistant_snapshot(session)
@@ -388,6 +514,44 @@ class ChatGPTWeb:
             source = source.strip()
             if not source:
                 continue
+            try:
+                request = json.loads(source)
+                validate_request(request)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            candidates.append((len(source), source, request))
+        if not candidates:
+            return None
+        _, source, request = min(candidates, key=lambda item: item[0])
+        identity = (message_id or '') + '\0' + source
+        fingerprint = hashlib.sha256(identity.encode('utf-8')).hexdigest()
+        return source, request, fingerprint
+
+    @staticmethod
+    def json_candidates_from_text(text: str) -> list[str]:
+        candidates = [
+            match.group(1).replace('\u00a0', ' ').strip()
+            for match in re.finditer(r'```[^\n]*\n(.*?)```', text, flags=re.DOTALL)
+            if match.group(1).strip()
+        ]
+        if candidates:
+            return candidates
+        stripped = text.replace('\u00a0', ' ').strip()
+        if stripped.lower().startswith('json\n'):
+            stripped = stripped.split('\n', 1)[1].strip()
+        if stripped.startswith(('{', '[')):
+            return [stripped]
+        return []
+
+    def valid_request_from_text(
+        self,
+        text: str,
+        validate_request: Callable[[Any], None],
+        *,
+        message_id: str | None = None,
+    ) -> tuple[str, Any, str] | None:
+        candidates: list[tuple[int, str, Any]] = []
+        for source in self.json_candidates_from_text(text):
             try:
                 request = json.loads(source)
                 validate_request(request)
@@ -493,10 +657,10 @@ class ChatGPTWeb:
         )
 
     def latest_message_is_assistant(self, session: WebSession) -> bool:
-        messages = session.page.locator('[data-message-author-role]')
+        messages = self.message_locator(session.page)
         if messages.count() == 0:
             return False
-        return messages.last.get_attribute('data-message-author-role') == 'assistant'
+        return self.message_role(messages.last) == 'assistant'
 
     @staticmethod
     def normalize_message_text(text: str) -> str:
@@ -508,11 +672,11 @@ class ChatGPTWeb:
         return normalized
 
     def latest_user_message(self, session: WebSession) -> tuple[str | None, str] | None:
-        messages = session.page.locator('[data-message-author-role="user"]')
+        messages = self.message_locator(session.page, 'user')
         if messages.count() == 0:
             return None
         message = messages.last
-        return message.get_attribute('data-message-id'), message.inner_text()
+        return self.message_id(message), self.rendered_message_text(message)
 
     def terminal_response_from_snapshot(
         self,
@@ -522,14 +686,14 @@ class ChatGPTWeb:
     ) -> tuple[str, str] | None:
         if snapshot.message_id is None:
             return None
-        messages = session.page.locator('[data-message-author-role]')
+        messages = self.message_locator(session.page)
         count = messages.count()
         expected_user_index = None
         snapshot_index = None
         for index in range(count - 1, -1, -1):
             message = messages.nth(index)
-            message_id = message.get_attribute('data-message-id')
-            role = message.get_attribute('data-message-author-role')
+            message_id = self.message_id(message)
+            role = self.message_role(message)
             if snapshot_index is None and role == 'assistant' and message_id == snapshot.message_id:
                 snapshot_index = index
             if role == 'user':
@@ -567,7 +731,7 @@ class ChatGPTWeb:
         *,
         limit: int = RECENT_ASSISTANT_MESSAGE_LIMIT,
     ) -> tuple[str, Any, str] | None:
-        messages = session.page.locator(ASSISTANT_SELECTOR)
+        messages = self.message_locator(session.page, 'assistant')
         count = messages.count()
         start = max(0, count - limit)
         for index in range(count - 1, start - 1, -1):
@@ -576,8 +740,206 @@ class ChatGPTWeb:
                 return request
         return None
 
+    @staticmethod
+    def bootstrap_routing_session_id(text: str) -> str | None:
+        match = re.search(
+            r'Every executable Poor Girl\'s Codex request MUST include the exact top-level field '
+            r'"session": "([^"]+)"',
+            text,
+        )
+        return match.group(1) if match is not None else None
+
+    def protocol_tool_result_matches_request(self, text: str, request: Any) -> bool:
+        calls = (
+            request.get('calls')
+            if isinstance(request, dict) and isinstance(request.get('calls'), list)
+            else [request]
+        )
+
+        stripped = text.strip()
+        if stripped.startswith("Poor Girl's Codex delivery error: the full tool results were too large for ChatGPT."):
+            for index, call in enumerate(calls):
+                if not isinstance(call, dict):
+                    return False
+                call_id = str(call.get('id', index))
+                tool = str(call.get('tool', '?'))
+                if f'- {call_id}: {tool} (' not in stripped:
+                    return False
+            return True
+
+        for source in self.json_candidates_from_text(text):
+            try:
+                payload = json.loads(source)
+            except json.JSONDecodeError:
+                continue
+            results = payload if isinstance(payload, list) else [payload]
+            if len(results) != len(calls):
+                continue
+            matched = True
+            for index, (call, result) in enumerate(zip(calls, results, strict=True)):
+                if not isinstance(call, dict) or not isinstance(result, dict):
+                    matched = False
+                    break
+                expected_id = str(call.get('id', index))
+                expected_tool = call.get('tool')
+                if str(result.get('id')) != expected_id or result.get('tool') != expected_tool:
+                    matched = False
+                    break
+            if matched:
+                return True
+        return False
+
+    @staticmethod
+    def rendered_message_text(message: Any) -> str:
+        text = message.inner_text()
+        toggles = message.locator('button[data-testid="collapsible-user-message-toggle"]')
+        if toggles.count() == 0:
+            toggles = message.locator('button')
+        for index in range(toggles.count()):
+            toggle_text = toggles.nth(index).inner_text().strip()
+            if toggle_text not in {'Show more', 'Show less'}:
+                continue
+            stripped = text.rstrip()
+            if stripped.endswith(toggle_text):
+                text = stripped[: -len(toggle_text)].rstrip()
+        stripped = text.strip()
+        for prefix in ('ChatGPT said:', 'You said:'):
+            if stripped == prefix:
+                return ''
+            if stripped.startswith(prefix + '\n'):
+                return stripped[len(prefix) + 1 :].strip()
+        return text
+
+    def conversation_protocol_state(
+        self,
+        session: WebSession,
+        validate_request: Callable[[Any], None],
+        *,
+        limit: int = RECENT_ASSISTANT_MESSAGE_LIMIT * 2,
+    ) -> ConversationProtocolState:
+        messages = self.message_locator(session.page)
+        count = messages.count()
+        start = max(0, count - limit)
+        records: list[dict[str, Any]] = []
+
+        for dom_index in range(start, count):
+            message = messages.nth(dom_index)
+            role = self.message_role(message)
+            if role not in {'user', 'assistant'}:
+                continue
+            message_id = self.message_id(message)
+            text = self.rendered_message_text(message).strip()
+            request = (
+                self.valid_request_from_message(message, validate_request)
+                if role == 'assistant'
+                else None
+            )
+            records.append(
+                {
+                    'role': role,
+                    'message_id': message_id,
+                    'text': text,
+                    'request': request,
+                }
+            )
+
+        latest_request: tuple[str, Any, str] | None = None
+        latest_request_index: int | None = None
+        bootstrap_session_id: str | None = None
+        bootstrap_index: int | None = None
+        for index, record in enumerate(records):
+            if record['role'] == 'user':
+                recovered = self.bootstrap_routing_session_id(record['text'])
+                if recovered is not None:
+                    bootstrap_session_id = recovered
+                    bootstrap_index = index
+                continue
+            if record['request'] is not None:
+                latest_request = record['request']
+                latest_request_index = index
+
+        routing_session_id = bootstrap_session_id
+        if latest_request is not None:
+            request_session = latest_request[1].get('session') if isinstance(latest_request[1], dict) else None
+            if isinstance(request_session, str):
+                routing_session_id = request_session
+
+        request_result_index: int | None = None
+        if latest_request_index is not None and latest_request is not None:
+            for index in range(latest_request_index + 1, len(records)):
+                record = records[index]
+                if record['role'] != 'user':
+                    continue
+                if self.protocol_tool_result_matches_request(record['text'], latest_request[1]):
+                    request_result_index = index
+                break
+
+        request_pending = latest_request_index is not None and request_result_index is None
+        terminal_response: tuple[str, str] | None = None
+        if routing_session_id is not None and records:
+            latest = records[-1]
+            if latest['role'] == 'assistant' and latest['request'] is None:
+                terminal = False
+                if latest_request_index is not None:
+                    terminal = (
+                        request_result_index is not None
+                        and request_result_index < len(records) - 1
+                        and not any(
+                            record['role'] == 'user'
+                            for record in records[request_result_index + 1 :]
+                        )
+                    )
+                elif bootstrap_index is not None:
+                    terminal = not any(
+                        record['role'] == 'user'
+                        for record in records[bootstrap_index + 1 :]
+                    )
+                if terminal:
+                    text = latest['text']
+                    identity = (latest['message_id'] or '') + '\0terminal-response\0' + text
+                    terminal_response = (
+                        text,
+                        hashlib.sha256(identity.encode('utf-8')).hexdigest(),
+                    )
+
+        return ConversationProtocolState(
+            routing_session_id=routing_session_id,
+            recent_request=latest_request,
+            request_pending=request_pending,
+            terminal_response=terminal_response,
+        )
+
+    @staticmethod
+    def composer(page: Any) -> Any:
+        composer = page.locator(COMPOSER_SELECTOR)
+        if composer.count() > 0:
+            return composer
+        composer = page.locator(NEW_COMPOSER_SELECTOR)
+        if composer.count() > 0:
+            return composer
+        return page.get_by_role('textbox', name='Ask ChatGPT', exact=True)
+
+    @staticmethod
+    def send_button(page: Any) -> Any:
+        button = page.locator(SEND_SELECTOR)
+        if button.count() > 0:
+            return button
+        button = page.get_by_role('button', name='Send prompt')
+        if button.count() > 0:
+            return button
+        return page.get_by_role('button', name='Send', exact=True)
+
+    @staticmethod
+    def stop_button(page: Any) -> Any:
+        button = page.locator(STOP_SELECTOR)
+        if button.count() > 0:
+            return button
+        button = page.get_by_role('button', name='Stop answering', exact=True)
+        if button.count() > 0:
+            return button
+        return page.get_by_role('button', name='Stop', exact=True)
+
     def set_composer_text(self, session: WebSession, text: str) -> None:
-        session.page.bring_to_front()
         if session.cdp_session is None:
             session.cdp_session = self.emulate_active_page(session.page)
         else:
@@ -593,21 +955,39 @@ class ChatGPTWeb:
             except Exception as exc:
                 print(f'  [web:{session.label}] active-page emulation error: {exc}', flush=True)
 
-        composer = session.page.locator(COMPOSER_SELECTOR).last
+        composer = self.composer(session.page)
         if composer.count() == 0:
-            raise RuntimeError(f'{session.label}: ChatGPT composer not found')
-        composer.fill(text)
+            # Foreground activation is a recovery path only. Normal background
+            # delivery should not steal the user's active browser tab.
+            session.page.bring_to_front()
+            composer = self.composer(session.page)
+            if composer.count() == 0:
+                raise RuntimeError(f'{session.label}: ChatGPT composer not found')
+
+        try:
+            composer.last.fill(text)
+        except Exception:
+            # Some Chromium/ChatGPT states still refuse to edit a background
+            # contenteditable despite focus emulation. Retry once in foreground.
+            session.page.bring_to_front()
+            composer = self.composer(session.page)
+            if composer.count() == 0:
+                raise RuntimeError(f'{session.label}: ChatGPT composer not found')
+            composer.last.fill(text)
+
+    def composer_text(self, session: WebSession) -> str | None:
+        composer = self.composer(session.page)
+        if composer.count() == 0:
+            return None
+        value = composer.last.inner_text()
+        return value if isinstance(value, str) else None
 
     def can_submit(self, session: WebSession) -> bool:
-        button = session.page.locator(SEND_SELECTOR)
-        if button.count() == 0:
-            button = session.page.get_by_role('button', name='Send prompt')
+        button = self.send_button(session.page)
         return button.count() > 0 and button.last.is_enabled()
 
     def is_generating(self, session: WebSession) -> bool:
-        button = session.page.locator(STOP_SELECTOR)
-        if button.count() == 0:
-            button = session.page.get_by_role('button', name='Stop answering', exact=True)
+        button = self.stop_button(session.page)
         return button.count() > 0 and button.last.is_visible()
 
     def latest_too_long_error_id(self, session: WebSession) -> str | None:
@@ -616,9 +996,31 @@ class ChatGPTWeb:
             match = matches.nth(index)
             if not match.is_visible():
                 continue
-            return match.evaluate(
-                "e => e.closest('[data-message-author-role=\\\"assistant\\\"]')?.getAttribute('data-message-id') || null"
+            message_id = match.evaluate(
+                """e => {
+                    const oldMessage = e.closest('[data-message-author-role="assistant"]');
+                    if (oldMessage) return oldMessage.getAttribute('data-message-id');
+                    const unit = e.closest('[data-chatgpt-search-unit-key$=":assistant"]');
+                    const ids = unit?.getAttribute('data-chatgpt-search-message-ids');
+                    return ids ? ids.trim().split(/\\s+/)[0] : null;
+                }"""
             )
+            if message_id:
+                return f'assistant:{message_id}'
+
+            # The redesigned ChatGPT UI renders submission failures as a
+            # standalone banner beside the composer rather than as an assistant
+            # message. Associate that banner with the most recent user turn so
+            # one failed submission has a stable dedup key, while a later failed
+            # submission naturally receives a different key.
+            latest_user = self.latest_user_message(session)
+            if latest_user is not None and latest_user[0] is not None:
+                return f'user:{latest_user[0]}'
+
+            # Last-resort stable key for a visible banner on a transcript where
+            # ChatGPT has not exposed a usable message id. Attachment baselining
+            # still prevents an already-visible banner from being replayed.
+            return 'visible-too-long-banner'
         return None
 
     def emulate_active_page(self, page: Any) -> Any | None:
@@ -639,25 +1041,56 @@ class ChatGPTWeb:
         self.set_composer_text(session, text)
 
         def send_button():
-            button = session.page.locator(SEND_SELECTOR)
-            if button.count() == 0:
-                button = session.page.get_by_role('button', name='Send prompt')
-            return button
+            return self.send_button(session.page)
 
+        deadline = time.monotonic() + SUBMIT_SETTLE_TIMEOUT_SECONDS
+        refilled = False
+        focused_for_missing_send = False
         button = send_button()
-        if button.count() == 0 or not button.last.is_enabled():
-            # ChatGPT sometimes does not materialize an enabled send button for a
-            # genuinely background Chrome tab. Focusing that tab is enough to make
-            # the composer controls catch up, so automate that only as a fallback.
+        if button.count() == 0:
+            # Preserve the old background-tab recovery for a genuinely missing
+            # control; there is no benefit in waiting for composer hydration first.
             session.page.bring_to_front()
+            focused_for_missing_send = True
             button = send_button()
 
-        if button.count() == 0:
-            raise RuntimeError(f'{session.label}: ChatGPT send button is not available')
-        if not button.last.is_enabled():
-            if button.last.get_attribute('aria-disabled') == 'true' and text:
+        while True:
+            current_text = self.composer_text(session)
+            if current_text is not None and current_text != text and not refilled:
+                # Fresh new-layout pages can finish hydrating after fill() and restore
+                # a stale local draft over the text we just entered. Refill once after
+                # hydration wins, then wait for React to enable Send for that payload.
+                self.set_composer_text(session, text)
+                refilled = True
+                button = send_button()
+                current_text = self.composer_text(session)
+
+            if (
+                button.count() > 0
+                and button.last.is_enabled()
+                and (current_text is None or current_text == text)
+            ):
+                break
+            if time.monotonic() >= deadline:
+                break
+            session.page.wait_for_timeout(int(SUBMIT_SETTLE_POLL_SECONDS * 1000))
+            button = send_button()
+
+        if button.count() == 0 or not button.last.is_enabled():
+            # A disabled Send button is no longer sufficient evidence that the
+            # payload is oversized: the new UI also uses it while restoring drafts
+            # and synchronizing composer state. Only the explicit ChatGPT error is
+            # treated as a length failure.
+            if session.page.get_by_text(MESSAGE_TOO_LONG_TEXT, exact=True).count() > 0:
                 raise MessageTooLongError(f'{session.label}: ChatGPT message is too long')
-            raise RuntimeError(f'{session.label}: ChatGPT send button is not available')
+
+            # Preserve the old background-tab recovery after the state-settle pass.
+            if not focused_for_missing_send:
+                session.page.bring_to_front()
+                button = send_button()
+            if button.count() == 0 or not button.last.is_enabled():
+                raise RuntimeError(f'{session.label}: ChatGPT send button is not available')
+
         # Playwright's normal click waits for the element to be visible and stable.
         # ChatGPT can leave the enabled send button perpetually "unstable" in a
         # background tab, so invoke the DOM click directly instead of requiring
@@ -676,8 +1109,11 @@ class ChatGPTWeb:
         self.instrument_conversations_responses(page)
         cdp_session = self.emulate_active_page(page) if emulate_active else None
         try:
-            page.goto('https' + '://chatgpt.com/', wait_until='domcontentloaded')
-            page.locator(COMPOSER_SELECTOR).last.wait_for(state='visible', timeout=15_000)
+            # ChatGPT can keep DOMContentLoaded pending long after the new-chat
+            # shell is usable. Navigation commit plus the composer visibility wait
+            # below is the actual readiness boundary we care about.
+            page.goto('https' + '://chatgpt.com/', wait_until='commit')
+            self.composer(page).last.wait_for(state='visible', timeout=15_000)
             pending = WebSession('', label or 'new chat', page, cdp_session=cdp_session)
             self.submit(pending, prompt)
             page.wait_for_url(
@@ -685,9 +1121,12 @@ class ChatGPTWeb:
                 timeout=30_000,
             )
             # Do not let the next subagent steal foreground focus until this
-            # conversation's assistant turn has actually started. ChatGPT can
-            # otherwise leave a just-submitted background tab dormant forever.
-            page.locator(ASSISTANT_SELECTOR).last.wait_for(state='attached', timeout=30_000)
+            # conversation's assistant turn has actually started. The new DOM
+            # exposes Stop before it mounts the assistant message unit.
+            page.locator(ASSISTANT_START_SELECTOR).last.wait_for(
+                state='attached',
+                timeout=30_000,
+            )
             conversation_id, page_label = self.describe_page(page)
             return WebSession(
                 conversation_id,
@@ -737,9 +1176,9 @@ class ChatGPTWeb:
         try:
             page.goto(
                 'https' + f'://chatgpt.com/c/{conversation_id}',
-                wait_until='domcontentloaded',
+                wait_until='commit',
             )
-            page.locator(COMPOSER_SELECTOR).last.wait_for(state='visible', timeout=15_000)
+            self.composer(page).last.wait_for(state='visible', timeout=15_000)
             actual_id, label = self.describe_page(page)
             if actual_id != conversation_id:
                 raise RuntimeError(
@@ -753,11 +1192,78 @@ class ChatGPTWeb:
     def archive_conversation(self, session: WebSession) -> None:
         page = session.page
         more = page.locator('button[data-testid="conversation-options-button"]')
-        if more.count() == 0:
-            raise RuntimeError(f'{session.label}: ChatGPT conversation options button not found')
+        new_header_menu = more.count() == 0
+
+        if new_header_menu:
+            more_button = page.get_by_role('button', name='More', exact=True)
+            try:
+                more_button.last.wait_for(state='visible', timeout=5_000)
+            except Exception as exc:
+                raise RuntimeError(
+                    f'{session.label}: ChatGPT conversation options button not found'
+                ) from exc
+            if more_button.count() == 0:
+                raise RuntimeError(
+                    f'{session.label}: ChatGPT conversation options button not found'
+                )
+
+            def open_menu_until_archive_state(*, timeout_seconds: float = 5.0) -> tuple[str, Any]:
+                deadline = time.monotonic() + timeout_seconds
+                while time.monotonic() < deadline:
+                    if more_button.last.get_attribute('aria-expanded') != 'true':
+                        more_button.last.click()
+                    page.wait_for_timeout(100)
+
+                    unarchive = page.get_by_role('menuitem', name='Unarchive', exact=True)
+                    if unarchive.count() > 0 and unarchive.last.is_visible():
+                        return 'unarchive', unarchive.last
+                    archive = page.get_by_role('menuitem', name='Archive', exact=True)
+                    if archive.count() > 0 and archive.last.is_visible():
+                        return 'archive', archive.last
+
+                    try:
+                        page.keyboard.press('Escape')
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(100)
+
+                raise RuntimeError(
+                    f'{session.label}: ChatGPT Archive/Unarchive menu state did not become available'
+                )
+
+            # The redesigned header/menu hydrates after the composer. Once the
+            # conversation-specific state appears, Unarchive means this operation
+            # is already complete and Archive is the action we need to invoke.
+            state, item = open_menu_until_archive_state()
+            if state == 'unarchive':
+                page.keyboard.press('Escape')
+                return
+            item.click()
+            page.wait_for_timeout(250)
+            if self.conversation_id_for_url(str(page.url)) != session.conversation_id:
+                return
+
+            # The redesigned page does not refresh its mounted menu model after
+            # archiving: it can continue to show Archive indefinitely even though
+            # the server-side state has changed. Reload the same conversation and
+            # confirm the persisted state from the freshly hydrated menu.
+            try:
+                page.reload(wait_until='domcontentloaded', timeout=30_000)
+                more_button.last.wait_for(state='visible', timeout=5_000)
+                state, _ = open_menu_until_archive_state()
+                if state != 'unarchive':
+                    raise RuntimeError('Archive remained available after reload')
+                page.keyboard.press('Escape')
+                return
+            except Exception as exc:
+                if self.conversation_id_for_url(str(page.url)) == session.conversation_id:
+                    raise RuntimeError(
+                        f'{session.label}: ChatGPT archive state was not confirmed'
+                    ) from exc
+                return
+
         more.last.wait_for(state='visible', timeout=5_000)
         more.last.evaluate('element => element.click()')
-
         archive = page.get_by_role('menuitem', name='Archive', exact=True)
         archive.wait_for(state='visible', timeout=5_000)
         archive.evaluate('element => element.click()')
@@ -1062,14 +1568,26 @@ class WebSessionWatcher:
                     session.last_too_long_error_id = self.interface.latest_too_long_error_id(session)
                     self.sessions[conversation_id] = session
                 if previous_id is None and prime_new:
-                    existing = self.interface.recent_valid_request(session, self.validate_request)
-                    if existing is not None:
-                        _, request, fingerprint = existing
-                        routing_session_id = self.request_session_id(request)
-                        if routing_session_id is not None:
-                            self.bind_routing_session(session, routing_session_id)
-                        if not self.should_replay_recovered_request(session, fingerprint):
-                            session.seen_fingerprints.add(fingerprint)
+                    if isinstance(self.interface, ChatGPTWeb):
+                        protocol = self.interface.conversation_protocol_state(
+                            session,
+                            self.validate_request,
+                        )
+                        if self.accepts_routing_session_id(protocol.routing_session_id):
+                            assert protocol.routing_session_id is not None
+                            session.recovered_from_dom = True
+                            self.bind_routing_session(session, protocol.routing_session_id)
+                            if protocol.recent_request is not None and not protocol.request_pending:
+                                session.seen_fingerprints.add(protocol.recent_request[2])
+                    else:
+                        existing = self.interface.recent_valid_request(session, self.validate_request)
+                        if existing is not None:
+                            _, request, fingerprint = existing
+                            routing_session_id = self.request_session_id(request)
+                            if routing_session_id is not None:
+                                self.bind_routing_session(session, routing_session_id)
+                            if not self.should_replay_recovered_request(session, fingerprint):
+                                session.seen_fingerprints.add(fingerprint)
             else:
                 session.page = page
 
@@ -1099,7 +1617,8 @@ class WebSessionWatcher:
             session.terminal_expectation = None
 
     def scan_session(self, session: WebSession, now: float) -> bool:
-        self.resolve_terminal_expectation(session)
+        if not isinstance(self.interface, ChatGPTWeb):
+            self.resolve_terminal_expectation(session)
         snapshot = (
             self.interface.latest_assistant_snapshot(session)
             if isinstance(self.interface, ChatGPTWeb)
@@ -1111,18 +1630,29 @@ class WebSessionWatcher:
             else self.interface.valid_request(session, self.validate_request)
         )
         if candidate is None:
-            if self.interface.is_generating(session) is True:
+            generating = self.interface.is_generating(session) is True
+            recover_terminal_while_generating = (
+                generating
+                and isinstance(self.interface, ChatGPTWeb)
+                and session.recovered_from_dom
+                and self.subagent_name(session.routing_session_id) is not None
+            )
+            if generating and not recover_terminal_while_generating:
                 session.settling_fingerprint = None
                 return False
 
-            invalid_json = (
+            # A recovered tab can retain ChatGPT's streaming UI indefinitely after
+            # its final prose is already rendered. In that case, skip malformed-call
+            # diagnostics but still let the DOM protocol classifier and normal
+            # fingerprint settling decide whether the response is terminal.
+            invalid_json = None if generating else (
                 self.interface.invalid_json_from_snapshot(snapshot)
                 if snapshot is not None
                 else self.interface.invalid_json_candidate(session)
             )
             invalid_request = None
             foreign_invalid_request = False
-            if invalid_json is None:
+            if invalid_json is None and not generating:
                 invalid_request = (
                     self.interface.invalid_request_from_snapshot(snapshot, self.validate_request)
                     if snapshot is not None
@@ -1185,74 +1715,88 @@ class WebSessionWatcher:
                 session.settling_fingerprint = None
                 return False
 
-            expectation = session.terminal_expectation
-            if expectation is not None and expectation.user_message_id is not None:
-                terminal = (
-                    self.interface.terminal_response_from_snapshot(
-                        session,
-                        snapshot,
-                        expectation.user_message_id,
-                    )
-                    if snapshot is not None
-                    else self.interface.terminal_response_candidate(
-                        session,
-                        expectation.user_message_id,
-                    )
+            terminal = None
+            if isinstance(self.interface, ChatGPTWeb):
+                protocol = self.interface.conversation_protocol_state(
+                    session,
+                    self.validate_request,
                 )
-                if terminal is not None:
-                    text, fingerprint = terminal
-                    if fingerprint in session.seen_fingerprints:
-                        session.terminal_expectation = None
-                        session.settling_fingerprint = None
-                        return False
-                    if session.settling_fingerprint != fingerprint:
-                        session.settling_fingerprint = fingerprint
-                        session.settle_deadline = now + self.settle_seconds
-                        return False
-                    if now < session.settle_deadline:
-                        return False
+                if not self.accepts_routing_session_id(protocol.routing_session_id):
+                    session.settling_fingerprint = None
+                    return False
+                if session.routing_session_id is None and protocol.routing_session_id is not None:
+                    self.bind_routing_session(session, protocol.routing_session_id)
+                terminal = protocol.terminal_response
+            else:
+                expectation = session.terminal_expectation
+                if expectation is not None and expectation.user_message_id is not None:
+                    terminal = (
+                        self.interface.terminal_response_from_snapshot(
+                            session,
+                            snapshot,
+                            expectation.user_message_id,
+                        )
+                        if snapshot is not None
+                        else self.interface.terminal_response_candidate(
+                            session,
+                            expectation.user_message_id,
+                        )
+                    )
 
-                    routing_session_id = session.routing_session_id
-                    parent = None
-                    if routing_session_id is not None and '::' in routing_session_id:
-                        parent_session_id = routing_session_id.rsplit('::', 1)[0]
-                        parent = self.sessions_by_routing_id.get(parent_session_id)
-                        if parent is None:
-                            raise RuntimeError(
-                                f'parent session is not attached: {parent_session_id}'
-                            )
-
-                    session.seen_fingerprints.add(fingerprint)
+            if terminal is not None:
+                text, fingerprint = terminal
+                if fingerprint in session.seen_fingerprints:
                     session.terminal_expectation = None
                     session.settling_fingerprint = None
-                    progress_prefix = self.progress_prefix(routing_session_id)
-                    header_prefix = f'{progress_prefix} ' if progress_prefix is not None else ''
-                    ResponseProgress.commit_live()
-                    print(flush=True)
-                    print(
-                        f"{header_prefix}{progress_color('terminal response [complete]', '1;32')}",
-                        flush=True,
-                    )
+                    return False
+                if session.settling_fingerprint != fingerprint:
+                    session.settling_fingerprint = fingerprint
+                    session.settle_deadline = now + self.settle_seconds
+                    return False
+                if now < session.settle_deadline:
+                    return False
 
-                    if parent is not None:
-                        message = (
-                            f'Subagent {routing_session_id} completed with terminal response:\n\n'
-                            + text.rstrip()
-                            + '\n'
+                routing_session_id = session.routing_session_id
+                parent = None
+                if routing_session_id is not None and '::' in routing_session_id:
+                    parent_session_id = routing_session_id.rsplit('::', 1)[0]
+                    parent = self.sessions_by_routing_id.get(parent_session_id)
+                    if parent is None:
+                        raise RuntimeError(
+                            f'parent session is not attached: {parent_session_id}'
                         )
-                        parent.pending_responses.append(PendingResponse(message, message))
-                        session.retire_requested = True
-                        self.retire_subagent(session)
-                    elif self.on_root_terminal is not None:
-                        try:
-                            self.on_root_terminal(session, text)
-                        except Exception as exc:
-                            print(
-                                f'  [web:{session.label}] terminal notification error: '
-                                f'{terminal_error_summary(exc)}',
-                                flush=True,
-                            )
-                    return True
+
+                session.seen_fingerprints.add(fingerprint)
+                session.terminal_expectation = None
+                session.settling_fingerprint = None
+                progress_prefix = self.progress_prefix(routing_session_id)
+                header_prefix = f'{progress_prefix} ' if progress_prefix is not None else ''
+                ResponseProgress.commit_live()
+                print(flush=True)
+                print(
+                    f"{header_prefix}{progress_color('terminal response [complete]', '1;32')}",
+                    flush=True,
+                )
+
+                if parent is not None:
+                    message = (
+                        f'Subagent {routing_session_id} completed with terminal response:\n\n'
+                        + text.rstrip()
+                        + '\n'
+                    )
+                    parent.pending_responses.append(PendingResponse(message, message))
+                    session.retire_requested = True
+                    self.retire_subagent(session)
+                elif self.on_root_terminal is not None:
+                    try:
+                        self.on_root_terminal(session, text)
+                    except Exception as exc:
+                        print(
+                            f'  [web:{session.label}] terminal notification error: '
+                            f'{terminal_error_summary(exc)}',
+                            flush=True,
+                        )
+                return True
 
             session.settling_fingerprint = None
             return False
@@ -1461,48 +2005,21 @@ class WebSessionWatcher:
         if remaining > 0.0:
             if not self.rate_limit_suspended:
                 # The response callback already made one dismissal attempt. Try once
-                # more immediately before freezing in case React painted the dialog
-                # between the network event and this watcher iteration.
+                # more immediately in case React painted the dialog between the
+                # network event and this watcher iteration. The cooldown pauses PGC
+                # work only; do not freeze Chromium pages or alter focus emulation.
+                # Page.setWebLifecycleState('frozen') can leave a visible tab with a
+                # stale/blank compositor surface until Chrome receives a real focus or
+                # visibility transition.
                 for session in self.sessions.values():
                     self.interface.dismiss_rate_limit_dialog(session.page)
-                    if session.cdp_session is None:
-                        continue
-                    try:
-                        session.cdp_session.send(
-                            'Emulation.setFocusEmulationEnabled',
-                            {'enabled': False},
-                        )
-                        session.cdp_session.send(
-                            'Page.setWebLifecycleState',
-                            {'state': 'frozen'},
-                        )
-                    except Exception as exc:
-                        print(
-                            f'  [web:{session.label}] rate-limit suspension error: {exc}',
-                            flush=True,
-                        )
                 self.rate_limit_suspended = True
             return True
 
         if self.rate_limit_suspended:
             for session in self.sessions.values():
-                if session.cdp_session is not None:
-                    try:
-                        session.cdp_session.send(
-                            'Emulation.setFocusEmulationEnabled',
-                            {'enabled': True},
-                        )
-                        session.cdp_session.send(
-                            'Page.setWebLifecycleState',
-                            {'state': 'active'},
-                        )
-                    except Exception as exc:
-                        print(
-                            f'  [web:{session.label}] rate-limit resume error: {exc}',
-                            flush=True,
-                        )
-                # A modal that had not rendered before the freeze can materialize
-                # when the page becomes active again. Clear that before normal work.
+                # Clear any modal that appeared during the logical cooldown before
+                # normal watcher work resumes.
                 self.interface.dismiss_rate_limit_dialog(session.page)
             self.rate_limit_suspended = False
             print('  [web:rate-limit] cooldown complete; resuming PGC', flush=True)
@@ -1616,7 +2133,7 @@ def conversation_raw_text(message: dict[str, Any]) -> tuple[str, list[Any]]:
     return ''.join(part for part in raw_parts if isinstance(part, str)), raw_parts
 
 
-def active_conversation_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def active_conversation_protocol_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
     mapping = payload.get('mapping')
     current_node = payload.get('current_node')
     if not isinstance(mapping, dict) or not isinstance(current_node, str):
@@ -1656,6 +2173,7 @@ def active_conversation_messages(payload: dict[str, Any]) -> list[dict[str, Any]
         text = ''.join(parts)
         if not text:
             continue
+        metadata = message.get('metadata')
         records.append(
             {
                 'position': len(records),
@@ -1663,9 +2181,17 @@ def active_conversation_messages(payload: dict[str, Any]) -> list[dict[str, Any]
                 'role': role,
                 'timestamp': message.get('create_time'),
                 'text': text,
+                'metadata': metadata if isinstance(metadata, dict) else {},
             }
         )
     return records
+
+
+def active_conversation_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {key: value for key, value in record.items() if key != 'metadata'}
+        for record in active_conversation_protocol_messages(payload)
+    ]
 
 
 def export_conversation(
