@@ -369,6 +369,38 @@ def remember_conversation(
     ensure_session_ignored(cwd)
 
 
+def set_terminal_session_title(
+    browser_title: str,
+    *,
+    cwd: str = ".",
+    stream: Any | None = None,
+) -> None:
+    stream = sys.stdout if stream is None else stream
+    if not stream.isatty():
+        return
+    project = os.path.basename(os.path.abspath(cwd)) or os.path.abspath(cwd)
+    safe_browser_title = "".join(
+        character
+        for character in browser_title.strip()
+        if character not in {"\x07", "\x1b", "\n", "\r"}
+    )
+    if not safe_browser_title:
+        return
+    stream.write(f"\033]0;{project} · {safe_browser_title}\007")
+    stream.flush()
+
+
+def note_web_session_attached(session: Any, root_session_id: str, *, cwd: str = ".") -> None:
+    remember_conversation(session.conversation_id, session.label, cwd=cwd)
+    if session.routing_session_id != root_session_id:
+        return
+    try:
+        browser_title = session.page.title().strip()
+    except Exception:
+        browser_title = ""
+    set_terminal_session_title(browser_title or session.label, cwd=cwd)
+
+
 def choose_saved_conversation(history: list[dict[str, Any]]) -> str | None:
     if not history:
         return None
@@ -1246,9 +1278,9 @@ def main() -> None:
                 message=terminal_response_summary(text) or 'Task completed successfully.',
             ),
             root_conversation_id=root_conversation_id,
-            on_session_attached=lambda session: remember_conversation(
-                session.conversation_id,
-                session.label,
+            on_session_attached=lambda session: note_web_session_attached(
+                session,
+                session_id,
             ),
         )
         return

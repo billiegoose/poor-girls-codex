@@ -50,6 +50,57 @@ class InterfaceSelectionTests(unittest.TestCase):
             with open(os.path.join(cwd, '.pgc', 'conversations.json'), encoding='utf-8') as history_file:
                 self.assertIn('Cats renamed', history_file.read())
 
+    def test_terminal_session_title_uses_cwd_basename_and_browser_title(self) -> None:
+        stream = mock.Mock()
+        stream.isatty.return_value = True
+
+        pgc.set_terminal_session_title(
+            'Root Browser Title',
+            cwd='/tmp/projects/asgard',
+            stream=stream,
+        )
+
+        stream.write.assert_called_once_with('\033]0;asgard · Root Browser Title\007')
+        stream.flush.assert_called_once_with()
+
+    def test_terminal_session_title_is_not_written_when_stdout_is_not_a_tty(self) -> None:
+        stream = mock.Mock()
+        stream.isatty.return_value = False
+
+        pgc.set_terminal_session_title('Root Browser Title', stream=stream)
+
+        stream.write.assert_not_called()
+        stream.flush.assert_not_called()
+
+    def test_web_session_attachment_sets_title_for_root_only(self) -> None:
+        root = mock.Mock(
+            conversation_id='root-chat',
+            label='Cached Root Title',
+            routing_session_id='root',
+        )
+        root.page.title.return_value = 'Live Root Browser Title'
+        child = mock.Mock(
+            conversation_id='child-chat',
+            label='Child',
+            routing_session_id='root::worker',
+        )
+
+        with (
+            mock.patch.object(pgc, 'remember_conversation') as remember,
+            mock.patch.object(pgc, 'set_terminal_session_title') as set_title,
+        ):
+            pgc.note_web_session_attached(root, 'root')
+            pgc.note_web_session_attached(child, 'root')
+
+        self.assertEqual(
+            remember.call_args_list,
+            [
+                mock.call('root-chat', 'Cached Root Title', cwd='.'),
+                mock.call('child-chat', 'Child', cwd='.'),
+            ],
+        )
+        set_title.assert_called_once_with('Live Root Browser Title', cwd='.')
+
     def test_choose_saved_conversation_defaults_to_new_and_accepts_index(self) -> None:
         history = [
             {'conversation_id': 'a', 'title': 'Cats', 'last_seen': 2.0},
@@ -373,7 +424,7 @@ class InterfaceSelectionTests(unittest.TestCase):
             callback = kwargs['on_session_attached']
             session = mock.Mock(conversation_id='saved-chat', label='Saved chat')
             callback(session)
-            remember.assert_called_once_with('saved-chat', 'Saved chat')
+            remember.assert_called_once_with('saved-chat', 'Saved chat', cwd='.')
 
     def test_web_execution_strips_session_from_single_call(self) -> None:
         with mock.patch.object(pgc.toolcall_lib, 'execute', return_value={'ok': True}) as execute:
