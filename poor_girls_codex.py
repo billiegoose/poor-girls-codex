@@ -983,6 +983,7 @@ def show_startup_ui(
     *,
     clipboard_write,
     web_managed: bool = False,
+    web_backend_label: str = "connected Chrome profile",
     ntfy_topic: str | None = None,
 ) -> None:
     border = "+================================================================+"
@@ -996,7 +997,7 @@ def show_startup_ui(
     print(color(border, "1;36"))
     print()
     if web_managed:
-        print(f"  {color('[1]', '1;35')} Keep the connected Chrome profile running.")
+        print(f"  {color('[1]', '1;35')} Keep the {web_backend_label} running.")
         print(f"  {color('[2]', '1;35')} I'll attach to this PGC session or create a new ChatGPT tab.")
         print(f"  {color('[3]', '1;35')} Leave me running; I'll handle tool calls in the background.")
     else:
@@ -1192,7 +1193,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--interface",
-        choices=("chatgpt-web",),
+        choices=("chatgpt-web", "terminal-browser"),
         default="chatgpt-web",
         help="model-facing interface to use (default: chatgpt-web)",
     )
@@ -1226,6 +1227,62 @@ def main() -> None:
 
     if args.conversation_reference is not None:
         parser.error("conversation_reference is only valid with export-conversation")
+
+    if args.interface == "terminal-browser":
+        if args.mode != "watch":
+            raise SystemExit("terminal-browser currently supports watch mode only")
+        from terminal_browser import focus_open_root_conversation, run_terminal_browser_watcher
+
+        session_id = load_or_create_session_id()
+        ntfy_topic = load_ntfy_topic()
+        root_conversation_id = focus_open_root_conversation(
+            session_id=session_id,
+            validate_request=lambda request: validate_web_session_request(request, session_id),
+        )
+        if root_conversation_id is None:
+            conversation_history = load_conversation_history()
+            root_conversation_id = choose_saved_conversation(conversation_history)
+        bootstrap_prompt = root_web_bootstrap_prompt(session_id)
+        show_startup_ui(
+            bootstrap_prompt,
+            clipboard_write=lambda text: subprocess.run(
+                ["pbcopy"], input=text, text=True, check=True
+            ),
+            web_managed=True,
+            web_backend_label="terminal-browser instance",
+            ntfy_topic=ntfy_topic,
+        )
+        run_terminal_browser_watcher(
+            session_id=session_id,
+            bootstrap_prompt=bootstrap_prompt,
+            validate_request=lambda request: validate_web_session_request(request, session_id),
+            execute_request=lambda request, announce=False, tool_executor=None, progress_prefix=None: execute_web_session_request(
+                request,
+                session_id,
+                announce=announce,
+                tool_executor=tool_executor,
+                progress_prefix=progress_prefix,
+            ),
+            fenced_result=fenced_result,
+            too_long_fallback=too_long_fallback_for_request,
+            bootstrap_prompt_for_session=subagent_web_bootstrap_prompt,
+            on_root_terminal=lambda session, text: publish_ntfy_completion(
+                topic=ntfy_topic,
+                server=args.ntfy_server,
+                title=(
+                    'Task complete ('
+                    + (os.path.basename(os.path.abspath('.')) or os.path.abspath('.'))
+                    + ')'
+                ),
+                message=terminal_response_summary(text) or 'Task completed successfully.',
+            ),
+            root_conversation_id=root_conversation_id,
+            on_session_attached=lambda session: note_web_session_attached(
+                session,
+                session_id,
+            ),
+        )
+        return
 
     if args.interface == "chatgpt-web":
         if args.mode != "watch":

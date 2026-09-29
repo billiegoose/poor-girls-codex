@@ -426,6 +426,43 @@ class InterfaceSelectionTests(unittest.TestCase):
             callback(session)
             remember.assert_called_once_with('saved-chat', 'Saved chat', cwd='.')
 
+    def test_main_terminal_browser_selects_experimental_backend(self) -> None:
+        import terminal_browser
+
+        with (
+            mock.patch.object(
+                sys,
+                'argv',
+                ['poor_girls_codex.py', '--interface', 'terminal-browser'],
+            ),
+            mock.patch.object(pgc, 'load_or_create_session_id', return_value='root'),
+            mock.patch.object(pgc, 'load_ntfy_topic', return_value=''),
+            mock.patch.object(pgc, 'load_conversation_history', return_value=[]),
+            mock.patch.object(pgc, 'choose_saved_conversation', return_value=None),
+            mock.patch.object(pgc, 'show_startup_ui') as startup,
+            mock.patch.object(
+                terminal_browser,
+                'focus_open_root_conversation',
+                return_value='terminal-chat',
+            ) as focus_open,
+            mock.patch.object(terminal_browser, 'run_terminal_browser_watcher') as run_watcher,
+        ):
+            pgc.main()
+
+        focus_open.assert_called_once()
+        self.assertEqual(startup.call_args.kwargs['web_backend_label'], 'terminal-browser instance')
+        self.assertEqual(run_watcher.call_args.kwargs['root_conversation_id'], 'terminal-chat')
+        self.assertEqual(run_watcher.call_args.kwargs['session_id'], 'root')
+
+    def test_terminal_browser_non_watch_mode_is_rejected(self) -> None:
+        with mock.patch.object(
+            sys,
+            'argv',
+            ['poor_girls_codex.py', 'copy', '--interface', 'terminal-browser'],
+        ):
+            with self.assertRaisesRegex(SystemExit, 'terminal-browser currently supports watch mode only'):
+                pgc.main()
+
     def test_web_execution_strips_session_from_single_call(self) -> None:
         with mock.patch.object(pgc.toolcall_lib, 'execute', return_value={'ok': True}) as execute:
             result = pgc.execute_web_session_request(

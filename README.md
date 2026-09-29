@@ -197,7 +197,7 @@ Together they:
 
 ## Requirements
 
-Poor Girl's Codex currently uses Python 3.14, Playwright, and a Chromium browser launched with a CDP endpoint.
+Poor Girl's Codex uses Python 3.14. The default `chatgpt-web` backend uses Playwright and a Chromium browser launched with a CDP endpoint. The experimental `terminal-browser` backend instead requires the `terminal-browser` command and uses its bundled agent-browser transport.
 
 Install dependencies with the project's normal `uv` workflow, then grant Accessibility permission to the terminal application from which Poor Girl's Codex is launched:
 
@@ -280,3 +280,19 @@ The new tab receives the requested subagent prompt followed by the normal PGC bo
 A subagent returns completed work with `handoff {result}`. PGC queues that result onto the immediate parent conversation; nested subagents therefore hand off one level at a time. The root conversation has no parent and cannot use `handoff`.
 
 See `docs/chatgpt-web-poc.md` for architecture, browser requirements, DOM assumptions, and the live POC results.
+
+### Experimental terminal-browser backend
+
+PGC also has an experimental secondary transport for [terminal-browser](https://github.com/zenbu-labs/terminal-browser). The normal Playwright/CDP `chatgpt-web` backend remains the default.
+
+With `terminal-browser` installed, run:
+
+```bash
+./poor_girls_codex --interface terminal-browser
+```
+
+This backend first discovers the terminal-browser associated with the current terminal tab using `terminal-browser ls --json` and targets individual browser tabs through `terminal-browser action`. That terminal-tab scoping is ideal when Pixel has a pane adapter for the terminal. If the terminal is not pane-aware to Pixel, PGC falls back to `terminal-browser ls --all --json` and uses the browser only when exactly one is running; multiple global browsers are rejected as ambiguous. The backend reuses PGC's existing multi-conversation watcher, routing ids, delivery retries, and subagent orchestration, but browser interaction itself goes through terminal-browser/agent-browser rather than Playwright.
+
+On terminals that terminal-browser can manage directly, `terminal-browser new-tab` can create the browser when needed. iTerm2 supports the Kitty graphics protocol needed for rendering, but Pixel currently has no iTerm2 pane-management adapter. When PGC is launched from iTerm2 and no terminal-browser is running yet, PGC uses iTerm2's AppleScript API to split the current session vertically (creating a pane to the right with the same profile) and launches `terminal-browser open` there. Once running, PGC discovers and controls that browser through the unique-browser fallback. Existing ChatGPT tabs in that browser are discovered automatically. PGC never shuts down the user's terminal-browser process when it exits.
+
+This path is intentionally experimental. It currently uses ChatGPT DOM inspection for message discovery and composer submission, and subagent retirement closes its terminal-browser tab without attempting ChatGPT's UI-level Archive action.
