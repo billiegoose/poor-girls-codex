@@ -1267,6 +1267,70 @@ class ChatGPTWebTests(unittest.TestCase):
 
         self.assertEqual(watcher.sessions['a'].seen_fingerprints, {'older-toolcall'})
 
+    def test_new_root_conversation_skips_existing_sessions(self) -> None:
+        old_page = FakePage('https' + '://chatgpt.com/c/old', title='Older chat')
+        new_page = FakePage('https' + '://chatgpt.com/c/fresh', title='New chat')
+        created = web.WebSession('fresh', 'New chat', new_page)
+        interface = mock.Mock()
+        interface.pages.return_value = [old_page]
+        interface.describe_page.side_effect = lambda page: (
+            web.ChatGPTWeb.conversation_id_for_url(page.url), page.title(),
+        )
+        interface.latest_too_long_error_id.return_value = None
+        interface.create_root_conversation.return_value = created
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            new_root_conversation=True,
+        )
+        installed_handlers = []
+
+        def install_handler(signum, handler):
+            installed_handlers.append((signum, handler))
+
+        def stop_after_startup():
+            installed_handlers[0][1](web.signal.SIGINT, None)
+            return False
+
+        watcher.step = mock.Mock(side_effect=stop_after_startup)
+        with (
+            mock.patch.object(web.signal, 'getsignal', return_value=None),
+            mock.patch.object(web.signal, 'signal', side_effect=install_handler),
+            mock.patch('builtins.print'),
+        ):
+            watcher.run(bootstrap_prompt='BOOTSTRAP')
+
+        interface.create_root_conversation.assert_called_once_with('BOOTSTRAP')
+        interface.open_conversation.assert_not_called()
+        interface.recent_valid_request.assert_not_called()
+        self.assertEqual(watcher.ignored_conversation_ids, {'old'})
+        self.assertEqual(set(watcher.sessions), {'fresh'})
+        self.assertIs(watcher.sessions_by_routing_id['root'], created)
+        self.assertEqual(created.routing_session_id, 'root')
+
+        # Subsequent polls must not discover or claim the preexisting chat.
+        interface.pages.return_value = [old_page, new_page]
+        watcher.refresh_sessions()
+        self.assertEqual(set(watcher.sessions), {'fresh'})
+        self.assertIs(watcher.sessions_by_routing_id['root'], created)
+
+    def test_new_root_conversation_cannot_also_select_saved_root(self) -> None:
+        with self.assertRaisesRegex(ValueError, 'cannot select an existing root'):
+            web.WebSessionWatcher(
+                mock.Mock(),
+                validate_request=lambda request: None,
+                execute_request=mock.Mock(),
+                fenced_result=str,
+                too_long_fallback=lambda request, result: 'FALLBACK',
+                root_session_id='root',
+                root_conversation_id='saved-chat',
+                new_root_conversation=True,
+            )
+
     def test_ensure_root_session_opens_saved_conversation_when_tab_is_closed(self) -> None:
         interface = mock.Mock()
         resumed = web.WebSession('saved-chat', 'Saved chat', mock.Mock())
@@ -3925,6 +3989,172 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertEqual(session.last_too_long_error_id, 'existing-error')
         self.assertFalse(watcher.recover_rejected_submission(session))
         self.assertEqual(session.pending_responses, [])
+
+
+class IdleReloadTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.interface = mock.Mock(spec=web.ChatGPTWeb)
+        self.interface.latest_assistant_snapshot.return_value = web.AssistantSnapshot('a1', (), 'Done.')
+        self.interface.valid_request_from_snapshot.return_value = None
+        self.interface.invalid_json_from_snapshot.return_value = None
+        self.interface.invalid_request_from_snapshot.return_value = None
+        self.interface.is_generating.return_value = False
+        self.interface.latest_user_message.return_value = ('u1', 'RESULT')
+        self.interface.composer_text.return_value = ''
+        self.interface.rate_limit_remaining.return_value = 0.0
+        self.interface.conversation_protocol_state.return_value = web.ConversationProtocolState(
+            routing_session_id='root', terminal_response=('Done.', 'terminal-fp'),
+        )
+        self.callback = mock.Mock()
+        self.now = 0.0
+        self.watcher = web.WebSessionWatcher(
+            self.interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(return_value={'ok': True}),
+            fenced_result=lambda result: 'RESULT',
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+            on_root_terminal=self.callback,
+            settle_seconds=0.0,
+            clock=lambda: self.now,
+        )
+        self.session = web.WebSession('a', 'Cats', mock.Mock(), routing_session_id='root')
+        self.watcher.sessions = {'a': self.session}
+        self.watcher.refresh_sessions = mock.Mock()
+
+    def complete(self) -> None:
+        self.assertFalse(self.watcher.step())
+        self.assertTrue(self.watcher.step())
+        self.assertEqual(self.session.next_idle_reload_at, 300.0)
+
+    def test_reloads_every_five_minutes_without_repeating_completion(self) -> None:
+        self.complete()
+        for self.now in (299.0, 300.0, 599.0, 600.0):
+            self.watcher.step()
+        self.assertEqual(self.interface.reload_session.call_args_list, [
+            mock.call(self.session), mock.call(self.session),
+        ])
+        self.callback.assert_called_once_with(self.session, 'Done.')
+        self.watcher.execute_request.assert_not_called()
+        self.assertEqual(self.session.seen_fingerprints, {'terminal-fp'})
+
+    def test_remote_tool_call_after_reload_executes_once(self) -> None:
+        self.complete()
+        self.now = 300.0
+        self.watcher.step()
+        self.interface.latest_user_message.return_value = ('phone-user', 'Keep going')
+        self.interface.valid_request_from_snapshot.return_value = (
+            '{}', {'session': 'root', 'tool': 'status'}, 'remote-tool-fp',
+        )
+        for self.now in (301.0, 302.0, 601.0):
+            self.watcher.step()
+        self.watcher.execute_request.assert_called_once()
+        self.interface.reload_session.assert_called_once_with(self.session)
+        self.assertIsNone(self.session.next_idle_reload_at)
+
+    def test_generation_cancels_timer_and_restarts_after_completion(self) -> None:
+        self.complete()
+        self.interface.is_generating.return_value = True
+        self.now = 300.0
+        self.watcher.step()
+        self.assertIsNone(self.session.next_idle_reload_at)
+        self.interface.is_generating.return_value = False
+        self.now = 310.0
+        self.watcher.step()
+        self.assertEqual(self.session.next_idle_reload_at, 610.0)
+        self.interface.reload_session.assert_not_called()
+
+    def test_new_user_turn_cancels_idle_reload_while_waiting_for_reply(self) -> None:
+        self.complete()
+        self.interface.latest_user_message.return_value = ('u2', 'Next task')
+        self.interface.conversation_protocol_state.return_value = web.ConversationProtocolState(
+            routing_session_id='root',
+        )
+        self.now = 300.0
+        self.watcher.step()
+        self.assertIsNone(self.session.next_idle_reload_at)
+        self.interface.reload_session.assert_not_called()
+
+    def test_draft_defers_reload_until_composer_is_empty(self) -> None:
+        self.complete()
+        self.interface.composer_text.return_value = 'Unsent draft'
+        self.now = 300.0
+        self.watcher.step()
+        self.interface.reload_session.assert_not_called()
+        self.interface.composer_text.return_value = ''
+        self.now = 301.0
+        self.watcher.step()
+        self.interface.reload_session.assert_called_once_with(self.session)
+
+    def test_busy_sessions_never_reload(self) -> None:
+        for state in (
+            {'pending_responses': [web.PendingResponse('RESULT', 'FALLBACK')]},
+            {'terminal_expectation': web.TerminalExpectation('RESULT', 'u0')},
+            {'settling_fingerprint': 'new-terminal'},
+            {'retire_requested': True},
+        ):
+            with self.subTest(state=state):
+                session = web.WebSession('b', 'Dogs', mock.Mock(), next_idle_reload_at=300.0, **state)
+                self.assertFalse(self.watcher.reload_idle_session(session, 300.0))
+                self.assertIsNone(session.next_idle_reload_at)
+        self.interface.reload_session.assert_not_called()
+
+    def test_reload_failure_waits_another_five_minutes(self) -> None:
+        self.complete()
+        self.interface.reload_session.side_effect = RuntimeError('navigation timed out')
+        for self.now in (300.0, 301.0, 599.0):
+            with mock.patch('builtins.print'):
+                self.watcher.step()
+        self.interface.reload_session.assert_called_once_with(self.session)
+        self.assertEqual(self.session.next_idle_reload_at, 600.0)
+
+    def test_playwright_reload_waits_for_page(self) -> None:
+        web.ChatGPTWeb().reload_session(self.session)
+        self.session.page.reload.assert_called_once_with(wait_until='domcontentloaded', timeout=30_000)
+
+    def test_idle_without_a_terminal_response_does_not_reload(self) -> None:
+        self.interface.conversation_protocol_state.return_value = web.ConversationProtocolState(
+            routing_session_id='root',
+        )
+        for self.now in (0.0, 300.0, 600.0):
+            self.watcher.step()
+        self.interface.reload_session.assert_not_called()
+
+    def test_each_session_has_its_own_reload_deadline(self) -> None:
+        self.complete()
+        other = web.WebSession('b', 'Dogs', mock.Mock(), routing_session_id='root')
+        self.watcher.sessions['b'] = other
+        for self.now in (100.0, 101.0, 300.0):
+            self.watcher.step()
+        self.interface.reload_session.assert_called_once_with(self.session)
+        self.now = 401.0
+        self.watcher.step()
+        self.assertEqual(self.interface.reload_session.call_args_list, [
+            mock.call(self.session), mock.call(other),
+        ])
+
+    def test_terminal_browser_stays_idle_after_terminal_expectation_clears(self) -> None:
+        interface = mock.Mock()
+        interface.rate_limit_remaining.return_value = 0.0
+        interface.valid_request.return_value = None
+        interface.invalid_json_candidate.return_value = None
+        interface.invalid_request_candidate.return_value = None
+        interface.is_generating.return_value = False
+        interface.latest_user_message.return_value = ('u1', 'RESULT')
+        interface.terminal_response_candidate.return_value = ('Done.', 'terminal-fp')
+        interface.composer_text.return_value = ''
+        self.watcher.interface = interface
+        self.session.terminal_expectation = web.TerminalExpectation('RESULT', 'u0', 'u1')
+        self.complete()
+        self.assertIsNone(self.session.terminal_expectation)
+        for self.now in (300.0, 600.0):
+            self.watcher.step()
+        self.assertEqual(interface.reload_session.call_count, 2)
+        interface.latest_user_message.return_value = ('u2', 'Next task')
+        self.now = 900.0
+        self.watcher.step()
+        self.assertEqual(interface.reload_session.call_count, 2)
+        self.assertIsNone(self.session.next_idle_reload_at)
 
 
 if __name__ == '__main__':

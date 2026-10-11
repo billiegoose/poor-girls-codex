@@ -22,8 +22,7 @@ DEFAULT_COMMAND = "terminal-browser"
 CHATGPT_URL = "https" + "://chatgpt.com/"
 TAB_START_TIMEOUT_SECONDS = 15.0
 TAB_START_POLL_SECONDS = 0.1
-SUBMIT_ATTEMPTS = 3
-SUBMIT_HYDRATION_SETTLE_SECONDS = 0.5
+SUBMIT_COMPOSER_TIMEOUT_SECONDS = 15.0
 SUBMIT_VERIFY_TIMEOUT_SECONDS = 2.0
 
 
@@ -436,6 +435,9 @@ class TerminalBrowserChatGPT:
         )
         return value is True
 
+    def reload_session(self, session: WebSession) -> None:
+        self.action(session.page, "reload", timeout=30.0)
+
     def terminal_response_candidate(
         self,
         session: WebSession,
@@ -464,10 +466,51 @@ class TerminalBrowserChatGPT:
             return text, hashlib.sha256(identity.encode("utf-8")).hexdigest()
         return None
 
-    def latest_too_long_error_id(self, session: WebSession) -> str | None:
+    def composer_text(self, session: WebSession) -> str | None:
         value = self.eval(
             session.page,
-            "(() => document.body.innerText.includes(" + json.dumps(MESSAGE_TOO_LONG_TEXT) + "))()",
+            r"""(() => {
+  const composer = [...document.querySelectorAll('[contenteditable="true"]')]
+    .find(e => (e.getAttribute('aria-label') || '') === 'Ask ChatGPT');
+  if (!composer) return null;
+
+  // ProseMirror represents semantic fill/paste multiline text as one direct
+  // block per logical line. innerText inserts an extra display newline between
+  // those blocks, so reconstruct the actual submitted text from the blocks.
+  const children = [...composer.children];
+  if (children.length > 0) {
+    return children.map(child => child.textContent || '').join('\n');
+  }
+  return composer.textContent || '';
+})()""",
+        )
+        return value if isinstance(value, str) else None
+
+    def can_submit(self, session: WebSession) -> bool:
+        value = self.eval(
+            session.page,
+            r"""(() => {
+  const send = [...document.querySelectorAll('button')].find(button => {
+    const label = (button.getAttribute('aria-label') || '').trim();
+    const testid = (button.getAttribute('data-testid') || '').trim();
+    return label === 'Send' || label === 'Send prompt' || testid === 'send-button';
+  });
+  return !!send && !send.disabled && !!(
+    send.offsetWidth || send.offsetHeight || send.getClientRects().length
+  );
+})()""",
+        )
+        return value is True
+
+    def latest_too_long_error_id(self, session: WebSession) -> str | None:
+        # The redesigned UI puts this error in an aria-hidden transition layer,
+        # so body.innerText omits it. Read textContent from that narrow layer.
+        value = self.eval(
+            session.page,
+            """(() => [...document.querySelectorAll('div > .overflow-hidden > .absolute')]
+  .some(e => (e.textContent || '').includes("""
+            + json.dumps(MESSAGE_TOO_LONG_TEXT)
+            + ")))()",
         )
         if value is not True:
             return None
@@ -490,41 +533,67 @@ class TerminalBrowserChatGPT:
         return
 
     def submit(self, session: WebSession, text: str) -> None:
-        before = self.latest_user_message(session)
-        normalized_text = self.normalize_message_text(text)
+        # Match the proven Playwright transport contract: wait for the real
+        # composer, verify that it contains exactly the intended logical text,
+        # wait for Send to become enabled, then click Send once. Never resubmit
+        # merely because the transcript is slow to expose the new user turn.
+        hydration_deadline = time.monotonic() + SUBMIT_COMPOSER_TIMEOUT_SECONDS
+        current_text = self.composer_text(session)
+        while current_text is None:
+            if time.monotonic() >= hydration_deadline:
+                raise RuntimeError(f"{session.label}: ChatGPT composer not found")
+            time.sleep(TAB_START_POLL_SECONDS)
+            current_text = self.composer_text(session)
 
-        for attempt in range(SUBMIT_ATTEMPTS):
-            try:
-                # Stay at terminal-browser's semantic layer: locate the active composer
-                # by accessibility role and use native browser input. A freshly opened
-                # ChatGPT tab can still be hydrating after the textbox first appears, so
-                # let that settle before filling. Fill exactly once: on contenteditables,
-                # repeating agent-browser's semantic fill can append instead of replace.
-                time.sleep(SUBMIT_HYDRATION_SETTLE_SECONDS)
-                self.action(session.page, "find", "role", "textbox", "fill", text)
-                self.action(session.page, "press", "Enter")
-            except RuntimeError:
-                if self.latest_too_long_error_id(session) is not None:
-                    raise MessageTooLongError(f"{session.label}: ChatGPT message is too long")
-                if attempt + 1 >= SUBMIT_ATTEMPTS:
-                    raise
-                time.sleep(SUBMIT_HYDRATION_SETTLE_SECONDS)
-                continue
+        # agent-browser's semantic `fill` appends to ChatGPT's ProseMirror
+        # contenteditable when a restored draft is already present. Clear the
+        # editor explicitly, then use inserttext (the browser-level paste-like
+        # operation). This preserves multiline payloads exactly in ProseMirror.
+        self.action(
+            session.page,
+            "find",
+            "role",
+            "textbox",
+            "click",
+            "--name",
+            "Ask ChatGPT",
+            "--exact",
+        )
+        self.action(session.page, "press", "Meta+a")
+        self.action(session.page, "press", "Backspace")
+        self.action(session.page, "keyboard", "inserttext", text)
 
-            deadline = time.monotonic() + SUBMIT_VERIFY_TIMEOUT_SECONDS
-            while time.monotonic() < deadline:
-                latest = self.latest_user_message(session)
-                if latest is not None:
-                    changed = before is None or latest != before
-                    if changed and self.normalize_message_text(latest[1]) == normalized_text:
-                        return
-                time.sleep(TAB_START_POLL_SECONDS)
-
+        deadline = time.monotonic() + SUBMIT_VERIFY_TIMEOUT_SECONDS
+        current_text = self.composer_text(session)
+        while current_text != text or not self.can_submit(session):
             if self.latest_too_long_error_id(session) is not None:
                 raise MessageTooLongError(f"{session.label}: ChatGPT message is too long")
-            time.sleep(SUBMIT_HYDRATION_SETTLE_SECONDS)
 
-        raise RuntimeError(f"{session.label}: ChatGPT did not record the submitted message")
+            if time.monotonic() >= deadline:
+                if current_text is None:
+                    raise RuntimeError(f"{session.label}: ChatGPT composer not found")
+                if current_text != text:
+                    raise RuntimeError(f"{session.label}: ChatGPT composer did not retain submitted text")
+                raise RuntimeError(f"{session.label}: ChatGPT send button is not available")
+
+            time.sleep(TAB_START_POLL_SECONDS)
+            current_text = self.composer_text(session)
+
+        try:
+            self.action(
+                session.page,
+                "find",
+                "role",
+                "button",
+                "click",
+                "--name",
+                "Send",
+                "--exact",
+            )
+        except RuntimeError:
+            if self.latest_too_long_error_id(session) is not None:
+                raise MessageTooLongError(f"{session.label}: ChatGPT message is too long")
+            raise
 
     @staticmethod
     def _iterm_session_uuid() -> str | None:
@@ -790,6 +859,7 @@ def run_terminal_browser_watcher(
     bootstrap_prompt_for_session: Callable[[str], str] | None = None,
     on_root_terminal: Callable[[WebSession, str], None] | None = None,
     root_conversation_id: str | None = None,
+    new_root_conversation: bool = False,
     on_session_attached: Callable[[WebSession], None] | None = None,
     command: str = DEFAULT_COMMAND,
 ) -> None:
@@ -806,6 +876,7 @@ def run_terminal_browser_watcher(
             bootstrap_prompt_for_session=bootstrap_prompt_for_session,
             on_root_terminal=on_root_terminal,
             root_conversation_id=root_conversation_id,
+            new_root_conversation=new_root_conversation,
             on_session_attached=on_session_attached,
         ).run(bootstrap_prompt=bootstrap_prompt)
     finally:

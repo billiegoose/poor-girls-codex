@@ -426,6 +426,50 @@ class InterfaceSelectionTests(unittest.TestCase):
             callback(session)
             remember.assert_called_once_with('saved-chat', 'Saved chat', cwd='.')
 
+    def test_main_new_conversation_bypasses_selection_for_both_interfaces(self) -> None:
+        import chatgpt_web
+        import terminal_browser
+
+        for interface_name, backend, runner_name in (
+            ('chatgpt-web', chatgpt_web, 'run_web_watcher'),
+            ('terminal-browser', terminal_browser, 'run_terminal_browser_watcher'),
+        ):
+            for flag in ('--new', '--new-conversation'):
+                with (
+                    self.subTest(interface=interface_name, flag=flag),
+                    mock.patch.object(sys, 'argv', [
+                        'poor_girls_codex.py', '--interface', interface_name, flag,
+                    ]),
+                    mock.patch.object(pgc, 'load_or_create_session_id', return_value='root'),
+                    mock.patch.object(pgc, 'load_ntfy_topic', return_value=''),
+                    mock.patch.object(pgc, 'load_conversation_history') as load_history,
+                    mock.patch.object(pgc, 'choose_saved_conversation') as choose_saved,
+                    mock.patch.object(pgc, 'show_startup_ui'),
+                    mock.patch.object(backend, 'focus_open_root_conversation') as focus_open,
+                    mock.patch.object(backend, runner_name) as run_watcher,
+                ):
+                    pgc.main()
+                    load_history.assert_not_called()
+                    choose_saved.assert_not_called()
+                    focus_open.assert_not_called()
+                    run_watcher.assert_called_once()
+                    self.assertIsNone(run_watcher.call_args.kwargs['root_conversation_id'])
+                    self.assertTrue(run_watcher.call_args.kwargs['new_root_conversation'])
+                    self.assertEqual(run_watcher.call_args.kwargs['session_id'], 'root')
+
+    def test_new_conversation_flag_rejects_non_watch_mode(self) -> None:
+        for flag in ('--new', '--new-conversation'):
+            with (
+                self.subTest(flag=flag),
+                mock.patch.object(sys, 'argv', [
+                    'poor_girls_codex.py', 'export-conversation', 'abc', flag,
+                ]),
+                mock.patch('sys.stderr'),
+                self.assertRaises(SystemExit) as error,
+            ):
+                pgc.main()
+            self.assertEqual(error.exception.code, 2)
+
     def test_main_terminal_browser_selects_experimental_backend(self) -> None:
         import terminal_browser
 

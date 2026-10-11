@@ -34,6 +34,7 @@ CHROME_CDP_STARTUP_TIMEOUT_SECONDS = 10.0
 CHROME_CDP_RETRY_SECONDS = 0.25
 DEFAULT_SETTLE_SECONDS = 0.35
 DEFAULT_POLL_SECONDS = 0.25
+IDLE_RELOAD_SECONDS = 5.0 * 60.0
 SUBMIT_SETTLE_TIMEOUT_SECONDS = 2.0
 SUBMIT_SETTLE_POLL_SECONDS = 0.05
 RECENT_ASSISTANT_MESSAGE_LIMIT = 10
@@ -133,6 +134,8 @@ class WebSession:
     terminal_expectation: TerminalExpectation | None = None
     cdp_session: Any | None = None
     recovered_from_dom: bool = False
+    next_idle_reload_at: float | None = None
+    idle_terminal_user_message_id: str | None = None
 
     @property
     def url(self) -> str:
@@ -990,6 +993,9 @@ class ChatGPTWeb:
         button = self.stop_button(session.page)
         return button.count() > 0 and button.last.is_visible()
 
+    def reload_session(self, session: WebSession) -> None:
+        session.page.reload(wait_until='domcontentloaded', timeout=30_000)
+
     def latest_too_long_error_id(self, session: WebSession) -> str | None:
         matches = session.page.get_by_text(MESSAGE_TOO_LONG_TEXT, exact=True)
         for index in range(matches.count() - 1, -1, -1):
@@ -1295,6 +1301,7 @@ class WebSessionWatcher:
         bootstrap_prompt_for_session: Callable[[str], str] | None = None,
         on_root_terminal: Callable[[WebSession, str], None] | None = None,
         root_conversation_id: str | None = None,
+        new_root_conversation: bool = False,
         on_session_attached: Callable[[WebSession], None] | None = None,
         settle_seconds: float = DEFAULT_SETTLE_SECONDS,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
@@ -1308,7 +1315,11 @@ class WebSessionWatcher:
         self.root_session_id = root_session_id
         self.bootstrap_prompt_for_session = bootstrap_prompt_for_session
         self.on_root_terminal = on_root_terminal
+        if new_root_conversation and root_conversation_id is not None:
+            raise ValueError('cannot select an existing root conversation with --new')
         self.root_conversation_id = root_conversation_id
+        self.new_root_conversation = new_root_conversation
+        self.ignored_conversation_ids: set[str] = set()
         self.on_session_attached = on_session_attached
         self.settle_seconds = settle_seconds
         self.poll_seconds = poll_seconds
@@ -1415,6 +1426,12 @@ class WebSessionWatcher:
         attached = self.sessions_by_routing_id.get(self.root_session_id)
         if attached is not None:
             return attached
+
+        if self.new_root_conversation:
+            created = self.interface.create_root_conversation(bootstrap_prompt)
+            self.sessions[created.conversation_id] = created
+            self.bind_routing_session(created, self.root_session_id)
+            return created
 
         if self.root_conversation_id is not None:
             preferred = self.sessions.get(self.root_conversation_id)
@@ -1544,6 +1561,8 @@ class WebSessionWatcher:
                     # and this refresh pass examining it (for example back to '/').
                     # Treat it as no longer live instead of crashing the watcher.
                     continue
+            if conversation_id in self.ignored_conversation_ids:
+                continue
             live.add(conversation_id)
             session = self.sessions.get(conversation_id)
             if session is None:
@@ -1616,7 +1635,42 @@ class WebSessionWatcher:
         if message_id != expectation.user_message_id:
             session.terminal_expectation = None
 
+    def arm_idle_reload(self, session: WebSession, now: float) -> None:
+        if session.next_idle_reload_at is not None:
+            return
+        latest_user = self.interface.latest_user_message(session)
+        if isinstance(latest_user, tuple) and latest_user[0] is not None:
+            session.idle_terminal_user_message_id = latest_user[0]
+            session.next_idle_reload_at = now + IDLE_RELOAD_SECONDS
+
+    def reload_idle_session(self, session: WebSession, now: float) -> bool:
+        if (
+            session.pending_responses
+            or session.terminal_expectation is not None
+            or session.settling_fingerprint is not None
+            or session.retire_requested
+        ):
+            session.next_idle_reload_at = None
+            return False
+        if session.next_idle_reload_at is None or now < session.next_idle_reload_at:
+            return False
+        if self.interface.is_generating(session):
+            session.next_idle_reload_at = None
+            return False
+        # Leave a draft alone, including while the user is typing at the deadline.
+        draft = self.interface.composer_text(session)
+        if draft is None or draft.strip():
+            return False
+        # Space failures out as well, rather than retrying on every watcher tick.
+        session.next_idle_reload_at = now + IDLE_RELOAD_SECONDS
+        self.interface.reload_session(session)
+        return True
+
     def scan_session(self, session: WebSession, now: float) -> bool:
+        if session.next_idle_reload_at is not None:
+            latest_user = self.interface.latest_user_message(session)
+            if not isinstance(latest_user, tuple) or latest_user[0] != session.idle_terminal_user_message_id:
+                session.next_idle_reload_at = None
         if not isinstance(self.interface, ChatGPTWeb):
             self.resolve_terminal_expectation(session)
         snapshot = (
@@ -1638,6 +1692,7 @@ class WebSessionWatcher:
                 and self.subagent_name(session.routing_session_id) is not None
             )
             if generating and not recover_terminal_while_generating:
+                session.next_idle_reload_at = None
                 session.settling_fingerprint = None
                 return False
 
@@ -1670,6 +1725,7 @@ class WebSessionWatcher:
                         invalid_request = None
 
             if invalid_json is not None or invalid_request is not None:
+                session.next_idle_reload_at = None
                 session.terminal_expectation = None
                 if invalid_json is not None:
                     _, detail, fingerprint = invalid_json
@@ -1712,6 +1768,7 @@ class WebSessionWatcher:
                 return True
 
             if foreign_invalid_request:
+                session.next_idle_reload_at = None
                 session.settling_fingerprint = None
                 return False
 
@@ -1722,6 +1779,7 @@ class WebSessionWatcher:
                     self.validate_request,
                 )
                 if not self.accepts_routing_session_id(protocol.routing_session_id):
+                    session.next_idle_reload_at = None
                     session.settling_fingerprint = None
                     return False
                 if session.routing_session_id is None and protocol.routing_session_id is not None:
@@ -1748,6 +1806,7 @@ class WebSessionWatcher:
                 if fingerprint in session.seen_fingerprints:
                     session.terminal_expectation = None
                     session.settling_fingerprint = None
+                    self.arm_idle_reload(session, now)
                     return False
                 if session.settling_fingerprint != fingerprint:
                     session.settling_fingerprint = fingerprint
@@ -1796,11 +1855,16 @@ class WebSessionWatcher:
                             f'{terminal_error_summary(exc)}',
                             flush=True,
                         )
+                if parent is None:
+                    self.arm_idle_reload(session, now)
                 return True
 
+            if isinstance(self.interface, ChatGPTWeb):
+                session.next_idle_reload_at = None
             session.settling_fingerprint = None
             return False
 
+        session.next_idle_reload_at = None
         _, request, fingerprint = candidate
         routing_session_id = self.request_session_id(request)
         if routing_session_id is None:
@@ -1935,6 +1999,7 @@ class WebSessionWatcher:
     def deliver_session(self, session: WebSession, now: float) -> bool:
         if not session.pending_responses:
             return False
+        session.next_idle_reload_at = None
         self.raise_if_delivery_timed_out(session, now)
         if now < session.next_delivery_at:
             return False
@@ -2048,6 +2113,7 @@ class WebSessionWatcher:
             try:
                 progressed = self.recover_rejected_submission(session) or progressed
                 progressed = self.scan_session(session, now) or progressed
+                progressed = self.reload_idle_session(session, now) or progressed
             except Exception as exc:
                 print(f'  [web:{session.label}] scan error: {exc}', flush=True)
 
@@ -2066,7 +2132,14 @@ class WebSessionWatcher:
         return progressed
 
     def run(self, *, bootstrap_prompt: str = '') -> None:
-        self.refresh_sessions()
+        if self.new_root_conversation:
+            # Do not reattach or execute requests from tabs that predate --new.
+            # They may share this directory's persistent routing id.
+            self.refresh_sessions(prime_new=False)
+            self.ignored_conversation_ids.update(self.sessions)
+            self.sessions.clear()
+        else:
+            self.refresh_sessions()
         root = self.ensure_root_session(bootstrap_prompt) if self.root_session_id is not None else None
         if self.root_session_id is not None:
             print(
@@ -2283,6 +2356,7 @@ def run_web_watcher(
     bootstrap_prompt_for_session: Callable[[str], str] | None = None,
     on_root_terminal: Callable[[WebSession, str], None] | None = None,
     root_conversation_id: str | None = None,
+    new_root_conversation: bool = False,
     on_session_attached: Callable[[WebSession], None] | None = None,
 ) -> None:
     interface = ChatGPTWeb(cdp_url)
@@ -2298,6 +2372,7 @@ def run_web_watcher(
             bootstrap_prompt_for_session=bootstrap_prompt_for_session,
             on_root_terminal=on_root_terminal,
             root_conversation_id=root_conversation_id,
+            new_root_conversation=new_root_conversation,
             on_session_attached=on_session_attached,
         ).run(bootstrap_prompt=bootstrap_prompt)
     finally:

@@ -269,6 +269,18 @@ poor_girls_codex --interface chatgpt-web
 
 Chrome must already be running with a remote-debugging endpoint. The default is `http://127.0.0.1:9222`; use `--cdp-url` to override it. Each open `chatgpt.com/c/...` tab becomes an independent session with its own tool-call fingerprints, pending results, and delivery retries. New conversation tabs are discovered automatically. PGC does not foreground, focus, launch, or close the browser.
 
+After a terminal response, PGC reloads the idle conversation every five minutes so messages sent from another device become visible. The timer stops when activity resumes, and reloads wait while the composer contains a draft. This applies to both browser backends.
+
+To start a **fresh ChatGPT conversation without the interactive conversation picker**, pass `--new` (also spelled `--new-conversation`):
+
+```bash
+poor_girls_codex --interface chatgpt-web --new
+# Or with the experimental terminal-browser interface:
+poor_girls_codex --interface terminal-browser --new
+```
+
+This skips both discovery of an already-open root conversation and the saved-conversation picker, and instructs the watcher to create a new root tab even if an older session is open. It does not clear conversation history or rotate the working directory's routing id. For a different codebase, launch the PGC executable with that project's directory as the working directory (for example, from `../fpgatool`). PGC's `run` tool waits for its child process to exit, so launching another long-running watcher through `run` requires detaching the child and redirecting its standard streams.
+
 Each working directory gets a persistent opaque routing id in `.pgc/session`. Every executable web tool request must repeat that id in a top-level `"session"` field. This lets multiple PGC processes watch the same browser while only executing requests for their own project. PGC automatically adds `.pgc/session` to that Git checkout's local `info/exclude`, so the routing id stays local and uncommitted.
 
 ### Web subagents
@@ -295,4 +307,4 @@ This backend first discovers the terminal-browser associated with the current te
 
 On terminals that terminal-browser can manage directly, `terminal-browser new-tab` can create the browser when needed. iTerm2 supports the Kitty graphics protocol needed for rendering, but Pixel currently has no iTerm2 pane-management adapter. When PGC is launched from iTerm2 and the current iTerm tab has no terminal-browser yet, PGC uses iTerm2's AppleScript API to split the current session vertically (creating a pane to the right with the same profile) and launches `terminal-browser open` there. That new pane's TTY becomes part of the current tab's ownership set, so subsequent ChatGPT conversations and subagents stay inside that browser. Existing ChatGPT tabs in the tab-owned browser are discovered automatically. PGC never shuts down the user's terminal-browser process when it exits.
 
-This path is intentionally experimental. Message discovery still uses a small amount of ChatGPT DOM inspection, while composer submission stays at terminal-browser's semantic accessibility layer (`find role textbox fill ...` followed by a native Enter keypress) with hydration-safe verification and retry. Subagent retirement closes its terminal-browser tab without attempting ChatGPT's UI-level Archive action.
+This path is intentionally experimental. Message discovery still uses a small amount of ChatGPT DOM inspection. Composer submission uses terminal-browser's semantic accessibility layer to focus the ChatGPT textbox, explicitly clears any restored draft, inserts the payload with agent-browser's paste-like `keyboard inserttext` operation, verifies the exact logical ProseMirror text and enabled Send button, then clicks Send exactly once. This avoids both contenteditable append behavior and duplicate delivery when ChatGPT is slow to expose the submitted turn. Submission-too-long errors are detected from ChatGPT's hidden transition layer so PGC can fall back to the compact result without re-executing tools. Subagent retirement closes its terminal-browser tab without attempting ChatGPT's UI-level Archive action.

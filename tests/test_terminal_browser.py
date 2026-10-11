@@ -323,57 +323,172 @@ class TerminalBrowserTests(unittest.TestCase):
         with mock.patch.object(interface, "transcript", return_value=newer_user):
             self.assertIsNone(interface.terminal_response_candidate(session, "u1"))
 
-    def test_submit_uses_semantic_fill_and_native_enter(self) -> None:
+    def test_submit_waits_for_composer_hydration_before_inserting(self) -> None:
         interface = tb.TerminalBrowserChatGPT()
         page = self.make_page(interface)
         session = WebSession("abc", "Cats", page)
         with (
-            mock.patch.object(interface, "action") as action,
             mock.patch.object(
                 interface,
-                "latest_user_message",
-                side_effect=[None, ("u1", "RESULT")],
+                "composer_text",
+                side_effect=[None, None, "", "RESULT"],
             ),
-            mock.patch("terminal_browser.time.sleep"),
+            mock.patch.object(interface, "can_submit", return_value=True),
+            mock.patch.object(interface, "latest_too_long_error_id", return_value=None),
+            mock.patch.object(interface, "action") as action,
+            mock.patch("terminal_browser.time.sleep") as sleep,
+            mock.patch("terminal_browser.time.monotonic", side_effect=[0.0, 0.1, 0.2, 0.3]),
         ):
             interface.submit(session, "RESULT")
 
+        self.assertGreaterEqual(sleep.call_count, 2)
         self.assertEqual(
-            action.call_args_list,
+            action.call_args_list[:4],
             [
-                mock.call(page, "find", "role", "textbox", "fill", "RESULT"),
-                mock.call(page, "press", "Enter"),
+                mock.call(
+                    page,
+                    "find",
+                    "role",
+                    "textbox",
+                    "click",
+                    "--name",
+                    "Ask ChatGPT",
+                    "--exact",
+                ),
+                mock.call(page, "press", "Meta+a"),
+                mock.call(page, "press", "Backspace"),
+                mock.call(page, "keyboard", "inserttext", "RESULT"),
             ],
         )
 
-    def test_submit_retries_when_hydration_loses_first_message(self) -> None:
+    def test_submit_clears_stale_draft_inserts_exact_text_and_clicks_send_once(self) -> None:
         interface = tb.TerminalBrowserChatGPT()
         page = self.make_page(interface)
         session = WebSession("abc", "Cats", page)
         with (
-            mock.patch.object(interface, "action") as action,
-            mock.patch.object(
-                interface,
-                "latest_user_message",
-                side_effect=[None, ("u1", "RESULT")],
-            ),
+            mock.patch.object(interface, "composer_text", side_effect=["stale draft", "RESULT"]),
+            mock.patch.object(interface, "can_submit", return_value=True),
             mock.patch.object(interface, "latest_too_long_error_id", return_value=None),
+            mock.patch.object(interface, "action") as action,
             mock.patch("terminal_browser.time.sleep"),
-            mock.patch("terminal_browser.time.monotonic") as monotonic,
         ):
-            # Attempt 1: deadline=2, first check=3 => verification timeout.
-            # Attempt 2: deadline=6, first check=4 => observe the user turn.
-            monotonic.side_effect = [0.0, 3.0, 4.0, 4.0]
             interface.submit(session, "RESULT")
 
-        self.assertEqual(action.call_count, 4)
         self.assertEqual(
             action.call_args_list,
             [
-                mock.call(page, "find", "role", "textbox", "fill", "RESULT"),
-                mock.call(page, "press", "Enter"),
-                mock.call(page, "find", "role", "textbox", "fill", "RESULT"),
-                mock.call(page, "press", "Enter"),
+                mock.call(
+                    page,
+                    "find",
+                    "role",
+                    "textbox",
+                    "click",
+                    "--name",
+                    "Ask ChatGPT",
+                    "--exact",
+                ),
+                mock.call(page, "press", "Meta+a"),
+                mock.call(page, "press", "Backspace"),
+                mock.call(page, "keyboard", "inserttext", "RESULT"),
+                mock.call(
+                    page,
+                    "find",
+                    "role",
+                    "button",
+                    "click",
+                    "--name",
+                    "Send",
+                    "--exact",
+                ),
+            ],
+        )
+
+    def test_submit_waits_for_exact_inserted_text_without_reinserting(self) -> None:
+        interface = tb.TerminalBrowserChatGPT()
+        page = self.make_page(interface)
+        session = WebSession("abc", "Cats", page)
+        with (
+            mock.patch.object(
+                interface,
+                "composer_text",
+                side_effect=["", "partial", "RESULT", "RESULT"],
+            ),
+            mock.patch.object(interface, "can_submit", side_effect=[False, True]),
+            mock.patch.object(interface, "latest_too_long_error_id", return_value=None),
+            mock.patch.object(interface, "action") as action,
+            mock.patch("terminal_browser.time.sleep"),
+        ):
+            interface.submit(session, "RESULT")
+
+        inserts = [call for call in action.call_args_list if "inserttext" in call.args]
+        sends = [call for call in action.call_args_list if "button" in call.args]
+        self.assertEqual(len(inserts), 1)
+        self.assertEqual(len(sends), 1)
+
+    def test_submit_preserves_multiline_payload_and_uses_modifier_clear(self) -> None:
+        interface = tb.TerminalBrowserChatGPT()
+        page = self.make_page(interface)
+        session = WebSession("abc", "Cats", page)
+        text = 'alpha\nbeta\n```json\n{"session":"probe"}\n```\nomega\\tail\n'
+        with (
+            mock.patch.object(interface, "composer_text", side_effect=["old draft", text]),
+            mock.patch.object(interface, "can_submit", return_value=True),
+            mock.patch.object(interface, "latest_too_long_error_id", return_value=None),
+            mock.patch.object(interface, "action") as action,
+            mock.patch("terminal_browser.time.sleep"),
+        ):
+            interface.submit(session, text)
+
+        self.assertIn(mock.call(page, "press", "Meta+a"), action.call_args_list)
+        self.assertIn(mock.call(page, "press", "Backspace"), action.call_args_list)
+        inserts = [call for call in action.call_args_list if "inserttext" in call.args]
+        self.assertEqual(inserts, [mock.call(page, "keyboard", "inserttext", text)])
+
+    def test_latest_too_long_error_reads_hidden_transition_text_content(self) -> None:
+        interface = tb.TerminalBrowserChatGPT()
+        page = self.make_page(interface)
+        session = WebSession("abc", "Cats", page)
+        with (
+            mock.patch.object(interface, "eval", return_value=True) as evaluate,
+            mock.patch.object(interface, "latest_user_message", return_value=("u7", "RESULT")),
+        ):
+            error_id = interface.latest_too_long_error_id(session)
+
+        self.assertEqual(error_id, "user:u7")
+        script = evaluate.call_args.args[1]
+        self.assertIn("div > .overflow-hidden > .absolute", script)
+        self.assertIn("textContent", script)
+
+    def test_submit_raises_message_too_long_without_resending(self) -> None:
+        interface = tb.TerminalBrowserChatGPT()
+        page = self.make_page(interface)
+        session = WebSession("abc", "Cats", page)
+        with (
+            mock.patch.object(interface, "composer_text", side_effect=["", "RESULT"]),
+            mock.patch.object(interface, "can_submit", return_value=False),
+            mock.patch.object(interface, "latest_too_long_error_id", return_value="user:u7"),
+            mock.patch.object(interface, "action") as action,
+            mock.patch("terminal_browser.time.sleep"),
+        ):
+            with self.assertRaises(tb.MessageTooLongError):
+                interface.submit(session, "RESULT")
+
+        self.assertEqual(
+            action.call_args_list,
+            [
+                mock.call(
+                    page,
+                    "find",
+                    "role",
+                    "textbox",
+                    "click",
+                    "--name",
+                    "Ask ChatGPT",
+                    "--exact",
+                ),
+                mock.call(page, "press", "Meta+a"),
+                mock.call(page, "press", "Backspace"),
+                mock.call(page, "keyboard", "inserttext", "RESULT"),
             ],
         )
 
@@ -500,6 +615,16 @@ class TerminalBrowserTests(unittest.TestCase):
                 "close",
             ],
             timeout=10.0,
+        )
+
+    def test_reload_session_targets_its_conversation_tab(self) -> None:
+        interface = tb.TerminalBrowserChatGPT()
+        page = self.make_page(interface)
+        session = WebSession('abc', 'Cats', page)
+        with mock.patch.object(interface, '_run') as run:
+            interface.reload_session(session)
+        run.assert_called_once_with(
+            ['action', '--target', 'target-1', '--', 'reload'], timeout=30.0,
         )
 
 

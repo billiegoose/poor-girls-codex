@@ -1198,6 +1198,12 @@ def main() -> None:
         help="model-facing interface to use (default: chatgpt-web)",
     )
     parser.add_argument(
+        "--new", "--new-conversation",
+        dest="new_conversation",
+        action="store_true",
+        help="start a fresh ChatGPT conversation without selecting or reattaching an existing one",
+    )
+    parser.add_argument(
         "--cdp-url",
         default=None,
         help="Chromium CDP endpoint for --interface chatgpt-web",
@@ -1208,6 +1214,8 @@ def main() -> None:
         help="ntfy server base URL (default: https://ntfy.sh)",
     )
     args = parser.parse_args()
+    if args.new_conversation and args.mode != "watch":
+        parser.error("--new is only valid in watch mode")
 
     if args.mode == "export-conversation":
         if not args.conversation_reference:
@@ -1235,13 +1243,15 @@ def main() -> None:
 
         session_id = load_or_create_session_id()
         ntfy_topic = load_ntfy_topic()
-        root_conversation_id = focus_open_root_conversation(
-            session_id=session_id,
-            validate_request=lambda request: validate_web_session_request(request, session_id),
-        )
-        if root_conversation_id is None:
-            conversation_history = load_conversation_history()
-            root_conversation_id = choose_saved_conversation(conversation_history)
+        root_conversation_id = None
+        if not args.new_conversation:
+            root_conversation_id = focus_open_root_conversation(
+                session_id=session_id,
+                validate_request=lambda request: validate_web_session_request(request, session_id),
+            )
+            if root_conversation_id is None:
+                conversation_history = load_conversation_history()
+                root_conversation_id = choose_saved_conversation(conversation_history)
         bootstrap_prompt = root_web_bootstrap_prompt(session_id)
         show_startup_ui(
             bootstrap_prompt,
@@ -1277,6 +1287,7 @@ def main() -> None:
                 message=terminal_response_summary(text) or 'Task completed successfully.',
             ),
             root_conversation_id=root_conversation_id,
+            new_root_conversation=args.new_conversation,
             on_session_attached=lambda session: note_web_session_attached(
                 session,
                 session_id,
@@ -1292,14 +1303,16 @@ def main() -> None:
         session_id = load_or_create_session_id()
         ntfy_topic = load_ntfy_topic()
         cdp_url = args.cdp_url or DEFAULT_CDP_URL
-        root_conversation_id = focus_open_root_conversation(
-            cdp_url=cdp_url,
-            session_id=session_id,
-            validate_request=lambda request: validate_web_session_request(request, session_id),
-        )
-        if root_conversation_id is None:
-            conversation_history = load_conversation_history()
-            root_conversation_id = choose_saved_conversation(conversation_history)
+        root_conversation_id = None
+        if not args.new_conversation:
+            root_conversation_id = focus_open_root_conversation(
+                cdp_url=cdp_url,
+                session_id=session_id,
+                validate_request=lambda request: validate_web_session_request(request, session_id),
+            )
+            if root_conversation_id is None:
+                conversation_history = load_conversation_history()
+                root_conversation_id = choose_saved_conversation(conversation_history)
         bootstrap_prompt = root_web_bootstrap_prompt(session_id)
         show_startup_ui(
             bootstrap_prompt,
@@ -1335,6 +1348,7 @@ def main() -> None:
                 message=terminal_response_summary(text) or 'Task completed successfully.',
             ),
             root_conversation_id=root_conversation_id,
+            new_root_conversation=args.new_conversation,
             on_session_attached=lambda session: note_web_session_attached(
                 session,
                 session_id,
