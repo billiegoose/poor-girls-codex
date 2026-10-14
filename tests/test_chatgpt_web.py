@@ -648,6 +648,7 @@ class ChatGPTWebTests(unittest.TestCase):
         page.locator.return_value = locator
         session = web.WebSession('a', 'Background', page)
         interface.set_composer_text = mock.Mock()
+        interface.composer_text = mock.Mock(return_value='result')
 
         interface.submit(session, 'result')
 
@@ -669,7 +670,7 @@ class ChatGPTWebTests(unittest.TestCase):
         page.get_by_role.return_value = missing
         session = web.WebSession('a', 'Background', page)
         interface.set_composer_text = mock.Mock()
-        interface.composer_text = mock.Mock(return_value=None)
+        interface.composer_text = mock.Mock(return_value='result')
 
         interface.submit(session, 'result')
 
@@ -687,6 +688,7 @@ class ChatGPTWebTests(unittest.TestCase):
         page.locator.return_value = locator
         session = web.WebSession('a', 'Background', page)
         interface.set_composer_text = mock.Mock()
+        interface.composer_text = mock.Mock(return_value='result')
 
         interface.submit(session, 'result')
 
@@ -719,6 +721,68 @@ class ChatGPTWebTests(unittest.TestCase):
         )
         enabled_button.evaluate.assert_called_once_with('element => element.click()')
         page.bring_to_front.assert_not_called()
+
+    def test_submit_waits_for_new_chat_hydration_before_refilling_or_sending(self) -> None:
+        interface = web.ChatGPTWeb()
+        disabled_button = mock.Mock()
+        disabled_button.is_enabled.return_value = False
+        disabled = mock.Mock()
+        disabled.count.return_value = 1
+        disabled.last = disabled_button
+        enabled_button = mock.Mock()
+        enabled_button.is_enabled.return_value = True
+        enabled = mock.Mock()
+        enabled.count.return_value = 1
+        enabled.last = enabled_button
+        page = mock.Mock()
+        session = web.WebSession('a', 'Hydrating', page)
+        interface.set_composer_text = mock.Mock()
+        interface.composer_text = mock.Mock(side_effect=['', '', 'result'])
+        interface.send_button = mock.Mock(side_effect=[disabled, disabled, enabled])
+
+        interface.submit(session, 'result')
+
+        interface.set_composer_text.assert_called_once_with(session, 'result')
+        enabled_button.evaluate.assert_called_once_with('element => element.click()')
+        page.bring_to_front.assert_not_called()
+
+    def test_submit_never_clicks_send_if_composer_text_is_wrong(self) -> None:
+        interface = web.ChatGPTWeb()
+        button = mock.Mock()
+        button.is_enabled.return_value = True
+        present = mock.Mock()
+        present.count.return_value = 1
+        present.last = button
+        no_error = mock.Mock()
+        no_error.count.return_value = 0
+        page = mock.Mock()
+        page.get_by_text.return_value = no_error
+        session = web.WebSession('a', 'Wrong draft', page)
+        interface.set_composer_text = mock.Mock()
+        interface.composer_text = mock.Mock(return_value='stale draft')
+        interface.send_button = mock.Mock(return_value=present)
+
+        with mock.patch.object(web, 'SUBMIT_SETTLE_TIMEOUT_SECONDS', 0.0):
+            with self.assertRaisesRegex(RuntimeError, 'composer text does not match'):
+                interface.submit(session, 'result')
+
+        button.evaluate.assert_not_called()
+        self.assertEqual(interface.set_composer_text.call_count, 2)
+
+    def test_composer_text_reads_logical_lines_instead_of_display_spacing(self) -> None:
+        interface = web.ChatGPTWeb()
+        editor = mock.Mock()
+        editor.evaluate.return_value = 'first line\n\nsecond line'
+        locator = mock.Mock()
+        locator.count.return_value = 1
+        locator.last = editor
+        interface.composer = mock.Mock(return_value=locator)
+        session = web.WebSession('a', 'Multiline', mock.Mock())
+
+        self.assertEqual(interface.composer_text(session), 'first line\n\nsecond line')
+        expression = editor.evaluate.call_args.args[0]
+        self.assertIn('children.every(child => child.tagName', expression)
+        self.assertIn('children.map(child => child.textContent', expression)
 
     def test_latest_too_long_error_id_uses_assistant_message_id_when_error_is_in_message(self) -> None:
         interface = web.ChatGPTWeb()

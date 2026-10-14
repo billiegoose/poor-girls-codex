@@ -35,7 +35,7 @@ CHROME_CDP_RETRY_SECONDS = 0.25
 DEFAULT_SETTLE_SECONDS = 0.35
 DEFAULT_POLL_SECONDS = 0.25
 IDLE_RELOAD_SECONDS = 5.0 * 60.0
-SUBMIT_SETTLE_TIMEOUT_SECONDS = 2.0
+SUBMIT_SETTLE_TIMEOUT_SECONDS = 10.0
 SUBMIT_SETTLE_POLL_SECONDS = 0.05
 RECENT_ASSISTANT_MESSAGE_LIMIT = 10
 DELIVERY_RETRY_INITIAL_SECONDS = 0.25
@@ -982,7 +982,21 @@ class ChatGPTWeb:
         composer = self.composer(session.page)
         if composer.count() == 0:
             return None
-        value = composer.last.inner_text()
+        # ProseMirror renders each logical line as a <p>. Its innerText inserts
+        # *display* spacing between paragraphs, so it does not equal the text
+        # passed to fill(), even though the actual draft is correct. Reconstruct
+        # logical newlines from the paragraph nodes instead.
+        value = composer.last.evaluate(
+            """element => {
+                if (element.matches('[contenteditable="true"]')) {
+                    const children = Array.from(element.children);
+                    if (children.length && children.every(child => child.tagName === 'P')) {
+                        return children.map(child => child.textContent || '').join('\\n');
+                    }
+                }
+                return element.innerText;
+            }"""
+        )
         return value if isinstance(value, str) else None
 
     def can_submit(self, session: WebSession) -> bool:
@@ -1062,27 +1076,27 @@ class ChatGPTWeb:
 
         while True:
             current_text = self.composer_text(session)
-            if current_text is not None and current_text != text and not refilled:
-                # Fresh new-layout pages can finish hydrating after fill() and restore
-                # a stale local draft over the text we just entered. Refill once after
-                # hydration wins, then wait for React to enable Send for that payload.
+            enabled = button.count() > 0 and button.last.is_enabled()
+            if current_text == text and enabled:
+                break
+            if not refilled and (
+                (current_text is not None and current_text not in ('', text))
+                or (current_text == '' and enabled)
+            ):
+                # Hydration may restore an old draft, or finish with an empty
+                # editor after the initial fill. Do not refill while the editor
+                # is still empty *and* Send is disabled: the first fill may just
+                # be waiting for React to hydrate.
                 self.set_composer_text(session, text)
                 refilled = True
                 button = send_button()
-                current_text = self.composer_text(session)
-
-            if (
-                button.count() > 0
-                and button.last.is_enabled()
-                and (current_text is None or current_text == text)
-            ):
-                break
+                continue
             if time.monotonic() >= deadline:
                 break
             session.page.wait_for_timeout(int(SUBMIT_SETTLE_POLL_SECONDS * 1000))
             button = send_button()
 
-        if button.count() == 0 or not button.last.is_enabled():
+        if current_text != text or button.count() == 0 or not button.last.is_enabled():
             # A disabled Send button is no longer sufficient evidence that the
             # payload is oversized: the new UI also uses it while restoring drafts
             # and synchronizing composer state. Only the explicit ChatGPT error is
@@ -1094,8 +1108,14 @@ class ChatGPTWeb:
             if not focused_for_missing_send:
                 session.page.bring_to_front()
                 button = send_button()
-            if button.count() == 0 or not button.last.is_enabled():
-                raise RuntimeError(f'{session.label}: ChatGPT send button is not available')
+            # Foreground activation can enable Send even if the editor still
+            # contains an old or incompletely hydrated draft. Never click it
+            # unless we can verify the exact payload.
+            if (button.count() == 0 or not button.last.is_enabled()
+                    or self.composer_text(session) != text):
+                raise RuntimeError(
+                    f'{session.label}: ChatGPT send button is not available or composer text does not match'
+                )
 
         # Playwright's normal click waits for the element to be visible and stable.
         # ChatGPT can leave the enabled send button perpetually "unstable" in a
