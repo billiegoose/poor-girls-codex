@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 import signal
 import subprocess
@@ -35,6 +36,9 @@ CHROME_CDP_RETRY_SECONDS = 0.25
 DEFAULT_SETTLE_SECONDS = 0.35
 DEFAULT_POLL_SECONDS = 0.25
 IDLE_RELOAD_SECONDS = 5.0 * 60.0
+STALL_INITIAL_RELOAD_SECONDS = 60.0
+STALL_RELOAD_MIN_SECONDS = 5.0 * 60.0
+STALL_RELOAD_MAX_SECONDS = 15.0 * 60.0
 SUBMIT_SETTLE_TIMEOUT_SECONDS = 10.0
 SUBMIT_SETTLE_POLL_SECONDS = 0.05
 RECENT_ASSISTANT_MESSAGE_LIMIT = 10
@@ -136,6 +140,10 @@ class WebSession:
     recovered_from_dom: bool = False
     next_idle_reload_at: float | None = None
     idle_terminal_user_message_id: str | None = None
+    stall_started_at: float | None = None
+    next_stall_reload_at: float | None = None
+    stall_last_user_message_id: str | None = None
+    stall_terminal: bool = False
 
     @property
     def url(self) -> str:
@@ -1655,6 +1663,63 @@ class WebSessionWatcher:
         if message_id != expectation.user_message_id:
             session.terminal_expectation = None
 
+    @staticmethod
+    def note_forward_progress(session: WebSession, now: float) -> None:
+        session.stall_started_at = now
+        session.next_stall_reload_at = now + STALL_INITIAL_RELOAD_SECONDS
+        session.stall_terminal = False
+
+    @staticmethod
+    def note_terminal_response(session: WebSession) -> None:
+        session.stall_terminal = True
+        session.stall_started_at = None
+        session.next_stall_reload_at = None
+
+    def reload_stalled_session(self, session: WebSession, now: float) -> bool:
+        if session.retire_requested:
+            return False
+        # A new user turn reactivates a completed conversation. Failure to read
+        # the DOM (for example during an outage) must not disable recovery.
+        try:
+            latest_user = self.interface.latest_user_message(session)
+        except Exception:
+            latest_user = None
+        if isinstance(latest_user, tuple) and latest_user[0] is not None:
+            user_message_id = latest_user[0]
+            if (
+                session.stall_last_user_message_id is not None
+                and user_message_id != session.stall_last_user_message_id
+            ):
+                self.note_forward_progress(session, now)
+            session.stall_last_user_message_id = user_message_id
+
+        if session.stall_terminal or not (
+            session.routing_session_id is not None
+            or session.pending_responses
+            or session.terminal_expectation is not None
+        ):
+            return False
+        if session.stall_started_at is None:
+            self.note_forward_progress(session, now)
+        assert session.stall_started_at is not None
+        if now - session.stall_started_at >= DELIVERY_FAILURE_TIMEOUT_SECONDS:
+            for response in session.pending_responses:
+                response.set_status('No forward progress for 1 hour; stopping PGC')
+            raise DeliveryFailureTimeout(
+                f'{session.label}: no forward progress for 1 hour; stopping PGC'
+            )
+        if session.next_stall_reload_at is None or now < session.next_stall_reload_at:
+            return False
+
+        # Schedule before navigating so even a failed reload waits for the next
+        # jittered interval. Keep the original one-hour deadline intact.
+        session.next_stall_reload_at = now + random.uniform(
+            STALL_RELOAD_MIN_SECONDS, STALL_RELOAD_MAX_SECONDS
+        )
+        self.interface.reload_session(session)
+        print(f'  [web:{session.label}] stalled for {now - session.stall_started_at:g}s; reloaded page', flush=True)
+        return True
+
     def arm_idle_reload(self, session: WebSession, now: float) -> None:
         if session.next_idle_reload_at is not None:
             return
@@ -1766,6 +1831,7 @@ class WebSessionWatcher:
                     session.settling_fingerprint = None
                     return False
                 if session.settling_fingerprint != fingerprint:
+                    self.note_forward_progress(session, now)
                     session.settling_fingerprint = fingerprint
                     session.settle_deadline = now + self.settle_seconds
                     return False
@@ -1822,6 +1888,7 @@ class WebSessionWatcher:
                     )
 
             if terminal is not None:
+                self.note_terminal_response(session)
                 text, fingerprint = terminal
                 if fingerprint in session.seen_fingerprints:
                     session.terminal_expectation = None
@@ -1898,6 +1965,7 @@ class WebSessionWatcher:
         session.terminal_expectation = None
 
         if session.settling_fingerprint != fingerprint:
+            self.note_forward_progress(session, now)
             session.settling_fingerprint = fingerprint
             session.settle_deadline = now + self.settle_seconds
             return False
@@ -1962,6 +2030,9 @@ class WebSessionWatcher:
             )
         )
         response_progress.set_status('[pending]')
+        # Execution may have taken minutes; use its completion time, not the
+        # timestamp captured when the watcher iteration began.
+        self.note_forward_progress(session, self.clock())
         return True
 
     def recover_rejected_submission(self, session: WebSession) -> bool:
@@ -2066,6 +2137,7 @@ class WebSessionWatcher:
         session.next_delivery_at = 0.0
         session.delivery_failure_started_at = None
         session.delivered += 1
+        self.note_forward_progress(session, self.clock())
         session.terminal_expectation = (
             TerminalExpectation(
                 submitted_text=submitted_text,
@@ -2131,21 +2203,35 @@ class WebSessionWatcher:
                     print(f'  [web:{session.label}] retirement error: {exc}', flush=True)
                 continue
             try:
-                progressed = self.recover_rejected_submission(session) or progressed
-                progressed = self.scan_session(session, now) or progressed
-                progressed = self.reload_idle_session(session, now) or progressed
+                recovered = self.recover_rejected_submission(session)
+                if recovered:
+                    self.note_forward_progress(session, self.clock())
+                progressed = recovered or progressed
+                progressed = self.scan_session(session, self.clock()) or progressed
+                progressed = self.reload_idle_session(session, self.clock()) or progressed
             except Exception as exc:
                 print(f'  [web:{session.label}] scan error: {exc}', flush=True)
 
         for session in list(self.sessions.values()):
             try:
-                progressed = self.deliver_session(session, now) or progressed
+                progressed = self.deliver_session(session, self.clock()) or progressed
             except DeliveryFailureTimeout:
                 raise
             except Exception as exc:
-                delay = self.schedule_delivery_retry(session, now)
+                delay = self.schedule_delivery_retry(session, self.clock())
                 print(
                     f'  [web:{session.label}] delivery error: {terminal_error_summary(exc)} [retry in {delay:g}s]',
+                    flush=True,
+                )
+
+        for session in list(self.sessions.values()):
+            try:
+                progressed = self.reload_stalled_session(session, self.clock()) or progressed
+            except DeliveryFailureTimeout:
+                raise
+            except Exception as exc:
+                print(
+                    f'  [web:{session.label}] stalled-page reload error: {terminal_error_summary(exc)}',
                     flush=True,
                 )
 

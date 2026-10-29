@@ -269,7 +269,9 @@ poor_girls_codex --interface chatgpt-web
 
 Chrome must already be running with a remote-debugging endpoint. The default is `http://127.0.0.1:9222`; use `--cdp-url` to override it. Each open `chatgpt.com/c/...` tab becomes an independent session with its own tool-call fingerprints, pending results, and delivery retries. New conversation tabs are discovered automatically. PGC does not foreground, focus, launch, or close the browser.
 
-After a terminal response, PGC reloads the idle conversation every five minutes so messages sent from another device become visible. The timer stops when activity resumes, and reloads wait while the composer contains a draft. This applies to both browser backends.
+If an active conversation makes no forward progress for 60 seconds (no new user turn, tool call, or successful result submission), PGC reloads that conversation's page. If it remains stuck, reloads recur at randomized intervals of 5–15 minutes, with a one-hour cutoff. The retry state is separate for each conversation and applies to both browser backends; failed navigations remain eligible for later retries. Detecting a terminal response disables this stalled-page recovery.
+
+After a terminal response, PGC instead reloads the idle conversation every five minutes so messages sent from another device become visible. The timer stops when activity resumes, and reloads wait while the composer contains a draft. This applies to both browser backends.
 
 To start a **fresh ChatGPT conversation without the interactive conversation picker**, pass `--new` (also spelled `--new-conversation`):
 

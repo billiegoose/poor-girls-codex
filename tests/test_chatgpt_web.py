@@ -3884,7 +3884,7 @@ class ChatGPTWebTests(unittest.TestCase):
             mock.Mock(),
             pending_responses=[web.PendingResponse('RESULT', 'FALLBACK')],
         )
-        clock = mock.Mock(side_effect=[100.0, 3_700.0])
+        clock = mock.Mock(return_value=100.0)
         watcher = web.WebSessionWatcher(
             interface,
             validate_request=lambda request: None,
@@ -3903,6 +3903,7 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertEqual(session.delivery_failure_started_at, 100.0)
         self.assertEqual(session.next_delivery_at, 100.25)
 
+        clock.return_value = 3_700.0
         with self.assertRaises(web.DeliveryFailureTimeout):
             watcher.step()
 
@@ -4110,7 +4111,7 @@ class IdleReloadTests(unittest.TestCase):
         self.interface.valid_request_from_snapshot.return_value = (
             '{}', {'session': 'root', 'tool': 'status'}, 'remote-tool-fp',
         )
-        for self.now in (301.0, 302.0, 601.0):
+        for self.now in (301.0, 302.0, 330.0):
             self.watcher.step()
         self.watcher.execute_request.assert_called_once()
         self.interface.reload_session.assert_called_once_with(self.session)
@@ -4176,13 +4177,14 @@ class IdleReloadTests(unittest.TestCase):
         web.ChatGPTWeb().reload_session(self.session)
         self.session.page.reload.assert_called_once_with(wait_until='domcontentloaded', timeout=30_000)
 
-    def test_idle_without_a_terminal_response_does_not_reload(self) -> None:
+    def test_idle_without_a_terminal_response_reloads_after_a_minute(self) -> None:
         self.interface.conversation_protocol_state.return_value = web.ConversationProtocolState(
             routing_session_id='root',
         )
-        for self.now in (0.0, 300.0, 600.0):
-            self.watcher.step()
-        self.interface.reload_session.assert_not_called()
+        with mock.patch.object(web.random, 'uniform', return_value=600.0):
+            for self.now in (0.0, 59.0, 60.0, 300.0, 600.0):
+                self.watcher.step()
+        self.interface.reload_session.assert_called_once_with(self.session)
 
     def test_each_session_has_its_own_reload_deadline(self) -> None:
         self.complete()
