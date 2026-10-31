@@ -862,11 +862,11 @@ def run_terminal_browser_watcher(
     new_root_conversation: bool = False,
     on_session_attached: Callable[[WebSession], None] | None = None,
     command: str = DEFAULT_COMMAND,
-) -> None:
+) -> str | None:
     interface = TerminalBrowserChatGPT(command)
     interface.connect()
     try:
-        WebSessionWatcher(
+        return WebSessionWatcher(
             interface,
             validate_request=validate_request,
             execute_request=execute_request,

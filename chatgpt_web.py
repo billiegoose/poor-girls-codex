@@ -34,8 +34,9 @@ DEFAULT_CDP_URL = 'http' + '://127.0.0.1:9222'
 CHROME_CDP_STARTUP_TIMEOUT_SECONDS = 10.0
 CHROME_CDP_RETRY_SECONDS = 0.25
 DEFAULT_SETTLE_SECONDS = 0.35
-DEFAULT_POLL_SECONDS = 0.25
-IDLE_RELOAD_SECONDS = 5.0 * 60.0
+DEFAULT_POLL_SECONDS = 1.0
+IDLE_RELOAD_MIN_SECONDS = 30.0 * 60.0
+IDLE_RELOAD_MAX_SECONDS = 60.0 * 60.0
 STALL_INITIAL_RELOAD_SECONDS = 60.0
 STALL_RELOAD_MIN_SECONDS = 5.0 * 60.0
 STALL_RELOAD_MAX_SECONDS = 15.0 * 60.0
@@ -1355,6 +1356,8 @@ class WebSessionWatcher:
         self.sessions: dict[str, WebSession] = {}
         self.sessions_by_routing_id: dict[str, WebSession] = {}
         self.rate_limit_suspended = False
+        self.restart_session: WebSession | None = None
+        self.restart_acknowledgement: TerminalExpectation | None = None
 
     def note_session_attached(self, session: WebSession) -> None:
         if self.on_session_attached is not None:
@@ -1447,6 +1450,21 @@ class WebSessionWatcher:
             session.routing_session_id = None
         self.sessions.pop(session.conversation_id, None)
 
+    def ignore_nonselected_root(
+        self, session: WebSession, routing_session_id: str | None
+    ) -> bool:
+        """A pinned restart must not adopt an older root with the same routing ID."""
+        if (
+            self.root_session_id is None
+            or self.root_conversation_id is None
+            or routing_session_id != self.root_session_id
+            or session.conversation_id == self.root_conversation_id
+        ):
+            return False
+        self.ignored_conversation_ids.add(session.conversation_id)
+        self.sessions.pop(session.conversation_id, None)
+        return True
+
     def ensure_root_session(self, bootstrap_prompt: str) -> WebSession | None:
         if self.root_session_id is None:
             return None
@@ -1467,6 +1485,12 @@ class WebSessionWatcher:
                 preferred = self.interface.open_conversation(self.root_conversation_id)
                 self.sessions[preferred.conversation_id] = preferred
             self.bind_routing_session(preferred, self.root_session_id)
+            protocol = (
+                self.interface.conversation_protocol_state(preferred, self.validate_request)
+                if isinstance(self.interface, ChatGPTWeb)
+                else None
+            )
+            self.prime_recovered_terminal(preferred, protocol)
             return preferred
 
         for session in self.sessions.values():
@@ -1480,6 +1504,12 @@ class WebSessionWatcher:
             self.bind_routing_session(session, routing_session_id)
             if not self.should_replay_recovered_request(session, fingerprint):
                 session.seen_fingerprints.add(fingerprint)
+            protocol = (
+                self.interface.conversation_protocol_state(session, self.validate_request)
+                if isinstance(self.interface, ChatGPTWeb)
+                else None
+            )
+            self.prime_recovered_terminal(session, protocol)
             return session
 
         created = self.interface.create_root_conversation(bootstrap_prompt)
@@ -1505,6 +1535,14 @@ class WebSessionWatcher:
                 'skipped': True,
                 'error': 'skipped because this subagent already handed off',
             }
+
+        if tool == 'restart':
+            if self.root_session_id is None or routing_session_id != self.root_session_id:
+                return {**base, 'ok': False, 'error': 'only the root PGC session may restart the watcher'}
+            if self.restart_session is not None:
+                return {**base, 'ok': False, 'error': 'restart already requested'}
+            self.restart_session = origin
+            return {**base, 'ok': True, 'status': 'restart queued after acknowledged delivery'}
 
         if tool == 'subagent':
             if self.bootstrap_prompt_for_session is None:
@@ -1620,6 +1658,9 @@ class WebSessionWatcher:
                             session,
                             self.validate_request,
                         )
+                        if self.ignore_nonselected_root(session, protocol.routing_session_id):
+                            live.discard(conversation_id)
+                            continue
                         if self.accepts_routing_session_id(protocol.routing_session_id):
                             assert protocol.routing_session_id is not None
                             session.recovered_from_dom = True
@@ -1631,10 +1672,17 @@ class WebSessionWatcher:
                         if existing is not None:
                             _, request, fingerprint = existing
                             routing_session_id = self.request_session_id(request)
+                            if self.ignore_nonselected_root(session, routing_session_id):
+                                live.discard(conversation_id)
+                                continue
                             if routing_session_id is not None:
                                 self.bind_routing_session(session, routing_session_id)
                             if not self.should_replay_recovered_request(session, fingerprint):
                                 session.seen_fingerprints.add(fingerprint)
+                    self.prime_recovered_terminal(
+                        session,
+                        protocol if isinstance(self.interface, ChatGPTWeb) else None,
+                    )
             else:
                 session.page = page
 
@@ -1662,6 +1710,30 @@ class WebSessionWatcher:
             return
         if message_id != expectation.user_message_id:
             session.terminal_expectation = None
+
+    def prime_recovered_terminal(
+        self,
+        session: WebSession,
+        protocol: ConversationProtocolState | None = None,
+    ) -> None:
+        if session.routing_session_id is None:
+            return
+        # A classified terminal transcript is reliable even if Chrome retained
+        # a stale streaming indicator. Regular scanning still handles completion.
+        confirmed_terminal = protocol is not None and protocol.terminal_response is not None
+        # A root can also end in ordinary assistant prose after a manual turn,
+        # without a recent matching PGC tool result in the transcript.
+        idle_root_prose = not confirmed_terminal and (
+            (protocol is None or not protocol.request_pending)
+            and self.subagent_name(session.routing_session_id) is None
+            and self.interface.is_generating(session) is not True
+            and self.interface.latest_message_is_assistant(session) is True
+            and self.interface.valid_request(session, self.validate_request) is None
+        )
+        if not (confirmed_terminal or idle_root_prose):
+            return
+        self.note_terminal_response(session)
+        self.arm_idle_reload(session, self.clock())
 
     @staticmethod
     def note_forward_progress(session: WebSession, now: float) -> None:
@@ -1702,17 +1774,11 @@ class WebSessionWatcher:
         if session.stall_started_at is None:
             self.note_forward_progress(session, now)
         assert session.stall_started_at is not None
-        if now - session.stall_started_at >= DELIVERY_FAILURE_TIMEOUT_SECONDS:
-            for response in session.pending_responses:
-                response.set_status('No forward progress for 1 hour; stopping PGC')
-            raise DeliveryFailureTimeout(
-                f'{session.label}: no forward progress for 1 hour; stopping PGC'
-            )
         if session.next_stall_reload_at is None or now < session.next_stall_reload_at:
             return False
 
         # Schedule before navigating so even a failed reload waits for the next
-        # jittered interval. Keep the original one-hour deadline intact.
+        # jittered interval. Only failed tool-result delivery has a time limit.
         session.next_stall_reload_at = now + random.uniform(
             STALL_RELOAD_MIN_SECONDS, STALL_RELOAD_MAX_SECONDS
         )
@@ -1726,16 +1792,24 @@ class WebSessionWatcher:
         latest_user = self.interface.latest_user_message(session)
         if isinstance(latest_user, tuple) and latest_user[0] is not None:
             session.idle_terminal_user_message_id = latest_user[0]
-            session.next_idle_reload_at = now + IDLE_RELOAD_SECONDS
+            if session.stall_last_user_message_id is None:
+                session.stall_last_user_message_id = latest_user[0]
+        session.next_idle_reload_at = now + random.uniform(
+            IDLE_RELOAD_MIN_SECONDS, IDLE_RELOAD_MAX_SECONDS
+        )
 
     def reload_idle_session(self, session: WebSession, now: float) -> bool:
         if (
-            session.pending_responses
+            not session.stall_terminal
+            or session.pending_responses
             or session.terminal_expectation is not None
-            or session.settling_fingerprint is not None
             or session.retire_requested
         ):
             session.next_idle_reload_at = None
+            return False
+        # The already-detected terminal fingerprint may still be settling.
+        # Defer reloading, but preserve the timer primed when the tab attached.
+        if session.settling_fingerprint is not None:
             return False
         if session.next_idle_reload_at is None or now < session.next_idle_reload_at:
             return False
@@ -1747,14 +1821,20 @@ class WebSessionWatcher:
         if draft is None or draft.strip():
             return False
         # Space failures out as well, rather than retrying on every watcher tick.
-        session.next_idle_reload_at = now + IDLE_RELOAD_SECONDS
+        session.next_idle_reload_at = now + random.uniform(
+            IDLE_RELOAD_MIN_SECONDS, IDLE_RELOAD_MAX_SECONDS
+        )
         self.interface.reload_session(session)
         return True
 
     def scan_session(self, session: WebSession, now: float) -> bool:
         if session.next_idle_reload_at is not None:
             latest_user = self.interface.latest_user_message(session)
-            if not isinstance(latest_user, tuple) or latest_user[0] != session.idle_terminal_user_message_id:
+            if (
+                isinstance(latest_user, tuple)
+                and latest_user[0] is not None
+                and latest_user[0] != session.idle_terminal_user_message_id
+            ):
                 session.next_idle_reload_at = None
         if not isinstance(self.interface, ChatGPTWeb):
             self.resolve_terminal_expectation(session)
@@ -1946,7 +2026,7 @@ class WebSessionWatcher:
                     self.arm_idle_reload(session, now)
                 return True
 
-            if isinstance(self.interface, ChatGPTWeb):
+            if isinstance(self.interface, ChatGPTWeb) and not session.stall_terminal:
                 session.next_idle_reload_at = None
             session.settling_fingerprint = None
             return False
@@ -1978,7 +2058,7 @@ class WebSessionWatcher:
         session.settling_fingerprint = None
         calls = self.request_calls(request)
         has_orchestration = any(
-            isinstance(call, dict) and call.get('tool') in {'subagent', 'handoff'}
+            isinstance(call, dict) and call.get('tool') in {'subagent', 'handoff', 'restart'}
             for call in calls
         )
         progress_prefix = self.progress_prefix(routing_session_id)
@@ -2146,7 +2226,34 @@ class WebSessionWatcher:
             if arms_terminal
             else None
         )
+        if session is self.restart_session:
+            self.restart_acknowledgement = TerminalExpectation(
+                submitted_text=submitted_text,
+                previous_user_message_id=previous_user_message_id,
+            )
         return True
+
+    def restart_ready(self) -> bool:
+        """Do not replace the process until ChatGPT visibly received the result."""
+        if self.restart_session is None or self.restart_acknowledgement is None:
+            return False
+        if any(session.pending_responses for session in self.sessions.values()):
+            return False
+        try:
+            latest = self.interface.latest_user_message(self.restart_session)
+        except Exception:
+            return False
+        if not isinstance(latest, tuple) or len(latest) != 2:
+            return False
+        message_id, text = latest
+        expected = self.restart_acknowledgement
+        return (
+            message_id is not None
+            and message_id != expected.previous_user_message_id
+            and isinstance(text, str)
+            and ChatGPTWeb.normalize_message_text(text)
+            == ChatGPTWeb.normalize_message_text(expected.submitted_text)
+        )
 
     def rate_limit_remaining(self) -> float:
         callback = getattr(self.interface, 'rate_limit_remaining', None)
@@ -2237,7 +2344,7 @@ class WebSessionWatcher:
 
         return progressed
 
-    def run(self, *, bootstrap_prompt: str = '') -> None:
+    def run(self, *, bootstrap_prompt: str = '') -> str | None:
         if self.new_root_conversation:
             # Do not reattach or execute requests from tabs that predate --new.
             # They may share this directory's persistent routing id.
@@ -2275,6 +2382,9 @@ class WebSessionWatcher:
         try:
             while not stop_requested:
                 progressed = self.step()
+                if self.restart_ready():
+                    assert self.restart_session is not None
+                    return self.restart_session.conversation_id
                 if not progressed and not stop_requested:
                     time.sleep(self.poll_seconds)
         except DeliveryFailureTimeout as exc:
@@ -2464,11 +2574,11 @@ def run_web_watcher(
     root_conversation_id: str | None = None,
     new_root_conversation: bool = False,
     on_session_attached: Callable[[WebSession], None] | None = None,
-) -> None:
+) -> str | None:
     interface = ChatGPTWeb(cdp_url)
     interface.connect()
     try:
-        WebSessionWatcher(
+        return WebSessionWatcher(
             interface,
             validate_request=validate_request,
             execute_request=execute_request,

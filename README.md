@@ -269,9 +269,9 @@ poor_girls_codex --interface chatgpt-web
 
 Chrome must already be running with a remote-debugging endpoint. The default is `http://127.0.0.1:9222`; use `--cdp-url` to override it. Each open `chatgpt.com/c/...` tab becomes an independent session with its own tool-call fingerprints, pending results, and delivery retries. New conversation tabs are discovered automatically. PGC does not foreground, focus, launch, or close the browser.
 
-If an active conversation makes no forward progress for 60 seconds (no new user turn, tool call, or successful result submission), PGC reloads that conversation's page. If it remains stuck, reloads recur at randomized intervals of 5–15 minutes, with a one-hour cutoff. The retry state is separate for each conversation and applies to both browser backends; failed navigations remain eligible for later retries. Detecting a terminal response disables this stalled-page recovery.
+If an active conversation makes no forward progress for 60 seconds (no new user turn, tool call, or successful result submission), PGC reloads that conversation's page. If it remains stuck, reloads recur at randomized intervals of 5–15 minutes without terminating PGC. The retry state is separate for each conversation and applies to both browser backends; failed navigations remain eligible for later retries. **Only failed submission of pending tool results** stops PGC after one hour; successful long-running tool calls are not interrupted.
 
-After a terminal response, PGC instead reloads the idle conversation every five minutes so messages sent from another device become visible. The timer stops when activity resumes, and reloads wait while the composer contains a draft. This applies to both browser backends.
+An attached conversation that is already in a terminal response state is treated as idle immediately, without a 60-second stalled-page reload. Terminal conversations instead refresh every randomized 30–60 minutes so messages from another device become visible, indefinitely. The timer stops when activity resumes, and reloads wait while the composer contains a draft.
 
 To start a **fresh ChatGPT conversation without the interactive conversation picker**, pass `--new` (also spelled `--new-conversation`):
 
@@ -282,6 +282,8 @@ poor_girls_codex --interface terminal-browser --new
 ```
 
 This skips both discovery of an already-open root conversation and the saved-conversation picker, and instructs the watcher to create a new root tab even if an older session is open. It does not clear conversation history or rotate the working directory's routing id. For a different codebase, launch the PGC executable with that project's directory as the working directory (for example, from `../fpgatool`). PGC's `run` tool waits for its child process to exit, so launching another long-running watcher through `run` requires detaching the child and redirecting its standard streams.
+
+The root conversation can request the standalone `restart {}` orchestration tool to reload PGC's Python code without launching a second watcher. PGC first delivers the restart tool result, waits until that acknowledgement is visible in ChatGPT, disconnects its browser interface, and uses Python's `os.execv` to replace itself **without changing its PID**. The replacement resumes the exact root conversation and does not replay `--new`. Subagents cannot request a restart. The first restart after installing this feature must still be done manually, since the already-running process has not loaded the new implementation.
 
 Each working directory gets a persistent opaque routing id in `.pgc/session`. Every executable web tool request must repeat that id in a top-level `"session"` field. This lets multiple PGC processes watch the same browser while only executing requests for their own project. PGC automatically adds `.pgc/session` to that Git checkout's local `info/exclude`, so the routing id stays local and uncommitted.
 

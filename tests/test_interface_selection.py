@@ -314,6 +314,26 @@ class InterfaceSelectionTests(unittest.TestCase):
             supported_tools=pgc.SUPPORTED_TOOLS,
         )
 
+    def test_restart_validation_and_root_only_advertisement(self) -> None:
+        pgc.validate_web_session_request(
+            {'session': 'abc', 'id': 'restart', 'tool': 'restart'}, 'abc'
+        )
+        with self.assertRaisesRegex(ValueError, 'restart'):
+            pgc.validate_web_session_request(
+                {
+                    'session': 'abc',
+                    'calls': [
+                        {'id': 'restart', 'tool': 'restart'},
+                        {'id': 'status', 'tool': 'status'},
+                    ],
+                },
+                'abc',
+            )
+        with self.assertRaisesRegex(ValueError, 'unsupported tool'):
+            pgc.validate_request({'id': 'restart', 'tool': 'restart'})
+        self.assertIn('restart {}', pgc.root_web_bootstrap_prompt('abc'))
+        self.assertNotIn('restart {}', pgc.subagent_web_bootstrap_prompt('abc::worker'))
+
     def test_subagent_and_handoff_validation(self) -> None:
         pgc.validate_web_session_request(
             {'session': 'abc', 'id': 's', 'tool': 'subagent', 'name': 'worker2', 'prompt': 'Do work'},
@@ -340,6 +360,27 @@ class InterfaceSelectionTests(unittest.TestCase):
                 {'session': 'abc', 'id': 'h', 'tool': 'handoff', 'result': ''},
                 'abc',
             )
+
+    def test_exec_restart_preserves_process_and_pins_conversation(self) -> None:
+        with (
+            mock.patch.object(sys, 'argv', [
+                '/work/poor_girls_codex.py', 'watch', '--interface', 'chatgpt-web',
+                '--new', '--resume-conversation', 'old-chat', '--cdp-url', 'http://127.0.0.1:9222',
+            ]),
+            mock.patch.object(pgc.os, 'execv') as execv,
+            mock.patch.object(pgc.os, 'getpid', return_value=42),
+            mock.patch('builtins.print'),
+        ):
+            pgc.exec_restart('current-chat')
+
+        execv.assert_called_once_with(
+            sys.executable,
+            [
+                sys.executable, '/work/poor_girls_codex.py', 'watch',
+                '--interface', 'chatgpt-web', '--cdp-url', 'http://127.0.0.1:9222',
+                '--resume-conversation', 'current-chat',
+            ],
+        )
 
     def test_main_export_conversation_is_read_only_cli_path(self) -> None:
         import chatgpt_web
@@ -469,6 +510,62 @@ class InterfaceSelectionTests(unittest.TestCase):
             ):
                 pgc.main()
             self.assertEqual(error.exception.code, 2)
+
+    def test_resume_conversation_bypasses_discovery_and_picker_for_both_backends(self) -> None:
+        import chatgpt_web
+        import terminal_browser
+
+        for interface_name, backend, runner_name in (
+            ('chatgpt-web', chatgpt_web, 'run_web_watcher'),
+            ('terminal-browser', terminal_browser, 'run_terminal_browser_watcher'),
+        ):
+            with (
+                self.subTest(interface=interface_name),
+                mock.patch.object(sys, 'argv', [
+                    'poor_girls_codex.py', '--interface', interface_name,
+                    '--resume-conversation', 'exact-chat',
+                ]),
+                mock.patch.object(pgc, 'load_or_create_session_id', return_value='root'),
+                mock.patch.object(pgc, 'load_ntfy_topic', return_value=''),
+                mock.patch.object(pgc, 'load_conversation_history') as history,
+                mock.patch.object(pgc, 'choose_saved_conversation') as picker,
+                mock.patch.object(pgc, 'show_startup_ui'),
+                mock.patch.object(backend, 'focus_open_root_conversation') as focus,
+                mock.patch.object(backend, runner_name, return_value=None) as watcher,
+            ):
+                pgc.main()
+                history.assert_not_called()
+                picker.assert_not_called()
+                focus.assert_not_called()
+                self.assertEqual(watcher.call_args.kwargs['root_conversation_id'], 'exact-chat')
+                self.assertFalse(watcher.call_args.kwargs['new_root_conversation'])
+
+    def test_watcher_restart_result_execs_after_cleanup(self) -> None:
+        import chatgpt_web
+
+        with (
+            mock.patch.object(sys, 'argv', [
+                'poor_girls_codex.py', '--resume-conversation', 'exact-chat',
+            ]),
+            mock.patch.object(pgc, 'load_or_create_session_id', return_value='root'),
+            mock.patch.object(pgc, 'load_ntfy_topic', return_value=''),
+            mock.patch.object(pgc, 'show_startup_ui'),
+            mock.patch.object(chatgpt_web, 'run_web_watcher', return_value='exact-chat'),
+            mock.patch.object(pgc, 'exec_restart') as restart,
+        ):
+            pgc.main()
+        restart.assert_called_once_with('exact-chat')
+
+    def test_new_and_resume_conversation_are_mutually_exclusive(self) -> None:
+        with (
+            mock.patch.object(sys, 'argv', [
+                'poor_girls_codex.py', '--new', '--resume-conversation', 'exact-chat',
+            ]),
+            mock.patch('sys.stderr'),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            pgc.main()
+        self.assertEqual(raised.exception.code, 2)
 
     def test_main_terminal_browser_selects_experimental_backend(self) -> None:
         import terminal_browser

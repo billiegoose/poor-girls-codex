@@ -31,7 +31,7 @@ SEND_RETRY_INITIAL_SECONDS = 0.25
 SEND_RETRY_MAX_SECONDS = 8.0
 MESSAGE_TOO_LONG_TEXT = "The message you submitted was too long, please edit it and resubmit."
 LOCAL_TOOLS = {"read", "find", "tree", "status", "diff", "edit", "write", "run"}
-WEB_ORCHESTRATION_TOOLS = {"subagent", "handoff"}
+WEB_ORCHESTRATION_TOOLS = {"subagent", "handoff", "restart"}
 SUPPORTED_TOOLS = LOCAL_TOOLS | WEB_ORCHESTRATION_TOOLS
 SESSION_DIR = ".pgc"
 SESSION_FILE = os.path.join(SESSION_DIR, "session")
@@ -447,6 +447,11 @@ def web_bootstrap_prompt(session_id: str, *, role: str) -> str:
         "- subagent {name,prompt} - create a fresh ChatGPT subagent conversation; "
         "name may contain letters, digits, '-' and '_', and must start with a letter or digit."
     )
+    if role == 'root':
+        additional_tools += (
+            "\n- restart {} - replace the running PGC process with freshly loaded code "
+            "after its tool-result acknowledgement is visible. Use as a standalone call."
+        )
 
     role_instructions = (
         "You are the root agent for this Poor Girl's Codex session. Finish normally in this conversation."
@@ -637,6 +642,8 @@ def validate_request(request: Any, *, supported_tools: set[str] = LOCAL_TOOLS) -
         tool = call.get("tool")
         if tool not in supported_tools:
             raise ValueError(f"call {index} has unsupported tool {tool!r}")
+        if tool == "restart" and len(calls) != 1:
+            raise ValueError("restart must be a standalone tool call")
         if tool == "subagent":
             name = call.get("name")
             prompt = call.get("prompt")
@@ -1161,6 +1168,29 @@ def watch_loop() -> None:
                 time.sleep(1.0)
 
 
+def exec_restart(conversation_id: str) -> None:
+    """Replace this process without replaying --new or losing the active root chat."""
+    arguments: list[str] = []
+    skip_value = False
+    for argument in sys.argv[1:]:
+        if skip_value:
+            skip_value = False
+            continue
+        if argument in ('--new', '--new-conversation'):
+            continue
+        if argument == '--resume-conversation':
+            skip_value = True
+            continue
+        if argument.startswith('--resume-conversation='):
+            continue
+        arguments.append(argument)
+    argv = [sys.executable, sys.argv[0], *arguments, '--resume-conversation', conversation_id]
+    print(f'  [web] restarting PGC in place (PID {os.getpid()})', flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable, argv)
+
+
 def main() -> None:
     global INTERFACE
 
@@ -1203,6 +1233,7 @@ def main() -> None:
         action="store_true",
         help="start a fresh ChatGPT conversation without selecting or reattaching an existing one",
     )
+    parser.add_argument('--resume-conversation', help=argparse.SUPPRESS)
     parser.add_argument(
         "--cdp-url",
         default=None,
@@ -1216,6 +1247,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.new_conversation and args.mode != "watch":
         parser.error("--new is only valid in watch mode")
+    if args.new_conversation and args.resume_conversation is not None:
+        parser.error("--new cannot be combined with --resume-conversation")
 
     if args.mode == "export-conversation":
         if not args.conversation_reference:
@@ -1243,8 +1276,8 @@ def main() -> None:
 
         session_id = load_or_create_session_id()
         ntfy_topic = load_ntfy_topic()
-        root_conversation_id = None
-        if not args.new_conversation:
+        root_conversation_id = args.resume_conversation
+        if root_conversation_id is None and not args.new_conversation:
             root_conversation_id = focus_open_root_conversation(
                 session_id=session_id,
                 validate_request=lambda request: validate_web_session_request(request, session_id),
@@ -1262,7 +1295,7 @@ def main() -> None:
             web_backend_label="terminal-browser instance",
             ntfy_topic=ntfy_topic,
         )
-        run_terminal_browser_watcher(
+        restart_conversation_id = run_terminal_browser_watcher(
             session_id=session_id,
             bootstrap_prompt=bootstrap_prompt,
             validate_request=lambda request: validate_web_session_request(request, session_id),
@@ -1293,6 +1326,8 @@ def main() -> None:
                 session_id,
             ),
         )
+        if isinstance(restart_conversation_id, str) and restart_conversation_id:
+            exec_restart(restart_conversation_id)
         return
 
     if args.interface == "chatgpt-web":
@@ -1303,8 +1338,8 @@ def main() -> None:
         session_id = load_or_create_session_id()
         ntfy_topic = load_ntfy_topic()
         cdp_url = args.cdp_url or DEFAULT_CDP_URL
-        root_conversation_id = None
-        if not args.new_conversation:
+        root_conversation_id = args.resume_conversation
+        if root_conversation_id is None and not args.new_conversation:
             root_conversation_id = focus_open_root_conversation(
                 cdp_url=cdp_url,
                 session_id=session_id,
@@ -1322,7 +1357,7 @@ def main() -> None:
             web_managed=True,
             ntfy_topic=ntfy_topic,
         )
-        run_web_watcher(
+        restart_conversation_id = run_web_watcher(
             cdp_url=cdp_url,
             session_id=session_id,
             bootstrap_prompt=bootstrap_prompt,
@@ -1354,6 +1389,8 @@ def main() -> None:
                 session_id,
             ),
         )
+        if isinstance(restart_conversation_id, str) and restart_conversation_id:
+            exec_restart(restart_conversation_id)
         return
 
 

@@ -46,14 +46,13 @@ class StalledReloadTests(unittest.TestCase):
         self.assertEqual(self.session.stall_started_at, 0.0)
         self.assertEqual(self.session.next_stall_reload_at, 1560.0)
 
-    def test_one_hour_without_progress_stops_even_when_next_reload_is_later(self) -> None:
+    def test_hours_without_progress_keep_reloading_without_stopping_pgc(self) -> None:
         with mock.patch.object(web.random, 'uniform', return_value=900.0):
-            self.step_at(0.0)
-            self.step_at(60.0)
-            self.step_at(3599.0)
-            with self.assertRaisesRegex(web.DeliveryFailureTimeout, 'no forward progress for 1 hour'):
-                self.step_at(3600.0)
+            for now in (0.0, 60.0, 960.0, 1860.0, 2760.0, 3660.0, 7200.0):
+                self.step_at(now)
+        self.assertEqual(self.interface.reload_session.call_count, 6)
         self.assertEqual(self.session.stall_started_at, 0.0)
+        self.assertEqual(self.session.next_stall_reload_at, 8100.0)
 
     def test_reload_failure_is_retried_after_jitter_not_each_tick(self) -> None:
         self.interface.reload_session.side_effect = RuntimeError('site unavailable')
