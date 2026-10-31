@@ -31,7 +31,7 @@ SEND_RETRY_INITIAL_SECONDS = 0.25
 SEND_RETRY_MAX_SECONDS = 8.0
 MESSAGE_TOO_LONG_TEXT = "The message you submitted was too long, please edit it and resubmit."
 LOCAL_TOOLS = {"read", "find", "tree", "status", "diff", "edit", "write", "run"}
-WEB_ORCHESTRATION_TOOLS = {"subagent", "handoff", "restart"}
+WEB_ORCHESTRATION_TOOLS = {"subagent", "handoff", "restart", "attach_image"}
 SUPPORTED_TOOLS = LOCAL_TOOLS | WEB_ORCHESTRATION_TOOLS
 SESSION_DIR = ".pgc"
 SESSION_FILE = os.path.join(SESSION_DIR, "session")
@@ -444,6 +444,8 @@ def web_bootstrap_prompt(session_id: str, *, role: str) -> str:
 
     additional_tools = (
         "Additional chatgpt-web tools:\n"
+        "- attach_image {path} - attach a local PNG/JPEG/GIF/WebP file to the same user turn "
+        "as its JSON tool result, without putting image bytes in JSON (Playwright backend only).\n"
         "- subagent {name,prompt} - create a fresh ChatGPT subagent conversation; "
         "name may contain letters, digits, '-' and '_', and must start with a letter or digit."
     )
@@ -644,6 +646,10 @@ def validate_request(request: Any, *, supported_tools: set[str] = LOCAL_TOOLS) -
             raise ValueError(f"call {index} has unsupported tool {tool!r}")
         if tool == "restart" and len(calls) != 1:
             raise ValueError("restart must be a standalone tool call")
+        if tool == "attach_image":
+            path = call.get("path")
+            if not isinstance(path, str) or not path.strip():
+                raise ValueError(f"call {index} attach_image path must be a non-empty string")
         if tool == "subagent":
             name = call.get("name")
             prompt = call.get("prompt")

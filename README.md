@@ -287,6 +287,12 @@ The root conversation can request the standalone `restart {}` orchestration tool
 
 Each working directory gets a persistent opaque routing id in `.pgc/session`. Every executable web tool request must repeat that id in a top-level `"session"` field. This lets multiple PGC processes watch the same browser while only executing requests for their own project. PGC automatically adds `.pgc/session` to that Git checkout's local `info/exclude`, so the routing id stays local and uncommitted.
 
+### Image attachments
+
+The `chatgpt-web` backend supports `attach_image {path}` in a JSON tool request. The file is read from the local filesystem (relative to PGC's working directory unless an absolute path is supplied) and uploaded through ChatGPT's photo-attachment control. Its bytes are **not** encoded into JSON: PGC attaches the image alongside the normal JSON tool result in a single user message, so the model can see its pixels directly. This works in batches with other tools, and delivery retries reuse already-staged previews instead of uploading duplicate files. Supported formats are PNG, JPEG, GIF, and WebP, up to 20 MiB per file and 40 MiB per batch; filenames in a batch must be unique. The experimental `terminal-browser` backend reports an unsupported-tool result for image attachments.
+
+Example: `{"session":"<routing-id>","id":"view","tool":"attach_image","path":"screenshots/layout.png"}`
+
 ### Web subagents
 
 In `chatgpt-web` mode, a conversation can create a fresh ChatGPT subagent tab with the `subagent {name,prompt}` orchestration tool. Subagent names are alphanumeric, and the child receives a derived routing id of `<parent-session>::<name>`. Because routing matches the current session tree, children can create nested subagents using the same convention.

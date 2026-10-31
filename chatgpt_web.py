@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import random
 import re
@@ -51,6 +52,15 @@ RATE_LIMIT_BACKOFF_MAX_SECONDS = 300.0
 RATE_LIMIT_BACKOFF_RESET_SECONDS = 900.0
 MESSAGE_TOO_LONG_TEXT = 'The message you submitted was too long, please edit it and resubmit.'
 TERMINAL_ERROR_MAX_CHARS = 1200
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_BATCH_BYTES = 40 * 1024 * 1024
+IMAGE_MIME_TYPES = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+}
 SUBAGENT_COLOR_CODES = ('1;34', '1;35', '1;36', '1;33', '1;32')
 
 
@@ -81,6 +91,37 @@ class DeliveryFailureTimeout(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class ImageAttachment:
+    name: str
+    mime_type: str
+    data: bytes
+
+
+def load_image_attachment(path_text: str) -> ImageAttachment:
+    path = Path(path_text).expanduser()
+    mime_type = IMAGE_MIME_TYPES.get(path.suffix.lower())
+    if mime_type is None:
+        raise ValueError('attach_image supports PNG, JPEG, GIF, and WebP files')
+    if not path.is_file():
+        raise ValueError(f'image file not found: {path}')
+    size = path.stat().st_size
+    if size <= 0 or size > MAX_IMAGE_BYTES:
+        raise ValueError(f'image must be between 1 byte and {MAX_IMAGE_BYTES} bytes')
+    data = path.read_bytes()
+    if len(data) > MAX_IMAGE_BYTES:
+        raise ValueError(f'image exceeds {MAX_IMAGE_BYTES} bytes')
+    signatures = {
+        'image/png': data.startswith(bytes.fromhex('89504e470d0a1a0a')),
+        'image/jpeg': data.startswith(bytes.fromhex('ffd8ff')),
+        'image/gif': data.startswith((b'GIF87a', b'GIF89a')),
+        'image/webp': data[:4] == b'RIFF' and data[8:12] == b'WEBP',
+    }
+    if not signatures[mime_type]:
+        raise ValueError(f'image content does not match its {path.suffix} extension')
+    return ImageAttachment(path.name, mime_type, data)
+
+
 @dataclass
 class PendingResponse:
     result: str
@@ -88,6 +129,7 @@ class PendingResponse:
     progress: ResponseProgress | None = None
     compact: bool = False
     arms_terminal: bool = True
+    images: tuple[ImageAttachment, ...] = ()
 
     def render(self) -> str:
         return self.fallback if self.compact else self.result
@@ -779,26 +821,34 @@ class ChatGPTWeb:
                     return False
             return True
 
-        for source in self.json_candidates_from_text(text):
-            try:
-                payload = json.loads(source)
-            except json.JSONDecodeError:
-                continue
-            results = payload if isinstance(payload, list) else [payload]
-            if len(results) != len(calls):
-                continue
-            matched = True
-            for index, (call, result) in enumerate(zip(calls, results, strict=True)):
-                if not isinstance(call, dict) or not isinstance(result, dict):
-                    matched = False
-                    break
-                expected_id = str(call.get('id', index))
-                expected_tool = call.get('tool')
-                if str(result.get('id')) != expected_id or result.get('tool') != expected_tool:
-                    matched = False
-                    break
-            if matched:
-                return True
+        # ChatGPT sometimes stores tool results with escaped Markdown fences
+        # and HTML entities (notably &#x20;). Try the original text first so
+        # ordinary JSON payloads retain their exact contents.
+        candidate_texts = [text]
+        decoded_text = html.unescape(text.replace('\\`', '`'))
+        if decoded_text != text:
+            candidate_texts.append(decoded_text)
+        for candidate_text in candidate_texts:
+            for source in self.json_candidates_from_text(candidate_text):
+                try:
+                    payload = json.loads(source)
+                except json.JSONDecodeError:
+                    continue
+                results = payload if isinstance(payload, list) else [payload]
+                if len(results) != len(calls):
+                    continue
+                matched = True
+                for index, (call, result) in enumerate(zip(calls, results, strict=True)):
+                    if not isinstance(call, dict) or not isinstance(result, dict):
+                        matched = False
+                        break
+                    expected_id = str(call.get('id', index))
+                    expected_tool = call.get('tool')
+                    if str(result.get('id')) != expected_id or result.get('tool') != expected_tool:
+                        matched = False
+                        break
+                if matched:
+                    return True
         return False
 
     @staticmethod
@@ -1066,7 +1116,29 @@ class ChatGPTWeb:
                 pass
             return None
 
-    def submit(self, session: WebSession, text: str) -> None:
+    def attach_images(self, session: WebSession, images: tuple[ImageAttachment, ...]) -> None:
+        # An already-visible preview can belong to a previous failed send.
+        # Keep it instead of uploading a duplicate on delivery retry.
+        missing = [
+            image for image in images
+            if session.page.get_by_role('button', name=f'Remove {image.name}', exact=True).count() == 0
+        ]
+        if missing:
+            uploader = session.page.locator('input[type="file"][aria-label="Attach photos"]')
+            if uploader.count() == 0:
+                raise RuntimeError(f'{session.label}: ChatGPT image upload input not found')
+            uploader.last.set_input_files([
+                {'name': image.name, 'mimeType': image.mime_type, 'buffer': image.data}
+                for image in missing
+            ])
+        for image in images:
+            session.page.get_by_role(
+                'button', name=f'Remove {image.name}', exact=True
+            ).wait_for(state='attached', timeout=30_000)
+
+    def submit(
+        self, session: WebSession, text: str, *, images: tuple[ImageAttachment, ...] = ()
+    ) -> None:
         self.set_composer_text(session, text)
 
         def send_button():
@@ -1125,6 +1197,21 @@ class ChatGPTWeb:
                 raise RuntimeError(
                     f'{session.label}: ChatGPT send button is not available or composer text does not match'
                 )
+
+        if images:
+            self.attach_images(session, images)
+            image_deadline = time.monotonic() + SUBMIT_SETTLE_TIMEOUT_SECONDS
+            while True:
+                button = send_button()
+                if (
+                    self.composer_text(session) == text
+                    and button.count() > 0
+                    and button.last.is_enabled()
+                ):
+                    break
+                if time.monotonic() >= image_deadline:
+                    raise RuntimeError(f'{session.label}: image attachment not ready for submission')
+                session.page.wait_for_timeout(int(SUBMIT_SETTLE_POLL_SECONDS * 1000))
 
         # Playwright's normal click waits for the element to be visible and stable.
         # ChatGPT can leave the enabled send button perpetually "unstable" in a
@@ -1523,6 +1610,7 @@ class WebSessionWatcher:
         routing_session_id: str,
         call: dict[str, Any],
         index: int,
+        image_attachments: list[ImageAttachment] | None = None,
     ) -> dict[str, Any]:
         tool = call.get('tool')
         call_id = call.get('id', str(index))
@@ -1543,6 +1631,29 @@ class WebSessionWatcher:
                 return {**base, 'ok': False, 'error': 'restart already requested'}
             self.restart_session = origin
             return {**base, 'ok': True, 'status': 'restart queued after acknowledged delivery'}
+
+        if tool == 'attach_image':
+            if not isinstance(self.interface, ChatGPTWeb):
+                return {**base, 'ok': False, 'error': 'attach_image requires the chatgpt-web backend'}
+            if image_attachments is None:
+                return {**base, 'ok': False, 'error': 'image delivery is unavailable'}
+            try:
+                attachment = load_image_attachment(call['path'])
+            except (OSError, ValueError, KeyError) as exc:
+                return {**base, 'ok': False, 'error': str(exc)}
+            if any(existing.name == attachment.name for existing in image_attachments):
+                return {**base, 'ok': False, 'error': f'duplicate image filename: {attachment.name}'}
+            if sum(len(image.data) for image in image_attachments) + len(attachment.data) > MAX_IMAGE_BATCH_BYTES:
+                return {**base, 'ok': False, 'error': 'total image attachment size exceeds 40 MiB'}
+            image_attachments.append(attachment)
+            return {
+                **base,
+                'ok': True,
+                'filename': attachment.name,
+                'size_bytes': len(attachment.data),
+                'sha256': hashlib.sha256(attachment.data).hexdigest(),
+                'status': 'queued for attachment to this tool result',
+            }
 
         if tool == 'subagent':
             if self.bootstrap_prompt_for_session is None:
@@ -2057,8 +2168,9 @@ class WebSessionWatcher:
         session.seen_fingerprints.add(fingerprint)
         session.settling_fingerprint = None
         calls = self.request_calls(request)
+        image_attachments: list[ImageAttachment] = []
         has_orchestration = any(
-            isinstance(call, dict) and call.get('tool') in {'subagent', 'handoff', 'restart'}
+            isinstance(call, dict) and call.get('tool') in {'subagent', 'handoff', 'restart', 'attach_image'}
             for call in calls
         )
         progress_prefix = self.progress_prefix(routing_session_id)
@@ -2076,6 +2188,7 @@ class WebSessionWatcher:
                     routing_session_id,
                     call,
                     index,
+                    image_attachments,
                 ),
             }
             if progress_prefix is not None:
@@ -2107,6 +2220,7 @@ class WebSessionWatcher:
                 result=self.fenced_result(result),
                 fallback=self.too_long_fallback(request, result),
                 progress=response_progress,
+                images=tuple(image_attachments),
             )
         )
         response_progress.set_status('[pending]')
@@ -2186,8 +2300,16 @@ class WebSessionWatcher:
             response.render().rstrip('\n') for response in session.pending_responses
         ) + '\n'
         submitted_text = rendered
+        images = tuple(image for response in session.pending_responses for image in response.images)
+
+        def submit_result(text: str) -> None:
+            if images:
+                self.interface.submit(session, text, images=images)
+            else:
+                self.interface.submit(session, text)
+
         try:
-            self.interface.submit(session, rendered)
+            submit_result(rendered)
         except MessageTooLongError:
             for response in session.pending_responses:
                 response.compact = True
@@ -2196,7 +2318,7 @@ class WebSessionWatcher:
                 response.fallback.rstrip('\n') for response in session.pending_responses
             ) + '\n'
             try:
-                self.interface.submit(session, fallback)
+                submit_result(fallback)
                 submitted_text = fallback
             except RuntimeError:
                 self.schedule_delivery_retry(session, now)

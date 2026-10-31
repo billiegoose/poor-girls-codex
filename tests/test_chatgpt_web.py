@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import chatgpt_web as web
@@ -97,6 +100,69 @@ class FakePage:
 
 
 class ChatGPTWebTests(unittest.TestCase):
+    def test_image_loader_checks_signature_and_size(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'diagram.png'
+            data = bytes.fromhex('89504e470d0a1a0a') + b'example-pixels'
+            path.write_bytes(data)
+            image = web.load_image_attachment(str(path))
+            self.assertEqual((image.name, image.mime_type, image.data), ('diagram.png', 'image/png', data))
+
+            path.write_bytes(b'not really a PNG')
+            with self.assertRaisesRegex(ValueError, 'does not match'):
+                web.load_image_attachment(str(path))
+
+            path.write_bytes(data)
+            with mock.patch.object(web, 'MAX_IMAGE_BYTES', 8):
+                with self.assertRaisesRegex(ValueError, 'between 1 byte'):
+                    web.load_image_attachment(str(path))
+
+    def test_attach_images_uses_photo_input_and_does_not_duplicate_retry(self) -> None:
+        interface = web.ChatGPTWeb()
+        image = web.ImageAttachment('diagram.png', 'image/png', b'image-data')
+        uploader = mock.Mock()
+        uploader.count.return_value = 1
+        preview = mock.Mock()
+        preview.count.side_effect = [0, 1]
+        page = mock.Mock()
+        page.locator.return_value = uploader
+        page.get_by_role.return_value = preview
+        session = web.WebSession('root', 'Root', page)
+
+        interface.attach_images(session, (image,))
+        interface.attach_images(session, (image,))
+
+        page.locator.assert_called_once_with(
+            'input[type="file"][aria-label="Attach photos"]'
+        )
+        uploader.last.set_input_files.assert_called_once_with([
+            {'name': 'diagram.png', 'mimeType': 'image/png', 'buffer': b'image-data'}
+        ])
+        self.assertEqual(preview.wait_for.call_count, 2)
+
+    def test_submit_with_image_stages_attachment_before_sending(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        session = web.WebSession('root', 'Root', page)
+        image = web.ImageAttachment('diagram.png', 'image/png', b'image-data')
+        interface.set_composer_text = mock.Mock()
+        interface.composer_text = mock.Mock(return_value='RESULT')
+        button = mock.Mock()
+        button.count.return_value = 1
+        button.last.is_enabled.return_value = True
+        interface.send_button = mock.Mock(return_value=button)
+        ordered = mock.Mock()
+        interface.attach_images = ordered.attach_images
+        button.last.evaluate = ordered.click_send
+
+        interface.submit(session, 'RESULT', images=(image,))
+
+        interface.set_composer_text.assert_called_once_with(session, 'RESULT')
+        ordered.assert_has_calls([
+            mock.call.attach_images(session, (image,)),
+            mock.call.click_send('element => element.click()'),
+        ])
+
     def test_launch_chrome_for_cdp_uses_dedicated_profile_and_debugging_flags(self) -> None:
         with (
             mock.patch.object(web.Path, 'home', return_value=web.Path('/Users/tester')),
@@ -1946,6 +2012,95 @@ class ChatGPTWebTests(unittest.TestCase):
         with mock.patch.object(web.sys.stdout, 'isatty', return_value=False):
             self.assertEqual(watcher.progress_prefix('root::parent::closure-parity'), '[closure-parity]')
 
+    def test_attach_image_queues_binary_data_and_rejects_duplicates(self) -> None:
+        interface = web.ChatGPTWeb()
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+            root_session_id='root',
+        )
+        root = web.WebSession('root', 'Root', mock.Mock(), routing_session_id='root')
+        data = bytes.fromhex('89504e470d0a1a0a') + b'pixels'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'capture.png'
+            path.write_bytes(data)
+            call = {'id': 'view', 'tool': 'attach_image', 'path': str(path)}
+            images: list[web.ImageAttachment] = []
+            result = watcher.execute_orchestration_tool(root, 'root', call, 0, images)
+            self.assertTrue(result['ok'])
+            self.assertEqual(result['filename'], 'capture.png')
+            self.assertEqual(result['size_bytes'], len(data))
+            self.assertEqual(result['sha256'], web.hashlib.sha256(data).hexdigest())
+            self.assertEqual(images, [web.ImageAttachment('capture.png', 'image/png', data)])
+            self.assertNotIn('data', result)
+
+            duplicate = watcher.execute_orchestration_tool(root, 'root', call, 1, images)
+            self.assertFalse(duplicate['ok'])
+            self.assertIn('duplicate', duplicate['error'])
+            self.assertEqual(len(images), 1)
+
+        unsupported = web.WebSessionWatcher(
+            mock.Mock(),
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+        rejected = unsupported.execute_orchestration_tool(root, 'root', call, 0, [])
+        self.assertFalse(rejected['ok'])
+        self.assertIn('chatgpt-web', rejected['error'])
+
+    def test_attach_image_scan_to_delivery_keeps_binary_out_of_json(self) -> None:
+        data = bytes.fromhex('89504e470d0a1a0a') + b'private-image-bytes'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'pixels.png'
+            path.write_bytes(data)
+            request = {
+                'session': 'root',
+                'id': 'show-image',
+                'tool': 'attach_image',
+                'path': str(path),
+            }
+            interface = web.ChatGPTWeb()
+            interface.latest_assistant_snapshot = mock.Mock(
+                return_value=web.AssistantSnapshot('assistant', (), '')
+            )
+            interface.valid_request_from_snapshot = mock.Mock(
+                return_value=('source', request, 'fingerprint')
+            )
+            interface.emulate_active_page = mock.Mock(return_value=None)
+            interface.latest_user_message = mock.Mock(return_value=('previous-user', 'Earlier.'))
+            interface.submit = mock.Mock()
+
+            def execute(request, **kwargs):
+                return kwargs['tool_executor'](request, 0)
+
+            watcher = web.WebSessionWatcher(
+                interface,
+                validate_request=lambda request: None,
+                execute_request=execute,
+                fenced_result=lambda result: '```\n' + json.dumps(result) + '\n```',
+                too_long_fallback=lambda request, result: 'FALLBACK',
+                root_session_id='root',
+                settle_seconds=0.0,
+            )
+            session = web.WebSession('root-chat', 'Root', mock.Mock())
+            self.assertFalse(watcher.scan_session(session, 0.0))
+            self.assertTrue(watcher.scan_session(session, 0.0))
+            self.assertEqual(len(session.pending_responses), 1)
+            pending = session.pending_responses[0]
+            self.assertEqual(pending.images, (web.ImageAttachment('pixels.png', 'image/png', data),))
+            self.assertIn('"tool": "attach_image"', pending.result)
+            self.assertNotIn('private-image-bytes', pending.result)
+            self.assertTrue(watcher.deliver_session(session, 0.0))
+            submitted = interface.submit.call_args
+            self.assertIs(submitted.args[0], session)
+            self.assertIn('"tool": "attach_image"', submitted.args[1])
+            self.assertEqual(submitted.kwargs['images'], pending.images)
+
     def test_restart_is_root_only_and_rejects_duplicate_requests(self) -> None:
         watcher = web.WebSessionWatcher(
             mock.Mock(),
@@ -3399,6 +3554,40 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIsNotNone(state.terminal_response)
         self.assertEqual(state.terminal_response[0], 'Finished work.')
 
+    def test_protocol_state_recovers_terminal_after_escaped_tool_result(self) -> None:
+        interface = web.ChatGPTWeb()
+        request = {
+            'session': 'root',
+            'calls': [{'id': 'stage', 'tool': 'run'}, {'id': 'push', 'tool': 'run'}],
+        }
+        result = (
+            '```\n[\n  {"id":"stage","tool":"run","ok":true},\n'
+            '  {"id":"push","tool":"run","ok":true}\n]\n```'
+        )
+        escaped = result.replace('```', r'\`\`\`').replace('  ', '&#x20;')
+        page = FakePage(
+            'https' + '://chatgpt.com/c/root',
+            message_roles=['assistant', 'user', 'assistant'],
+            message_role_ids=['request', 'result', 'final'],
+            message_texts=[
+                '{"session":"root","calls":[{"id":"stage","tool":"run"},'
+                '{"id":"push","tool":"run"}]}',
+                escaped,
+                'Committed and pushed successfully!',
+            ],
+        )
+        session = web.WebSession('root', 'Root', page)
+
+        self.assertFalse(
+            interface.protocol_tool_result_matches_request(
+                escaped.replace('"id":"push"', '"id":"wrong"'), request
+            )
+        )
+        state = interface.conversation_protocol_state(session, lambda request: None)
+        self.assertFalse(state.request_pending)
+        self.assertIsNotNone(state.terminal_response)
+        self.assertEqual(state.terminal_response[0], 'Committed and pushed successfully!')
+
     def test_protocol_state_does_not_treat_human_reply_as_tool_result(self) -> None:
         interface = web.ChatGPTWeb()
         page = FakePage(
@@ -4043,6 +4232,31 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertEqual(a.delivered, 1)
         self.assertIsNone(a.delivery_failure_started_at)
         progress.set_status.assert_called_with('[sent]')
+
+    def test_image_delivery_retries_with_same_binary_payload(self) -> None:
+        interface = mock.Mock()
+        interface.submit.side_effect = [RuntimeError('busy'), None]
+        image = web.ImageAttachment('capture.png', 'image/png', b'pixels')
+        session = web.WebSession(
+            'root', 'Root', mock.Mock(),
+            pending_responses=[web.PendingResponse('RESULT', 'FALLBACK', images=(image,))],
+        )
+        watcher = web.WebSessionWatcher(
+            interface,
+            validate_request=lambda request: None,
+            execute_request=mock.Mock(),
+            fenced_result=str,
+            too_long_fallback=lambda request, result: 'FALLBACK',
+        )
+
+        self.assertFalse(watcher.deliver_session(session, 0.0))
+        self.assertEqual(len(session.pending_responses), 1)
+        self.assertTrue(watcher.deliver_session(session, 0.25))
+        self.assertEqual(session.pending_responses, [])
+        self.assertEqual(interface.submit.call_args_list, [
+            mock.call(session, 'RESULT\n', images=(image,)),
+            mock.call(session, 'RESULT\n', images=(image,)),
+        ])
 
     def test_delivery_backoff_caps_without_huge_integer_float_conversion(self) -> None:
         interface = mock.Mock()

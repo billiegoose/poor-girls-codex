@@ -314,6 +314,22 @@ class InterfaceSelectionTests(unittest.TestCase):
             supported_tools=pgc.SUPPORTED_TOOLS,
         )
 
+    def test_attach_image_validation_and_bootstrap_advertisement(self) -> None:
+        pgc.validate_web_session_request(
+            {'session': 'abc', 'id': 'view', 'tool': 'attach_image', 'path': 'capture.png'},
+            'abc',
+        )
+        for invalid_path in (None, '', '   ', 5):
+            with self.assertRaisesRegex(ValueError, 'attach_image path'):
+                pgc.validate_web_session_request(
+                    {'session': 'abc', 'tool': 'attach_image', 'path': invalid_path},
+                    'abc',
+                )
+        with self.assertRaisesRegex(ValueError, 'unsupported tool'):
+            pgc.validate_request({'tool': 'attach_image', 'path': 'capture.png'})
+        self.assertIn('attach_image {path}', pgc.root_web_bootstrap_prompt('abc'))
+        self.assertIn('attach_image {path}', pgc.subagent_web_bootstrap_prompt('abc::worker'))
+
     def test_restart_validation_and_root_only_advertisement(self) -> None:
         pgc.validate_web_session_request(
             {'session': 'abc', 'id': 'restart', 'tool': 'restart'}, 'abc'
