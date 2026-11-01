@@ -31,7 +31,7 @@ SEND_RETRY_INITIAL_SECONDS = 0.25
 SEND_RETRY_MAX_SECONDS = 8.0
 MESSAGE_TOO_LONG_TEXT = "The message you submitted was too long, please edit it and resubmit."
 LOCAL_TOOLS = {"read", "find", "tree", "status", "diff", "edit", "write", "run"}
-WEB_ORCHESTRATION_TOOLS = {"subagent", "handoff", "restart", "attach_image"}
+WEB_ORCHESTRATION_TOOLS = {"subagent", "handoff", "restart", "attach_image", "camera"}
 SUPPORTED_TOOLS = LOCAL_TOOLS | WEB_ORCHESTRATION_TOOLS
 SESSION_DIR = ".pgc"
 SESSION_FILE = os.path.join(SESSION_DIR, "session")
@@ -446,6 +446,8 @@ def web_bootstrap_prompt(session_id: str, *, role: str) -> str:
         "Additional chatgpt-web tools:\n"
         "- attach_image {path} - attach a local PNG/JPEG/GIF/WebP file to the same user turn "
         "as its JSON tool result, without putting image bytes in JSON (Playwright backend only).\n"
+        "- camera {camera} - ask the separately authorized A.P.P.L.E.P.I.E. macOS app for a still JPEG "
+        "of board or monitor, attached to the same result turn (Playwright backend only).\n"
         "- subagent {name,prompt} - create a fresh ChatGPT subagent conversation; "
         "name may contain letters, digits, '-' and '_', and must start with a letter or digit."
     )
@@ -650,6 +652,9 @@ def validate_request(request: Any, *, supported_tools: set[str] = LOCAL_TOOLS) -
             path = call.get("path")
             if not isinstance(path, str) or not path.strip():
                 raise ValueError(f"call {index} attach_image path must be a non-empty string")
+        if tool == "camera":
+            if call.get("camera") not in ("board", "monitor"):
+                raise ValueError(f"call {index} camera must be 'board' or 'monitor'")
         if tool == "subagent":
             name = call.get("name")
             prompt = call.get("prompt")

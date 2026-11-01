@@ -293,6 +293,12 @@ The `chatgpt-web` backend supports `attach_image {path}` in a JSON tool request.
 
 Example: `{"session":"<routing-id>","id":"view","tool":"attach_image","path":"screenshots/layout.png"}`
 
+### A.P.P.L.E.P.I.E. instrument camera captures
+
+The native app uses bundle ID `com.ananabanana.APPLEPIE` and listens on the user-only Unix socket `~/Library/Application Support/APPLEPIE/capture.sock`. After upgrading from A LIAR, relaunch the newly named app, grant macOS Camera permission again, and explicitly authorize the current PGC routing session.
+
+When the separate native macOS **A.P.P.L.E.P.I.E.** app is installed and running, the `chatgpt-web` backend also supports `camera {camera}` with `camera` set to `board` (Basys 3 FPGA) or `monitor` (VGA display). Example: `{"session":"<routing-id>","id":"inspect-board","tool":"camera","camera":"board"}`. The app—not PGC—owns macOS Camera authorization. The user must assign webcams, opt each role into automation, make a PGC camera request so its routing session appears in A.P.P.L.E.P.I.E., and explicitly grant that session a time-limited window (up to six hours). The window is in memory, applies only to that routing session, and can be revoked in the app. Requests use a user-only local Unix socket; PGC validates the returned private JPEG and attaches the image bytes using the same transport as `attach_image`. Missing permission, disconnected devices, or expired authorization return structured errors and **no image**. The `terminal-browser` backend cannot attach camera images.
+
 ### Web subagents
 
 In `chatgpt-web` mode, a conversation can create a fresh ChatGPT subagent tab with the `subagent {name,prompt}` orchestration tool. Subagent names are alphanumeric, and the child receives a derived routing id of `<parent-session>::<name>`. Because routing matches the current session tree, children can create nested subagents using the same convention.

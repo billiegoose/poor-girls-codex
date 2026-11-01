@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, unquote, urlparse
 
+from camera_bridge import CameraBridgeError, request_capture
 from progress_ui import ResponseProgress, color as progress_color
 
 
@@ -1655,6 +1656,26 @@ class WebSessionWatcher:
                 'status': 'queued for attachment to this tool result',
             }
 
+        if tool == 'camera':
+            if not isinstance(self.interface, ChatGPTWeb):
+                return {**base, 'ok': False, 'error': 'camera requires the chatgpt-web backend'}
+            if image_attachments is None:
+                return {**base, 'ok': False, 'error': 'image delivery is unavailable'}
+            try:
+                reply = request_capture(call['camera'], session_id=routing_session_id)
+            except (CameraBridgeError, OSError, KeyError) as exc:
+                return {**base, 'ok': False, 'error': str(exc)}
+            if not reply.metadata['ok']:
+                return {**base, **reply.metadata, 'ok': False}
+            assert reply.jpeg_data is not None and reply.image_name is not None
+            attachment = ImageAttachment(reply.image_name, 'image/jpeg', reply.jpeg_data)
+            if any(existing.name == attachment.name for existing in image_attachments):
+                return {**base, 'ok': False, 'error': f'duplicate image filename: {attachment.name}'}
+            if sum(len(image.data) for image in image_attachments) + len(attachment.data) > MAX_IMAGE_BATCH_BYTES:
+                return {**base, 'ok': False, 'error': 'total image attachment size exceeds 40 MiB'}
+            image_attachments.append(attachment)
+            return {**base, **reply.metadata, 'ok': True, 'status': 'queued for image attachment'}
+
         if tool == 'subagent':
             if self.bootstrap_prompt_for_session is None:
                 return {**base, 'ok': False, 'error': 'subagents are unavailable in this watcher'}
@@ -2170,7 +2191,7 @@ class WebSessionWatcher:
         calls = self.request_calls(request)
         image_attachments: list[ImageAttachment] = []
         has_orchestration = any(
-            isinstance(call, dict) and call.get('tool') in {'subagent', 'handoff', 'restart', 'attach_image'}
+            isinstance(call, dict) and call.get('tool') in {'subagent', 'handoff', 'restart', 'attach_image', 'camera'}
             for call in calls
         )
         progress_prefix = self.progress_prefix(routing_session_id)
