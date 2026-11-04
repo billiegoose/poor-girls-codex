@@ -209,6 +209,10 @@ System Settings
 
 The ChatGPT desktop application must be running with an ordinary conversation open.
 
+## T3 Code / Agent Client Protocol (experimental)
+
+PGC can run as a local ACP agent for clients such as T3 Code. In T3's **Local ACP command** provider settings, select this checkout's absolute `poor_girls_codex` launcher path and pass `acp` as its argument. PGC negotiates ACP v1 and uses the existing ChatGPT browser tool harness. See [the ACP setup guide](docs/acp.md) for details and current limitations.
+
 ## Testing
 
 Poor Girl's Codex uses Python's standard-library `unittest` framework. `pytest` is not a project dependency.

@@ -1209,7 +1209,7 @@ def main() -> None:
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=("watch", "copy", "execute", "paste", "once", "export-conversation"),
+        choices=("watch", "acp", "copy", "execute", "paste", "once", "export-conversation"),
         default="watch",
         help="watch=continuous background harness; copy/execute/paste/once are debugging modes; export-conversation writes a read-only transcript",
     )
@@ -1279,6 +1279,14 @@ def main() -> None:
 
     if args.conversation_reference is not None:
         parser.error("conversation_reference is only valid with export-conversation")
+
+    if args.mode == "acp":
+        if args.interface != "chatgpt-web":
+            parser.error("ACP currently requires the chatgpt-web interface")
+        from acp_server import serve_stdio
+        from chatgpt_web import DEFAULT_CDP_URL
+        serve_stdio(cdp_url=args.cdp_url or DEFAULT_CDP_URL)
+        return
 
     if args.interface == "terminal-browser":
         if args.mode != "watch":

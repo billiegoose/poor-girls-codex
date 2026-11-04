@@ -44,6 +44,8 @@ STALL_RELOAD_MIN_SECONDS = 5.0 * 60.0
 STALL_RELOAD_MAX_SECONDS = 15.0 * 60.0
 SUBMIT_SETTLE_TIMEOUT_SECONDS = 10.0
 SUBMIT_SETTLE_POLL_SECONDS = 0.05
+CONVERSATION_START_TIMEOUT_SECONDS = 120.0
+CONVERSATION_START_POLL_SECONDS = 0.25
 RECENT_ASSISTANT_MESSAGE_LIMIT = 10
 DELIVERY_RETRY_INITIAL_SECONDS = 0.25
 DELIVERY_RETRY_MAX_SECONDS = 8.0
@@ -1220,6 +1222,40 @@ class ChatGPTWeb:
         # foreground-tab actionability.
         button.last.evaluate('element => element.click()')
 
+    def wait_for_started_conversation(
+        self,
+        page: Any,
+        *,
+        should_abort: Callable[[], bool] | None = None,
+    ) -> None:
+        """Wait for a saved ChatGPT conversation and its first assistant turn.
+
+        ChatGPT initially navigates to /c/local-chatgpt:... while saving a
+        new conversation. That transient URL is not a usable routing ID.
+        Polling both conditions avoids treating the intermediate navigation
+        as a finished startup and allows ACP cancellation to interrupt it.
+        """
+        deadline = time.monotonic() + CONVERSATION_START_TIMEOUT_SECONDS
+        while True:
+            if should_abort is not None and should_abort():
+                raise RuntimeError('ChatGPT conversation startup cancelled')
+            url = str(page.url)
+            persistent = self.conversation_id_for_url(url) is not None
+            assistant_started = page.locator(ASSISTANT_START_SELECTOR).count() > 0
+            if persistent and assistant_started:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f'ChatGPT conversation did not become ready in '
+                    f'{CONVERSATION_START_TIMEOUT_SECONDS:g}s '
+                    f'(persistent URL={persistent}, assistant started={assistant_started}, '
+                    f'last URL={url})'
+                )
+            page.wait_for_timeout(max(1, min(
+                int(CONVERSATION_START_POLL_SECONDS * 1000), int(remaining * 1000),
+            )))
+
     def _create_conversation(
         self,
         context: Any,
@@ -1227,6 +1263,7 @@ class ChatGPTWeb:
         label: str | None,
         prompt: str,
         emulate_active: bool = False,
+        should_abort: Callable[[], bool] | None = None,
     ) -> WebSession:
         page = context.new_page()
         self.instrument_conversations_responses(page)
@@ -1239,17 +1276,10 @@ class ChatGPTWeb:
             self.composer(page).last.wait_for(state='visible', timeout=15_000)
             pending = WebSession('', label or 'new chat', page, cdp_session=cdp_session)
             self.submit(pending, prompt)
-            page.wait_for_url(
-                lambda url: self.conversation_id_for_url(str(url)) is not None,
-                timeout=30_000,
-            )
-            # Do not let the next subagent steal foreground focus until this
-            # conversation's assistant turn has actually started. The new DOM
-            # exposes Stop before it mounts the assistant message unit.
-            page.locator(ASSISTANT_START_SELECTOR).last.wait_for(
-                state='attached',
-                timeout=30_000,
-            )
+            # ChatGPT may stay at /c/local-chatgpt:... while saving the first
+            # turn. Wait for a persistent ID and assistant activity together.
+            # ACP can cancel this longer readiness window between polls.
+            self.wait_for_started_conversation(page, should_abort=should_abort)
             conversation_id, page_label = self.describe_page(page)
             return WebSession(
                 conversation_id,
@@ -1280,13 +1310,17 @@ class ChatGPTWeb:
             emulate_active=True,
         )
 
-    def create_root_conversation(self, prompt: str) -> WebSession:
+    def create_root_conversation(
+        self, prompt: str, *, should_abort: Callable[[], bool] | None = None,
+    ) -> WebSession:
         if self._browser is None:
             raise RuntimeError('chatgpt-web is not connected')
         contexts = self._browser.contexts
         if not contexts:
             raise RuntimeError('connected Chrome browser has no usable context')
-        return self._create_conversation(contexts[0], label=None, prompt=prompt)
+        return self._create_conversation(
+            contexts[0], label=None, prompt=prompt, should_abort=should_abort,
+        )
 
     def open_conversation(self, conversation_id: str) -> WebSession:
         if self._browser is None:
@@ -1420,6 +1454,7 @@ class WebSessionWatcher:
         root_conversation_id: str | None = None,
         new_root_conversation: bool = False,
         on_session_attached: Callable[[WebSession], None] | None = None,
+        managed_only: bool = False,
         settle_seconds: float = DEFAULT_SETTLE_SECONDS,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
@@ -1438,6 +1473,7 @@ class WebSessionWatcher:
         self.new_root_conversation = new_root_conversation
         self.ignored_conversation_ids: set[str] = set()
         self.on_session_attached = on_session_attached
+        self.managed_only = managed_only
         self.settle_seconds = settle_seconds
         self.poll_seconds = poll_seconds
         self.clock = clock
@@ -1748,8 +1784,10 @@ class WebSessionWatcher:
     def refresh_sessions(self, *, prime_new: bool = True) -> None:
         live: set[str] = set()
         for page in self.interface.pages():
-            self.interface.instrument_conversations_responses(page)
             conversation_id = ChatGPTWeb.conversation_id_for_url(str(page.url))
+            if self.managed_only and conversation_id not in self.sessions:
+                continue
+            self.interface.instrument_conversations_responses(page)
             label = None
             if conversation_id is None:
                 try:
@@ -1760,6 +1798,8 @@ class WebSessionWatcher:
                     # Treat it as no longer live instead of crashing the watcher.
                     continue
             if conversation_id in self.ignored_conversation_ids:
+                continue
+            if self.managed_only and conversation_id not in self.sessions:
                 continue
             live.add(conversation_id)
             session = self.sessions.get(conversation_id)

@@ -557,8 +557,50 @@ class ChatGPTWebTests(unittest.TestCase):
             page.method_calls.index(mock.call.goto('https' + '://chatgpt.com/', wait_until='commit')),
         )
         page.locator.assert_any_call(web.ASSISTANT_START_SELECTOR)
-        page.locator.return_value.last.wait_for.assert_any_call(state='attached', timeout=30_000)
+        page.wait_for_url.assert_not_called()
         self.assertEqual(child.conversation_id, 'child')
+
+    def test_conversation_start_waits_through_local_url_and_assistant_hydration(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        page.url = 'https://chatgpt.com/c/local-chatgpt%3Atemporary'
+        page.locator.return_value.count.side_effect = [0, 0, 1]
+
+        def advance(_milliseconds):
+            page.url = 'https://chatgpt.com/c/persisted-id'
+
+        page.wait_for_timeout.side_effect = advance
+        interface.wait_for_started_conversation(page)
+
+        self.assertEqual(page.wait_for_timeout.call_count, 2)
+        self.assertEqual(page.url, 'https://chatgpt.com/c/persisted-id')
+        page.wait_for_url.assert_not_called()
+
+    def test_conversation_start_wait_is_cancellable(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        page.url = 'https://chatgpt.com/c/local-chatgpt%3Atemporary'
+        page.locator.return_value.count.return_value = 0
+        cancelled = False
+
+        def advance(_milliseconds):
+            nonlocal cancelled
+            cancelled = True
+
+        page.wait_for_timeout.side_effect = advance
+        with self.assertRaisesRegex(RuntimeError, 'startup cancelled'):
+            interface.wait_for_started_conversation(page, should_abort=lambda: cancelled)
+        page.wait_for_timeout.assert_called_once()
+
+    def test_conversation_start_timeout_explains_transient_url(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        page.url = 'https://chatgpt.com/c/local-chatgpt%3Atemporary'
+        page.locator.return_value.count.return_value = 0
+        with mock.patch.object(web, 'CONVERSATION_START_TIMEOUT_SECONDS', 0):
+            with self.assertRaisesRegex(RuntimeError, 'persistent URL=False, assistant started=False'):
+                interface.wait_for_started_conversation(page)
+        page.wait_for_timeout.assert_not_called()
 
     def test_create_subagent_emulates_focused_active_page_with_cdp(self) -> None:
         interface = web.ChatGPTWeb()
