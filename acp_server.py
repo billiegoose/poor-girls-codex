@@ -19,7 +19,37 @@ from pathlib import Path
 from typing import Any, Callable, TextIO
 
 import poor_girls_codex as pgc
-from chatgpt_web import ChatGPTWeb, DEFAULT_CDP_URL, WebSession, WebSessionWatcher
+from chatgpt_web import (
+    ChatGPTWeb, DEFAULT_CDP_URL, DEFAULT_SETTLE_SECONDS, THINKING_EFFORTS,
+    WebSession, WebSessionWatcher,
+)
+
+
+_PULL_REQUEST_LINKING_OPEN = {'<pull_request_linking>', r'\<pull_request_linking>'}
+_PULL_REQUEST_LINKING_CLOSE = {'</pull_request_linking>', r'\</pull_request_linking>'}
+
+
+def strip_pull_request_linking(prompt: str) -> str:
+    """Remove complete standalone T3 PR-instruction blocks before browser submission.
+
+    Preserve inline mentions and unclosed blocks, including their original line
+    endings. A subsequent opening tag also leaves a prior unclosed block intact.
+    """
+    output: list[str] = []
+    pending: list[str] = []
+    for line in prompt.splitlines(keepends=True):
+        tag = line.strip()
+        if tag in _PULL_REQUEST_LINKING_OPEN:
+            output.extend(pending)
+            pending = [line]
+        elif pending:
+            pending.append(line)
+            if tag in _PULL_REQUEST_LINKING_CLOSE:
+                pending = []
+        else:
+            output.append(line)
+    output.extend(pending)
+    return ''.join(output)
 
 
 @dataclass
@@ -29,6 +59,8 @@ class Turn:
     previous_user_id: str | None = None
     user_id: str | None = None
     cancelled: bool = False
+    completion_candidate: tuple[str, str] | None = None
+    completion_deadline: float = 0.0
 
 
 class AcpSession:
@@ -43,6 +75,26 @@ class AcpSession:
         self.tool_counter = 0
         self.closing = False
         self.close_request_ids: list[int | str] = []
+        self.thinking_effort = 'high'
+
+    def config_options(self) -> list[dict[str, Any]]:
+        return [{
+            'id': 'thinking_effort', 'name': 'Thinking Effort',
+            'category': 'thought_level', 'type': 'select',
+            'description': 'ChatGPT thinking effort. Changes apply to the next browser submission.',
+            'currentValue': self.thinking_effort,
+            'options': [{'value': value, 'name': name} for value, name in THINKING_EFFORTS.items()],
+        }]
+
+    def sync_thinking_effort(self) -> None:
+        # Called on the browser worker, including before tool-result delivery.
+        # In-flight generations keep their effort; the next submission uses
+        # the latest selection, including in this session's subagent tabs.
+        if self.web is not None:
+            self.web.thinking_effort = self.thinking_effort
+        if self.watcher is not None:
+            for web in self.watcher.sessions.values():
+                web.thinking_effort = self.thinking_effort
 
     def validate(self, request: Any) -> None:
         pgc.validate_web_session_request(request, self.routing_id)
@@ -103,6 +155,8 @@ class AcpSession:
 
     def start(self, interface: ChatGPTWeb) -> None:
         assert self.turn is not None
+        self.sync_thinking_effort()
+        browser_prompt = strip_pull_request_linking(self.turn.prompt)
         if self.watcher is None:
             self.watcher = WebSessionWatcher(
                 interface, validate_request=self.validate, execute_request=self.tool_request,
@@ -115,7 +169,8 @@ class AcpSession:
             )
         if self.web is None:
             web = interface.create_root_conversation(
-                self.bootstrap(self.turn.prompt),
+                self.bootstrap(browser_prompt),
+                thinking_effort=self.thinking_effort,
                 should_abort=lambda: (
                     self.server.stopping.is_set() or self.closing
                     or self.turn is None or self.turn.cancelled
@@ -130,12 +185,14 @@ class AcpSession:
                 raise RuntimeError('ChatGPT is still generating the previous response')
             latest = interface.latest_user_message(self.web)
             self.turn.previous_user_id = latest[0] if latest else None
-            interface.submit(self.web, self.turn.prompt)
+            interface.submit(self.web, browser_prompt)
             self.watcher.note_forward_progress(self.web, time.monotonic())
 
     def complete(self, text: str) -> None:
         turn = self.turn
-        if turn is None or turn.cancelled:
+        if turn is None or turn.cancelled or not text.strip():
+            # A newly mounted assistant node can be empty even after ChatGPT
+            # hides its Stop button. Never acknowledge an empty ACP answer.
             return
         self.server.update(self.session_id, {
             'sessionUpdate': 'agent_message_chunk',
@@ -152,14 +209,27 @@ class AcpSession:
         if turn.user_id is None and latest and latest[0] != turn.previous_user_id:
             turn.user_id = latest[0]
         if turn.user_id is None or interface.is_generating(web) is True:
+            turn.completion_candidate = None
             return
         if web.pending_responses or web.retire_requested:
+            turn.completion_candidate = None
             return
         snapshot = interface.latest_assistant_snapshot(web)
         if snapshot is None or self.validate_snapshot_request(interface, snapshot):
+            turn.completion_candidate = None
             return
         result = interface.terminal_response_from_snapshot(web, snapshot, turn.user_id)
-        if result is not None:
+        if result is None or not result[0].strip():
+            turn.completion_candidate = None
+            return
+        now = time.monotonic()
+        if turn.completion_candidate != result:
+            # The DOM can briefly contain partial prose after the Stop button
+            # disappears. Require an unchanged message across polling cycles.
+            turn.completion_candidate = result
+            turn.completion_deadline = now + DEFAULT_SETTLE_SECONDS
+            return
+        if now >= turn.completion_deadline:
             self.complete(result[0])
 
     def validate_snapshot_request(self, interface: ChatGPTWeb, snapshot: Any) -> bool:
@@ -311,8 +381,24 @@ class AcpServer:
                 if not isinstance(params.get('mcpServers', []), list):
                     raise ValueError('mcpServers must be an array')
                 session_id = 'pgc-' + secrets.token_hex(12)
-                self.sessions[session_id] = AcpSession(self, session_id, str(Path(cwd).resolve()))
-                self.respond(request_id, {'sessionId': session_id})
+                session = AcpSession(self, session_id, str(Path(cwd).resolve()))
+                self.sessions[session_id] = session
+                self.respond(request_id, {'sessionId': session_id, 'configOptions': session.config_options()})
+                return
+            if method == 'session/set_config_option':
+                if not is_request:
+                    return
+                session = self.get_session(params)
+                if session.closing:
+                    self.error(request_id, -32000, 'This session is closing')
+                    return
+                if params.get('configId') != 'thinking_effort':
+                    raise ValueError('Unknown configId')
+                value = params.get('value')
+                if not isinstance(value, str) or value not in THINKING_EFFORTS:
+                    raise ValueError('Thinking Effort must be instant, medium, or high')
+                session.thinking_effort = value
+                self.respond(request_id, {'configOptions': session.config_options()})
                 return
             if method == 'session/prompt':
                 if not is_request:
@@ -432,6 +518,7 @@ class AcpServer:
                         session.cancel(interface)
                         continue
                     try:
+                        session.sync_thinking_effort()
                         self.in_workspace(session, lambda: (session.watcher.step(), session.check_completion(interface)))
                     except Exception as exc:
                         print(f'  [acp:{session.session_id}] watcher error: {exc}', file=sys.stderr)

@@ -33,6 +33,7 @@ ASSISTANT_START_SELECTOR = (
     f'{STOP_SELECTOR}, button[aria-label="Stop"]'
 )
 DEFAULT_CDP_URL = 'http' + '://127.0.0.1:9222'
+THINKING_EFFORTS = {'instant': 'Instant', 'medium': 'Medium', 'high': 'High'}
 CHROME_CDP_STARTUP_TIMEOUT_SECONDS = 10.0
 CHROME_CDP_RETRY_SECONDS = 0.25
 DEFAULT_SETTLE_SECONDS = 0.35
@@ -190,6 +191,7 @@ class WebSession:
     next_stall_reload_at: float | None = None
     stall_last_user_message_id: str | None = None
     stall_terminal: bool = False
+    thinking_effort: str | None = None
 
     @property
     def url(self) -> str:
@@ -741,7 +743,7 @@ class ChatGPTWeb:
         snapshot: AssistantSnapshot,
         expected_user_message_id: str,
     ) -> tuple[str, str] | None:
-        if snapshot.message_id is None:
+        if snapshot.message_id is None or not snapshot.text.strip():
             return None
         messages = self.message_locator(session.page)
         count = messages.count()
@@ -959,7 +961,7 @@ class ChatGPTWeb:
                         record['role'] == 'user'
                         for record in records[bootstrap_index + 1 :]
                     )
-                if terminal:
+                if terminal and latest['text'].strip():
                     text = latest['text']
                     identity = (latest['message_id'] or '') + '\0terminal-response\0' + text
                     terminal_response = (
@@ -1003,6 +1005,40 @@ class ChatGPTWeb:
         if button.count() > 0:
             return button
         return page.get_by_role('button', name='Stop', exact=True)
+
+    def set_thinking_effort(self, session: WebSession, effort: str) -> None:
+        """Select and verify the three-position ChatGPT thinking-effort slider."""
+        if effort not in THINKING_EFFORTS:
+            raise ValueError(f'Unknown ChatGPT thinking effort: {effort}')
+        label = THINKING_EFFORTS[effort]
+        button = session.page.get_by_role('button', name='Select ChatGPT model', exact=True)
+        # The composer can appear before the model picker finishes hydrating.
+        button.wait_for(state='visible', timeout=30_000)
+        selected = button.filter(has_text=re.compile(rf'{label}\s*$'))
+        if selected.count() > 0:
+            return
+
+        button.evaluate('element => element.click()')
+        menu = session.page.get_by_role('menu', name='Select ChatGPT model', exact=True)
+        try:
+            power = menu.get_by_role('menuitem', name='Power', exact=True)
+            power.wait_for(state='visible', timeout=5_000)
+            # The slider thumb is aria-hidden; its containing menuitem owns
+            # keyboard interaction. Do not drag it or depend on coordinates.
+            slider = power.locator('[role="slider"]')
+            minimum = slider.get_attribute('aria-valuemin')
+            maximum = slider.get_attribute('aria-valuemax')
+            current = slider.get_attribute('aria-valuenow')
+            if minimum != '0' or maximum != '2' or current not in ('0', '1', '2'):
+                raise RuntimeError(f'{session.label}: unsupported ChatGPT thinking-effort slider')
+            target = tuple(THINKING_EFFORTS).index(effort)
+            delta = target - int(current)
+            for _ in range(abs(delta)):
+                power.press('ArrowRight' if delta > 0 else 'ArrowLeft', timeout=5_000)
+            selected.wait_for(state='visible', timeout=5_000)
+        finally:
+            button.press('Escape', timeout=5_000)
+            menu.wait_for(state='hidden', timeout=5_000)
 
     def set_composer_text(self, session: WebSession, text: str) -> None:
         if session.cdp_session is None:
@@ -1142,6 +1178,8 @@ class ChatGPTWeb:
     def submit(
         self, session: WebSession, text: str, *, images: tuple[ImageAttachment, ...] = ()
     ) -> None:
+        if session.thinking_effort is not None:
+            self.set_thinking_effort(session, session.thinking_effort)
         self.set_composer_text(session, text)
 
         def send_button():
@@ -1264,6 +1302,7 @@ class ChatGPTWeb:
         prompt: str,
         emulate_active: bool = False,
         should_abort: Callable[[], bool] | None = None,
+        thinking_effort: str | None = None,
     ) -> WebSession:
         page = context.new_page()
         self.instrument_conversations_responses(page)
@@ -1274,7 +1313,10 @@ class ChatGPTWeb:
             # below is the actual readiness boundary we care about.
             page.goto('https' + '://chatgpt.com/', wait_until='commit')
             self.composer(page).last.wait_for(state='visible', timeout=15_000)
-            pending = WebSession('', label or 'new chat', page, cdp_session=cdp_session)
+            pending = WebSession(
+                '', label or 'new chat', page, cdp_session=cdp_session,
+                thinking_effort=thinking_effort,
+            )
             self.submit(pending, prompt)
             # ChatGPT may stay at /c/local-chatgpt:... while saving the first
             # turn. Wait for a persistent ID and assistant activity together.
@@ -1286,6 +1328,7 @@ class ChatGPTWeb:
                 label or page_label,
                 page,
                 cdp_session=cdp_session,
+                thinking_effort=thinking_effort,
             )
         except Exception:
             if cdp_session is not None:
@@ -1308,10 +1351,12 @@ class ChatGPTWeb:
             label=label,
             prompt=prompt,
             emulate_active=True,
+            thinking_effort=origin.thinking_effort,
         )
 
     def create_root_conversation(
         self, prompt: str, *, should_abort: Callable[[], bool] | None = None,
+        thinking_effort: str | None = None,
     ) -> WebSession:
         if self._browser is None:
             raise RuntimeError('chatgpt-web is not connected')
@@ -1320,6 +1365,7 @@ class ChatGPTWeb:
             raise RuntimeError('connected Chrome browser has no usable context')
         return self._create_conversation(
             contexts[0], label=None, prompt=prompt, should_abort=should_abort,
+            thinking_effort=thinking_effort,
         )
 
     def open_conversation(self, conversation_id: str) -> WebSession:

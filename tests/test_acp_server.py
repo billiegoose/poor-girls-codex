@@ -49,6 +49,132 @@ class AcpServerTests(unittest.TestCase):
         self.assertEqual(self.server.sessions[session_id].cwd, str(Path(self.directory.name).resolve()))
         self.assertIsNone(self.server.worker)
 
+    def test_advertises_thinking_effort_as_t3_reasoning_control(self):
+        self.new_session()
+        self.assertEqual(self.messages()[-1]['result']['configOptions'], [{
+            'id': 'thinking_effort', 'name': 'Thinking Effort',
+            'category': 'thought_level', 'type': 'select',
+            'description': 'ChatGPT thinking effort. Changes apply to the next browser submission.',
+            'currentValue': 'high',
+            'options': [
+                {'value': 'instant', 'name': 'Instant'},
+                {'value': 'medium', 'name': 'Medium'},
+                {'value': 'high', 'name': 'High'},
+            ],
+        }])
+
+    def test_config_changes_are_session_local_and_work_during_a_turn(self):
+        session_id = self.new_session()
+        other_id = self.new_session()
+        session = self.server.sessions[session_id]
+        session.turn = acp.Turn(10, 'Working')
+        for effort in ('instant', 'high', 'medium'):
+            with self.subTest(effort=effort):
+                self.server.handle({
+                    'jsonrpc': '2.0', 'id': 2, 'method': 'session/set_config_option',
+                    'params': {'sessionId': session_id, 'configId': 'thinking_effort', 'value': effort},
+                })
+                self.assertEqual(self.messages()[-1]['result']['configOptions'], session.config_options())
+                self.assertEqual(session.thinking_effort, effort)
+                self.assertEqual(self.server.sessions[other_id].thinking_effort, 'high')
+        self.assertIsNone(self.server.worker)
+        self.assertTrue(self.server.jobs.empty())
+
+    def test_invalid_config_does_not_change_effort(self):
+        session_id = self.new_session()
+        for overrides in (
+            {'sessionId': 'unknown'}, {'configId': 'unknown'},
+            {'value': 'low'}, {'value': True}, {'value': []}, {'value': None},
+        ):
+            with self.subTest(overrides=overrides):
+                self.server.handle({
+                    'jsonrpc': '2.0', 'id': 2, 'method': 'session/set_config_option',
+                    'params': {'sessionId': session_id, 'configId': 'thinking_effort',
+                               'value': 'high', **overrides},
+                })
+                self.assertEqual(self.messages()[-1]['error']['code'], -32602)
+                self.assertEqual(self.server.sessions[session_id].thinking_effort, 'high')
+
+    def test_closing_session_rejects_effort_changes(self):
+        session_id = self.new_session()
+        session = self.server.sessions[session_id]
+        session.closing = True
+        self.server.handle({
+            'jsonrpc': '2.0', 'id': 2, 'method': 'session/set_config_option',
+            'params': {'sessionId': session_id, 'configId': 'thinking_effort', 'value': 'high'},
+        })
+        self.assertEqual(self.messages()[-1]['error']['code'], -32000)
+        self.assertEqual(session.thinking_effort, 'high')
+
+    def test_sync_effort_updates_owned_tabs_and_followup_submission(self):
+        session_id = self.new_session()
+        session = self.server.sessions[session_id]
+        root, child = self.fake_web('root'), self.fake_web('child')
+        session.web = root
+        session.watcher = mock.Mock()
+        session.watcher.sessions = {'root': root, 'child': child}
+        session.thinking_effort = 'instant'
+        session.turn = acp.Turn(10, 'Follow up')
+        interface = mock.Mock()
+        interface.is_generating.return_value = False
+        interface.latest_user_message.return_value = None
+        session.start(interface)
+        self.assertEqual(root.thinking_effort, 'instant')
+        self.assertEqual(child.thinking_effort, 'instant')
+        interface.submit.assert_called_once_with(root, 'Follow up')
+
+    def test_strip_pull_request_linking_preserves_unrelated_text(self):
+        prompt = (
+            'Please change the literal `<pull_request_linking>` label.\n'
+            '<runtime_info>Keep this metadata.</runtime_info>\n'
+            '<pull_request_linking>\n'
+            'T3-only instruction text\n'
+            '</pull_request_linking>\n'
+            'Continue with the actual task.\n'
+            '\\<pull_request_linking>\r\n'
+            'More T3-only instructions\r\n'
+            '\\</pull_request_linking>\r\n'
+            'End.\n'
+        )
+        self.assertEqual(acp.strip_pull_request_linking(prompt), (
+            'Please change the literal `<pull_request_linking>` label.\n'
+            '<runtime_info>Keep this metadata.</runtime_info>\n'
+            'Continue with the actual task.\n'
+            'End.\n'
+        ))
+        unclosed = 'Before\n<pull_request_linking>\nNever closed\nAfter'
+        self.assertEqual(acp.strip_pull_request_linking(unclosed), unclosed)
+        inline = 'An inline <pull_request_linking> tag is not a block.'
+        self.assertEqual(acp.strip_pull_request_linking(inline), inline)
+        nested_unclosed = (
+            'A\n<pull_request_linking>\nUnclosed\n'
+            '<pull_request_linking>\nComplete\n</pull_request_linking>\nB\n'
+        )
+        self.assertEqual(acp.strip_pull_request_linking(nested_unclosed), (
+            'A\n<pull_request_linking>\nUnclosed\nB\n'
+        ))
+
+    def test_strips_t3_instructions_on_first_and_followup_submissions(self):
+        session_id = self.new_session()
+        session = self.server.sessions[session_id]
+        prompt = 'Implement feature.\n<pull_request_linking>\nT3 wiring\n</pull_request_linking>\nDone.'
+        filtered = 'Implement feature.\nDone.'
+        session.turn = acp.Turn(9, prompt)
+        interface = mock.Mock()
+        interface.create_root_conversation.return_value = WebSession('root', 'Root', mock.Mock())
+        with mock.patch.object(acp, 'WebSessionWatcher'):
+            session.start(interface)
+        self.assertEqual(
+            interface.create_root_conversation.call_args.args[0], session.bootstrap(filtered),
+        )
+        self.assertEqual(session.turn.prompt, prompt)
+        session.turn = acp.Turn(10, prompt)
+        interface.is_generating.return_value = False
+        interface.latest_user_message.return_value = None
+        session.start(interface)
+        interface.submit.assert_called_once_with(session.web, filtered)
+        self.assertEqual(session.turn.prompt, prompt)
+
     def test_initialize_required_and_invalid_cwd_rejected(self):
         self.server.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'session/new', 'params': {}})
         self.assertEqual(self.messages()[-1]['error']['code'], -32600)
@@ -93,6 +219,7 @@ class AcpServerTests(unittest.TestCase):
         interface.create_root_conversation.return_value = WebSession('root-chat', 'Root', mock.Mock())
         with mock.patch.object(acp, 'WebSessionWatcher'):
             session.start(interface)
+        self.assertEqual(interface.create_root_conversation.call_args.kwargs['thinking_effort'], 'high')
         callback = interface.create_root_conversation.call_args.kwargs['should_abort']
         self.assertFalse(callback())
         session.turn.cancelled = True
@@ -143,9 +270,55 @@ class AcpServerTests(unittest.TestCase):
         interface.latest_assistant_snapshot.return_value = AssistantSnapshot('answer-1', (), text='Done')
         interface.valid_request_from_snapshot.return_value = None
         interface.terminal_response_from_snapshot.return_value = ('Done', 'fingerprint')
-        session.check_completion(interface)
+        with mock.patch.object(acp.time, 'monotonic', side_effect=[100.0, 100.1, 100.4]):
+            session.check_completion(interface)
+            self.assertIsNotNone(session.turn)
+            session.check_completion(interface)
+            self.assertIsNotNone(session.turn)
+            session.check_completion(interface)
         self.assertEqual(self.messages()[-2]['params']['update']['content']['text'], 'Done')
         self.assertEqual(self.messages()[-1]['result']['stopReason'], 'end_turn')
+
+    def test_complete_never_acknowledges_empty_response(self):
+        session_id = self.new_session()
+        session = self.server.sessions[session_id]
+        session.turn = acp.Turn(9, 'Question')
+        for text in ('', '  \n  ', '\t'):
+            session.complete(text)
+        self.assertEqual(len(self.messages()), 2)
+        self.assertIsNotNone(session.turn)
+        session.complete('Actual answer')
+        self.assertEqual(self.messages()[-2]['params']['update']['content']['text'], 'Actual answer')
+        self.assertEqual(self.messages()[-1]['result'], {'stopReason': 'end_turn'})
+
+    def test_followup_waits_for_nonempty_stable_response(self):
+        session_id = self.new_session()
+        session = self.server.sessions[session_id]
+        session.turn = acp.Turn(9, 'Question', previous_user_id='old-user')
+        session.web = WebSession('chat-1', 'Project', mock.Mock())
+        interface = mock.Mock()
+        interface.latest_user_message.return_value = ('new-user', 'Question')
+        interface.is_generating.return_value = False
+        interface.valid_request_from_snapshot.return_value = None
+        interface.latest_assistant_snapshot.side_effect = [
+            AssistantSnapshot('answer-1', (), text=''),
+            AssistantSnapshot('answer-1', (), text='A partial'),
+            AssistantSnapshot('answer-1', (), text='A complete answer'),
+            AssistantSnapshot('answer-1', (), text='A complete answer'),
+            AssistantSnapshot('answer-1', (), text='A complete answer'),
+        ]
+        interface.terminal_response_from_snapshot.side_effect = [
+            None, ('A partial', 'partial-fp'), ('A complete answer', 'complete-fp'),
+            ('A complete answer', 'complete-fp'), ('A complete answer', 'complete-fp'),
+        ]
+        with mock.patch.object(acp.time, 'monotonic', side_effect=[1.0, 1.1, 1.2, 1.5]):
+            for _ in range(4):
+                session.check_completion(interface)
+                self.assertIsNotNone(session.turn)
+            session.check_completion(interface)
+        self.assertIsNone(session.turn)
+        self.assertEqual(self.messages()[-2]['params']['update']['content']['text'], 'A complete answer')
+        self.assertEqual(self.messages()[-1]['result'], {'stopReason': 'end_turn'})
 
     def test_workspace_is_restored_even_on_error(self):
         session_id = self.new_session()
@@ -268,6 +441,7 @@ class AcpServerTests(unittest.TestCase):
         self.assertEqual([m['id'] for m in result], [10, 11])
         self.assertEqual(result[0]['result']['protocolVersion'], 1)
         self.assertIn('sessionId', result[1]['result'])
+        self.assertEqual(result[1]['result']['configOptions'][0]['category'], 'thought_level')
 
 
 if __name__ == '__main__':

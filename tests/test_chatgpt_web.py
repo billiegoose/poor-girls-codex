@@ -100,6 +100,75 @@ class FakePage:
 
 
 class ChatGPTWebTests(unittest.TestCase):
+    def test_thinking_effort_selects_slider_and_verifies_label(self) -> None:
+        interface = web.ChatGPTWeb()
+        for effort, current, keys in (
+            ('instant', '2', ['ArrowLeft', 'ArrowLeft']),
+            ('medium', '0', ['ArrowRight']),
+            ('high', '0', ['ArrowRight', 'ArrowRight']),
+        ):
+            with self.subTest(effort=effort):
+                page = mock.Mock()
+                button, menu = mock.Mock(), mock.Mock()
+                page.get_by_role.side_effect = [button, menu]
+                button.filter.return_value.count.return_value = 0
+                power = menu.get_by_role.return_value
+                power.locator.return_value.get_attribute.side_effect = ['0', '2', current]
+
+                interface.set_thinking_effort(web.WebSession('root', 'Root', page), effort)
+
+                page.get_by_role.assert_any_call('button', name='Select ChatGPT model', exact=True)
+                menu.get_by_role.assert_called_once_with('menuitem', name='Power', exact=True)
+                self.assertEqual(power.press.call_args_list, [mock.call(key, timeout=5_000) for key in keys])
+                button.filter.return_value.wait_for.assert_called_once_with(state='visible', timeout=5_000)
+                button.press.assert_called_once_with('Escape', timeout=5_000)
+                menu.wait_for.assert_called_once_with(state='hidden', timeout=5_000)
+
+    def test_thinking_effort_already_selected_keeps_menu_closed(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        button = page.get_by_role.return_value
+        button.filter.return_value.count.return_value = 1
+        interface.set_thinking_effort(web.WebSession('root', 'Root', page), 'medium')
+        button.evaluate.assert_not_called()
+        button.press.assert_not_called()
+
+    def test_thinking_effort_rejects_unexpected_slider_and_closes_menu(self) -> None:
+        interface = web.ChatGPTWeb()
+        page = mock.Mock()
+        button, menu = mock.Mock(), mock.Mock()
+        page.get_by_role.side_effect = [button, menu]
+        button.filter.return_value.count.return_value = 0
+        menu.get_by_role.return_value.locator.return_value.get_attribute.side_effect = ['0', '3', '2']
+        with self.assertRaisesRegex(RuntimeError, 'unsupported ChatGPT thinking-effort slider'):
+            interface.set_thinking_effort(web.WebSession('root', 'Root', page), 'high')
+        button.press.assert_called_once_with('Escape', timeout=5_000)
+
+    def test_submit_applies_effort_before_composing_and_never_sends_on_failure(self) -> None:
+        interface = web.ChatGPTWeb()
+        session = web.WebSession('root', 'Root', mock.Mock(), thinking_effort='high')
+        order = mock.Mock()
+        interface.set_thinking_effort = order.effort
+        interface.set_composer_text = order.compose
+        interface.composer_text = mock.Mock(return_value='PROMPT')
+        button = mock.Mock()
+        button.count.return_value = 1
+        button.last.is_enabled.return_value = True
+        button.last.evaluate = order.send
+        interface.send_button = mock.Mock(return_value=button)
+        interface.submit(session, 'PROMPT')
+        self.assertEqual(order.mock_calls, [
+            mock.call.effort(session, 'high'), mock.call.compose(session, 'PROMPT'),
+            mock.call.send('element => element.click()'),
+        ])
+
+        order.reset_mock()
+        interface.set_thinking_effort.side_effect = RuntimeError('picker unavailable')
+        with self.assertRaisesRegex(RuntimeError, 'picker unavailable'):
+            interface.submit(session, 'PROMPT')
+        order.compose.assert_not_called()
+        order.send.assert_not_called()
+
     def test_image_loader_checks_signature_and_size(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'diagram.png'
@@ -559,6 +628,24 @@ class ChatGPTWebTests(unittest.TestCase):
         page.locator.assert_any_call(web.ASSISTANT_START_SELECTOR)
         page.wait_for_url.assert_not_called()
         self.assertEqual(child.conversation_id, 'child')
+
+    def test_new_root_and_subagent_apply_effort_to_first_submission(self) -> None:
+        interface = web.ChatGPTWeb()
+        context = mock.Mock()
+        page = context.new_page.return_value
+        page.locator.return_value.count.return_value = 1
+        interface._browser = mock.Mock(contexts=[context])
+        interface.submit = mock.Mock()
+        interface.wait_for_started_conversation = mock.Mock()
+        interface.describe_page = mock.Mock(return_value=('created', 'Created'))
+
+        root = interface.create_root_conversation('BOOTSTRAP', thinking_effort='high')
+        self.assertEqual(interface.submit.call_args.args[0].thinking_effort, 'high')
+        self.assertEqual(root.thinking_effort, 'high')
+        root.page.context = context
+        child = interface.create_conversation(origin=root, label='Child', prompt='TASK')
+        self.assertEqual(interface.submit.call_args.args[0].thinking_effort, 'high')
+        self.assertEqual(child.thinking_effort, 'high')
 
     def test_conversation_start_waits_through_local_url_and_assistant_hydration(self) -> None:
         interface = web.ChatGPTWeb()
