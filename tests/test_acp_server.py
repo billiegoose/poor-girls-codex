@@ -279,6 +279,57 @@ class AcpServerTests(unittest.TestCase):
         self.assertEqual(self.messages()[-2]['params']['update']['content']['text'], 'Done')
         self.assertEqual(self.messages()[-1]['result']['stopReason'], 'end_turn')
 
+    def test_acp_completion_tracks_confirmed_tool_result_user_turn(self):
+        from chatgpt_web import TerminalExpectation
+
+        session_id = self.new_session()
+        session = self.server.sessions[session_id]
+        session.turn = acp.Turn(9, 'Question', previous_user_id='older', user_id='prompt-user')
+        session.web = WebSession('chat-1', 'Project', mock.Mock())
+        session.web.terminal_expectation = TerminalExpectation('```\nRESULT\n```', 'prompt-user')
+        interface = mock.Mock()
+        interface.latest_user_message.return_value = ('result-user', 'RESULT\n…\nShow more')
+        interface.latest_user_matches_submission.return_value = True
+        interface.is_generating.side_effect = [True, False, False]
+        interface.latest_assistant_snapshot.return_value = AssistantSnapshot('answer-1', (), 'Done')
+        interface.valid_request_from_snapshot.return_value = None
+        interface.terminal_response_from_snapshot.return_value = ('Done', 'terminal-fingerprint')
+
+        session.check_completion(interface)
+        self.assertEqual(session.turn.user_id, 'result-user')
+        self.assertIsNone(session.turn.completion_candidate)
+        with mock.patch.object(acp.time, 'monotonic', side_effect=[10.0, 10.4]):
+            session.check_completion(interface)
+            self.assertIsNotNone(session.turn)
+            session.check_completion(interface)
+        self.assertIsNone(session.turn)
+        self.assertEqual(self.messages()[-2]['params']['update']['content']['text'], 'Done')
+        self.assertEqual(self.messages()[-1]['result'], {'stopReason': 'end_turn'})
+        interface.terminal_response_from_snapshot.assert_called_with(
+            session.web, interface.latest_assistant_snapshot.return_value, 'result-user',
+        )
+
+    def test_acp_does_not_trust_unmatched_new_user_turn(self):
+        from chatgpt_web import TerminalExpectation
+
+        session_id = self.new_session()
+        session = self.server.sessions[session_id]
+        session.turn = acp.Turn(9, 'Question', previous_user_id='older', user_id='prompt-user')
+        session.web = WebSession('chat-1', 'Project', mock.Mock())
+        session.web.terminal_expectation = TerminalExpectation('```\nRESULT\n```', 'prompt-user')
+        interface = mock.Mock()
+        interface.latest_user_message.return_value = ('foreign-user', 'Unrelated human message')
+        interface.latest_user_matches_submission.return_value = False
+        interface.is_generating.return_value = False
+        interface.latest_assistant_snapshot.return_value = AssistantSnapshot('answer-1', (), 'Not our response')
+        interface.valid_request_from_snapshot.return_value = None
+        interface.terminal_response_from_snapshot.return_value = None
+        session.check_completion(interface)
+        self.assertEqual(session.turn.user_id, 'prompt-user')
+        self.assertIsNone(session.turn.completion_candidate)
+        self.assertFalse(any(message.get('result', {}).get('stopReason') == 'end_turn'
+                             for message in self.messages()))
+
     def test_complete_never_acknowledges_empty_response(self):
         session_id = self.new_session()
         session = self.server.sessions[session_id]

@@ -737,6 +737,23 @@ class ChatGPTWeb:
         message = messages.last
         return self.message_id(message), self.rendered_message_text(message)
 
+    def latest_user_matches_submission(self, session: WebSession, submitted_text: str) -> bool:
+        """Verify that the latest user turn is our own delivered tool result.
+
+        ChatGPT may collapse a long user message to an ellipsis while retaining
+        its complete code block in the DOM. Never treat arbitrary newer human
+        messages as acknowledgements of a PGC submission.
+        """
+        messages = self.message_locator(session.page, 'user')
+        if messages.count() == 0:
+            return False
+        message = messages.last
+        expected = self.normalize_message_text(submitted_text)
+        if self.normalize_message_text(self.rendered_message_text(message)) == expected:
+            return True
+        _, sources = self.json_candidates_for_message(message)
+        return any(self.normalize_message_text(source) == expected for source in sources)
+
     def terminal_response_from_snapshot(
         self,
         session: WebSession,
@@ -906,6 +923,7 @@ class ChatGPTWeb:
                     'role': role,
                     'message_id': message_id,
                     'text': text,
+                    'message': message,
                     'request': request,
                 }
             )
@@ -937,7 +955,17 @@ class ChatGPTWeb:
                 record = records[index]
                 if record['role'] != 'user':
                     continue
-                if self.protocol_tool_result_matches_request(record['text'], latest_request[1]):
+                matched = self.protocol_tool_result_matches_request(record['text'], latest_request[1])
+                if not matched:
+                    # ChatGPT collapses long user messages with a visible ellipsis,
+                    # but the complete tool-result JSON remains in the code block.
+                    # Read it without expanding or modifying the user's page.
+                    _, sources = self.json_candidates_for_message(record['message'])
+                    matched = any(
+                        self.protocol_tool_result_matches_request(source, latest_request[1])
+                        for source in sources
+                    )
+                if matched:
                     request_result_index = index
                 break
 

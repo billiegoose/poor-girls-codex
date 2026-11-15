@@ -208,6 +208,19 @@ class AcpSession:
         latest = interface.latest_user_message(web)
         if turn.user_id is None and latest and latest[0] != turn.previous_user_id:
             turn.user_id = latest[0]
+        elif turn.user_id is not None and latest and latest[0] != turn.user_id:
+            expectation = web.terminal_expectation
+            if (
+                expectation is not None
+                and expectation.previous_user_message_id == turn.user_id
+                and latest[0] is not None
+                and interface.latest_user_matches_submission(web, expectation.submitted_text)
+            ):
+                # A tool-result submission creates a new ChatGPT user turn.
+                # Bind completion to that turn, not the earlier ACP prompt.
+                # Do this while generating too, so subsequent tool calls do not
+                # leave the expectation permanently attached to the old turn.
+                turn.user_id = latest[0]
         if turn.user_id is None or interface.is_generating(web) is True:
             turn.completion_candidate = None
             return

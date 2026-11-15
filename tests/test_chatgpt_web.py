@@ -3717,6 +3717,64 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIsNotNone(state.terminal_response)
         self.assertEqual(state.terminal_response[0], 'Committed and pushed successfully!')
 
+    def test_collapsed_tool_result_still_confirms_terminal_response(self) -> None:
+        interface = web.ChatGPTWeb()
+        request = (
+            '{"session":"root","calls":['
+            '{"id":"first","tool":"run"},'
+            '{"id":"second","tool":"run"}]}'
+        )
+        result = (
+            '[{"id":"first","tool":"run","ok":true},'
+            '{"id":"second","tool":"run","ok":true}]'
+        )
+        collapsed = FakeLocator(
+            [result[:30] + '\n…\nShow more'], message_id='result', author_role='user',
+        )
+        collapsed.locator = lambda selector: (
+            FakeLocator([result]) if selector == 'pre code'
+            else FakeLocator(['Show more']) if selector == 'button'
+            else FakeLocator([])
+        )
+        messages = [
+            FakeLocator([request], message_id='request', author_role='assistant'),
+            collapsed,
+            FakeLocator(['All checks passed.'], message_id='final', author_role='assistant'),
+        ]
+
+        class MessageList:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+            @property
+            def last(self):
+                return self.items[-1]
+
+        def message_locator(_page, role=None):
+            return MessageList([
+                message for message in messages
+                if role is None or interface.message_role(message) == role
+            ])
+
+        session = web.WebSession('root', 'Root', object())
+        with mock.patch.object(interface, 'message_locator', side_effect=message_locator):
+            self.assertNotEqual(
+                interface.normalize_message_text(interface.rendered_message_text(collapsed)),
+                interface.normalize_message_text(result),
+            )
+            state = interface.conversation_protocol_state(session, lambda request: None)
+            self.assertFalse(state.request_pending)
+            self.assertIsNotNone(state.terminal_response)
+            self.assertEqual(state.terminal_response[0], 'All checks passed.')
+            self.assertTrue(interface.latest_user_matches_submission(session, '```\n' + result + '\n```'))
+            self.assertFalse(interface.latest_user_matches_submission(session, '```\n' + result + 'x\n```'))
+
     def test_protocol_state_does_not_treat_human_reply_as_tool_result(self) -> None:
         interface = web.ChatGPTWeb()
         page = FakePage(
