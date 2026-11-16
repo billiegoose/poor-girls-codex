@@ -558,6 +558,29 @@ class ChatGPTWeb:
             self.rendered_message_text(message).strip(),
         )
 
+    def markdown_from_assistant_snapshot(self, session: WebSession, snapshot: AssistantSnapshot) -> str | None:
+        """Recover rich text from the same assistant node validated for completion.
+
+        The page's `inner_text()` loses headings, code fences, hyperlinks, etc.
+        Restrict extraction to rendered Markdown content, never toolbar buttons.
+        If the ChatGPT DOM changes, ACP falls back to the verified plain text.
+        """
+        if snapshot.message_id is None:
+            return None
+        from acp_markdown import html_to_markdown
+
+        messages = self.message_locator(session.page, 'assistant')
+        for index in range(messages.count() - 1, -1, -1):
+            message = messages.nth(index)
+            if self.message_id(message) != snapshot.message_id:
+                continue
+            blocks = message.locator('.markdown')
+            if not blocks.count():
+                return None
+            rendered = [html_to_markdown(blocks.nth(i).inner_html()) for i in range(blocks.count())]
+            return '\n\n'.join(part for part in rendered if part.strip()) or None
+        return None
+
     def latest_json_candidates(self, session: WebSession) -> tuple[str | None, list[str]]:
         snapshot = self.latest_assistant_snapshot(session)
         return snapshot.message_id, list(snapshot.sources)

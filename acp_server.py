@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any, Callable, TextIO
 
 import poor_girls_codex as pgc
+from acp_session_store import AcpSessionStore
+from acp_tool_display import acp_content, display_input, display_name, display_output, display_title
 from chatgpt_web import (
     ChatGPTWeb, DEFAULT_CDP_URL, DEFAULT_SETTLE_SECONDS, THINKING_EFFORTS,
     WebSession, WebSessionWatcher,
@@ -64,18 +66,23 @@ class Turn:
 
 
 class AcpSession:
-    def __init__(self, server: AcpServer, session_id: str, cwd: str) -> None:
+    def __init__(
+        self, server: AcpServer, session_id: str, cwd: str, *,
+        routing_id: str | None = None, conversation_id: str | None = None,
+        thinking_effort: str = 'high',
+    ) -> None:
         self.server = server
         self.session_id = session_id
         self.cwd = cwd
-        self.routing_id = 'acp-' + secrets.token_hex(12)
+        self.routing_id = routing_id or 'acp-' + secrets.token_hex(12)
+        self.conversation_id = conversation_id
         self.turn: Turn | None = None
         self.web: WebSession | None = None
         self.watcher: WebSessionWatcher | None = None
         self.tool_counter = 0
         self.closing = False
         self.close_request_ids: list[int | str] = []
-        self.thinking_effort = 'high'
+        self.thinking_effort = thinking_effort
 
     def config_options(self) -> list[dict[str, Any]]:
         return [{
@@ -131,25 +138,36 @@ class AcpSession:
             name = call.get('tool', '?') if isinstance(call, dict) else '?'
             kind = {'read': 'read', 'find': 'search', 'tree': 'search',
                     'edit': 'edit', 'write': 'edit', 'run': 'execute'}.get(name, 'other')
+            details = call if isinstance(call, dict) else {'tool': str(name)}
             self.server.update(self.session_id, {
                 'sessionUpdate': 'tool_call', 'toolCallId': call_id,
-                'title': f'{name}: {call.get("id", index)}' if isinstance(call, dict) else str(name),
+                'name': display_name(details),
+                'title': display_title(details, index),
                 'kind': kind, 'status': 'in_progress',
+                'rawInput': display_input(details),
             })
         try:
             result = pgc.execute_web_session_request(request, self.routing_id, **kwargs)
-        except Exception:
+        except Exception as exc:
             for call_id in ids:
                 self.server.update(self.session_id, {
-                    'sessionUpdate': 'tool_call_update', 'toolCallId': call_id, 'status': 'failed',
+                    'sessionUpdate': 'tool_call_update', 'toolCallId': call_id,
+                    'status': 'failed', 'content': acp_content(f'Execution failed: {exc}'),
                 })
             raise
         results = result if isinstance(result, list) else [result]
         for index, call_id in enumerate(ids):
-            success = index < len(results) and isinstance(results[index], dict) and results[index].get('ok') is True
+            item = results[index] if index < len(results) and isinstance(results[index], dict) else {
+                'ok': False, 'error': 'Skipped or missing tool result',
+            }
+            command_failed = calls[index].get('tool') == 'run' and item.get('exit_code', 0) != 0
+            success = item.get('ok') is True and not command_failed
+            name = calls[index].get('tool', '?')
             self.server.update(self.session_id, {
                 'sessionUpdate': 'tool_call_update', 'toolCallId': call_id,
                 'status': 'completed' if success else 'failed',
+                'content': acp_content(display_output(name, item)),
+                'rawOutput': item,
             })
         return result
 
@@ -164,9 +182,47 @@ class AcpSession:
                 too_long_fallback=pgc.too_long_fallback_for_request,
                 root_session_id=self.routing_id,
                 bootstrap_prompt_for_session=pgc.subagent_web_bootstrap_prompt,
-                on_root_terminal=lambda _session, text: self.complete(text),
+                on_root_terminal=lambda web, text: self.complete_from_watcher(interface, web, text),
                 managed_only=True,
             )
+        if self.web is None and self.conversation_id is not None:
+            # Reattach to the original conversation after the ACP subprocess
+            # exits. Never replace a known conversation with an empty one.
+            web = interface.open_conversation(self.conversation_id)
+            if web.conversation_id != self.conversation_id:
+                try:
+                    web.page.close()
+                finally:
+                    raise RuntimeError(
+                        'Reopened ChatGPT conversation does not match the persisted ACP session'
+                    )
+            web.thinking_effort = self.thinking_effort
+            self.watcher.sessions[web.conversation_id] = web
+            try:
+                self.watcher.bind_routing_session(web, self.routing_id)
+                # Read the transcript before resuming: a completed call must
+                # not execute twice, but a pending call must not silently vanish.
+                protocol = interface.conversation_protocol_state(web, self.validate)
+                if protocol.routing_session_id not in (None, self.routing_id):
+                    raise RuntimeError(
+                        'ChatGPT conversation belongs to a different PGC routing session'
+                    )
+                if protocol.request_pending:
+                    raise RuntimeError(
+                        'Recovered ChatGPT conversation has an unresolved tool request; '
+                        'refusing to submit another prompt because replay could duplicate '
+                        'side effects. Inspect the original ChatGPT conversation before '
+                        'continuing or start a new T3 thread.'
+                    )
+                if protocol.recent_request is not None:
+                    web.seen_fingerprints.add(protocol.recent_request[2])
+                self.watcher.prime_recovered_terminal(web, protocol)
+            except Exception:
+                self.watcher.sessions.pop(web.conversation_id, None)
+                web.page.close()
+                raise
+            self.web = web
+            self.watcher.note_forward_progress(web, time.monotonic())
         if self.web is None:
             web = interface.create_root_conversation(
                 self.bootstrap(browser_prompt),
@@ -177,6 +233,8 @@ class AcpSession:
                 ),
             )
             self.web = web
+            self.conversation_id = web.conversation_id
+            self.server.persist_session(self)
             self.watcher.sessions[web.conversation_id] = web
             self.watcher.bind_routing_session(web, self.routing_id)
             self.watcher.note_forward_progress(web, time.monotonic())
@@ -188,7 +246,7 @@ class AcpSession:
             interface.submit(self.web, browser_prompt)
             self.watcher.note_forward_progress(self.web, time.monotonic())
 
-    def complete(self, text: str) -> None:
+    def complete(self, text: str, *, markdown: str | None = None) -> None:
         turn = self.turn
         if turn is None or turn.cancelled or not text.strip():
             # A newly mounted assistant node can be empty even after ChatGPT
@@ -196,10 +254,27 @@ class AcpSession:
             return
         self.server.update(self.session_id, {
             'sessionUpdate': 'agent_message_chunk',
-            'content': {'type': 'text', 'text': text},
+            'content': {'type': 'text', 'text': markdown if isinstance(markdown, str) and markdown.strip() else text},
         })
         self.server.respond(turn.request_id, {'stopReason': 'end_turn'})
         self.turn = None
+
+    def complete_from_watcher(self, interface: ChatGPTWeb, web: WebSession, text: str) -> None:
+        """Preserve formatting for the watcher's already-confirmed terminal answer.
+
+        The watcher normally completes ACP before check_completion gets a turn.
+        Only use Markdown from the same visible message as the accepted answer;
+        otherwise retain the original confirmed text.
+        """
+        markdown = None
+        if self.turn is not None and self.web is web:
+            try:
+                snapshot = interface.latest_assistant_snapshot(web)
+                if snapshot is not None and snapshot.message_id and snapshot.text == text:
+                    markdown = interface.markdown_from_assistant_snapshot(web, snapshot)
+            except Exception as exc:
+                print(f'  [acp] Markdown extraction failed: {exc}', file=sys.stderr)
+        self.complete(text, markdown=markdown)
 
     def check_completion(self, interface: ChatGPTWeb) -> None:
         turn, web = self.turn, self.web
@@ -243,7 +318,14 @@ class AcpSession:
             turn.completion_deadline = now + DEFAULT_SETTLE_SECONDS
             return
         if now >= turn.completion_deadline:
-            self.complete(result[0])
+            # Markdown is presentation-only. Completion remains tied to the
+            # stable, identity-checked plain-text snapshot above.
+            markdown = None
+            try:
+                markdown = interface.markdown_from_assistant_snapshot(web, snapshot)
+            except Exception as exc:
+                print(f'  [acp] Markdown extraction failed: {exc}', file=sys.stderr)
+            self.complete(result[0], markdown=markdown)
 
     def validate_snapshot_request(self, interface: ChatGPTWeb, snapshot: Any) -> bool:
         return interface.valid_request_from_snapshot(snapshot, self.validate) is not None
@@ -311,10 +393,13 @@ class AcpServer:
     def __init__(
         self, *, writer: TextIO, cdp_url: str = DEFAULT_CDP_URL,
         interface_factory: Callable[[str], ChatGPTWeb] = ChatGPTWeb,
+        session_store: AcpSessionStore | None = None,
     ) -> None:
         self.writer = writer
         self.cdp_url = cdp_url
         self.interface_factory = interface_factory
+        self.session_store = session_store if session_store is not None else AcpSessionStore()
+        self.state_lock = threading.RLock()
         self.write_lock = threading.Lock()
         self.sessions: dict[str, AcpSession] = {}
         self.jobs: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -335,6 +420,13 @@ class AcpServer:
 
     def update(self, session_id: str, update: dict[str, Any]) -> None:
         self.send({'method': 'session/update', 'params': {'sessionId': session_id, 'update': update}})
+
+    def persist_session(self, session: AcpSession) -> None:
+        with self.state_lock:
+            self.session_store.save(
+                session.session_id, session.cwd, session.routing_id,
+                session.conversation_id, session.thinking_effort,
+            )
 
     @staticmethod
     def params_object(message: dict[str, Any]) -> dict[str, Any]:
@@ -377,7 +469,7 @@ class AcpServer:
                 self.initialized = True
                 self.respond(request_id, {
                     'protocolVersion': 1,
-                    'agentCapabilities': {'sessionCapabilities': {'close': {}}},
+                    'agentCapabilities': {'sessionCapabilities': {'close': {}, 'resume': {}}},
                     'agentInfo': {'name': 'poor-girls-codex', 'title': "Poor Girl's Codex", 'version': '0.1.0'},
                     'authMethods': [],
                 })
@@ -395,8 +487,42 @@ class AcpServer:
                     raise ValueError('mcpServers must be an array')
                 session_id = 'pgc-' + secrets.token_hex(12)
                 session = AcpSession(self, session_id, str(Path(cwd).resolve()))
+                self.persist_session(session)
                 self.sessions[session_id] = session
                 self.respond(request_id, {'sessionId': session_id, 'configOptions': session.config_options()})
+                return
+            if method == 'session/resume':
+                if not is_request:
+                    return
+                session_id = params.get('sessionId')
+                if not isinstance(session_id, str):
+                    raise ValueError('sessionId must be a string')
+                cwd = params.get('cwd')
+                if not isinstance(cwd, str) or not os.path.isabs(cwd) or not Path(cwd).is_dir():
+                    raise ValueError('cwd must be an existing absolute directory')
+                if not isinstance(params.get('mcpServers', []), list):
+                    raise ValueError('mcpServers must be an array')
+                resolved_cwd = str(Path(cwd).resolve())
+                session = self.sessions.get(session_id)
+                if session is None:
+                    record = self.session_store.load(session_id)
+                    if record is None:
+                        raise ValueError(
+                            'Cannot resume unknown ACP sessionId (sessions created before '
+                            'persistent restoration was implemented cannot be reconstructed automatically)'
+                        )
+                    if record['cwd'] != resolved_cwd:
+                        raise ValueError('ACP session workspace does not match its original cwd')
+                    session = AcpSession(
+                        self, session_id, resolved_cwd,
+                        routing_id=record['routingId'],
+                        conversation_id=record['conversationId'],
+                        thinking_effort=record['thinkingEffort'],
+                    )
+                    self.sessions[session_id] = session
+                if session.cwd != resolved_cwd or session.closing:
+                    raise ValueError('ACP session workspace mismatch or session is closing')
+                self.respond(request_id, {'configOptions': session.config_options()})
                 return
             if method == 'session/set_config_option':
                 if not is_request:
@@ -410,7 +536,9 @@ class AcpServer:
                 value = params.get('value')
                 if not isinstance(value, str) or value not in THINKING_EFFORTS:
                     raise ValueError('Thinking Effort must be instant, medium, or high')
-                session.thinking_effort = value
+                with self.state_lock:
+                    session.thinking_effort = value
+                    self.persist_session(session)
                 self.respond(request_id, {'configOptions': session.config_options()})
                 return
             if method == 'session/prompt':
@@ -460,6 +588,9 @@ class AcpServer:
         except ValueError as exc:
             if is_request:
                 self.error(request_id, -32602, str(exc))
+        except OSError as exc:
+            if is_request:
+                self.error(request_id, -32000, f'ACP session persistence failed: {exc}')
 
     def get_session(self, params: dict[str, Any]) -> AcpSession:
         session_id = params.get('sessionId')
