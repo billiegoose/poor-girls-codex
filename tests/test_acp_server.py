@@ -11,15 +11,17 @@ from pathlib import Path
 from unittest import mock
 
 import acp_server as acp
+from acp_session_store import AcpSessionStore
 from chatgpt_web import AssistantSnapshot, WebSession, WebSessionWatcher
 
 
 class AcpServerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.output = io.StringIO()
-        self.server = acp.AcpServer(writer=self.output)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
+        self.session_store = AcpSessionStore(Path(self.directory.name) / 'session-store')
+        self.server = acp.AcpServer(writer=self.output, session_store=self.session_store)
 
     def messages(self):
         return [json.loads(line) for line in self.output.getvalue().splitlines()]
@@ -44,7 +46,7 @@ class AcpServerTests(unittest.TestCase):
         session_id = self.new_session()
         messages = self.messages()
         self.assertEqual(messages[0]['result']['protocolVersion'], 1)
-        self.assertEqual(messages[0]['result']['agentCapabilities'], {'sessionCapabilities': {'close': {}}})
+        self.assertEqual(messages[0]['result']['agentCapabilities'], {'sessionCapabilities': {'close': {}, 'resume': {}}})
         self.assertEqual(messages[1]['result']['sessionId'], session_id)
         self.assertEqual(self.server.sessions[session_id].cwd, str(Path(self.directory.name).resolve()))
         self.assertIsNone(self.server.worker)
@@ -486,7 +488,8 @@ class AcpServerTests(unittest.TestCase):
         ]
         proc = subprocess.run([sys.executable, str(script), 'acp'],
                               input='\n'.join(map(json.dumps, lines)) + '\n',
-                              text=True, capture_output=True, timeout=15, check=True)
+                              text=True, capture_output=True, timeout=15, check=True,
+                                env={**os.environ, 'PGC_ACP_SESSION_DIR': str(Path(self.directory.name) / 'stdio-sessions')})
         result = [json.loads(line) for line in proc.stdout.splitlines()]
         self.assertEqual(len(result), 2)
         self.assertEqual([m['id'] for m in result], [10, 11])
