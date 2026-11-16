@@ -8,7 +8,7 @@ from unittest import mock
 import acp_server as acp
 from acp_markdown import html_to_markdown
 from acp_tool_display import display_name, display_title, display_input, display_output
-from chatgpt_web import AssistantSnapshot, ChatGPTWeb, WebSession
+from chatgpt_web import AssistantSnapshot, ChatGPTWeb, WebSession, raw_assistant_markdown
 
 
 class MarkdownTests(unittest.TestCase):
@@ -62,6 +62,85 @@ class MarkdownTests(unittest.TestCase):
                 '### Ready\n\nA *formatted* reply.')
             self.assertIsNone(interface.markdown_from_assistant_snapshot(
                 session, AssistantSnapshot('stale-answer', (), 'Old reply')))
+
+
+class OriginalMarkdownTests(unittest.TestCase):
+    @staticmethod
+    def payload(*, current='final'):
+        return {
+            'current_node': current,
+            'mapping': {
+                'root': {'parent': None, 'message': None},
+                'user': {'parent': 'root', 'message': {
+                    'id': 'u1', 'author': {'role': 'user'},
+                    'content': {'content_type': 'text', 'parts': ['Prompt']},
+                }},
+                'final': {'parent': 'user', 'message': {
+                    'id': 'a1', 'author': {'role': 'assistant'},
+                    'content': {'content_type': 'text', 'parts': [
+                        '# Exact title\n\nA [link](https://example.org) and **bold**.\n\n',
+                        '```python\nprint("hello")\n```\n',
+                    ]},
+                }},
+                'regenerated': {'parent': 'user', 'message': {
+                    'id': 'a2', 'author': {'role': 'assistant'},
+                    'content': {'content_type': 'text', 'parts': ['Replacement']},
+                }},
+                'later-user': {'parent': 'final', 'message': {
+                    'id': 'u2', 'author': {'role': 'user'},
+                    'content': {'content_type': 'text', 'parts': ['Another prompt']},
+                }},
+            },
+        }
+
+    def test_original_markdown_preserves_exact_parts(self):
+        original = '# Exact title\n\nA [link](https://example.org) and **bold**.\n\n```python\nprint("hello")\n```\n'
+        self.assertEqual(raw_assistant_markdown(self.payload(), 'a1'), original)
+        self.assertIsNone(raw_assistant_markdown(self.payload(), 'a2'))
+        self.assertIsNone(raw_assistant_markdown(self.payload(current='regenerated'), 'a1'))
+        self.assertIsNone(raw_assistant_markdown(self.payload(current='later-user'), 'a1'))
+
+    def test_browser_uses_original_markdown_without_rendered_markdown_node(self):
+        interface = ChatGPTWeb()
+        interface._browser = mock.Mock()
+        interface.fetch_conversation_payload = mock.Mock(return_value=self.payload())
+        message = mock.Mock()
+        message.get_attribute.side_effect = lambda key: 'a1' if key == 'data-message-id' else None
+        message.locator.return_value.count.return_value = 0
+        messages = mock.Mock()
+        messages.count.return_value = 1
+        messages.nth.return_value = message
+        session = WebSession('conversation', 'Test', mock.Mock())
+        snapshot = AssistantSnapshot('a1', (), 'Exact title A link and bold.')
+        with mock.patch.object(interface, 'message_locator', return_value=messages):
+            actual = interface.markdown_from_assistant_snapshot(session, snapshot)
+        self.assertEqual(actual, raw_assistant_markdown(self.payload(), 'a1'))
+        interface.fetch_conversation_payload.assert_called_once_with('conversation')
+        message.locator.assert_not_called()
+
+    def test_payload_failure_falls_back_to_html_but_not_other_message(self):
+        interface = ChatGPTWeb()
+        interface._browser = mock.Mock()
+        interface.fetch_conversation_payload = mock.Mock(side_effect=RuntimeError('API unavailable'))
+        block = mock.Mock()
+        block.inner_html.return_value = '<h2>Fallback</h2>'
+        blocks = mock.Mock()
+        blocks.count.return_value = 1
+        blocks.nth.return_value = block
+        message = mock.Mock()
+        message.get_attribute.side_effect = lambda key: 'a1' if key == 'data-message-id' else None
+        message.locator.return_value = blocks
+        messages = mock.Mock()
+        messages.count.return_value = 1
+        messages.nth.return_value = message
+        session = WebSession('conversation', 'Test', mock.Mock())
+        with mock.patch.object(interface, 'message_locator', return_value=messages):
+            self.assertEqual(interface.markdown_from_assistant_snapshot(
+                session, AssistantSnapshot('a1', (), 'Fallback')),
+                '## Fallback')
+            self.assertIsNone(interface.markdown_from_assistant_snapshot(
+                session, AssistantSnapshot('different', (), 'Fallback')))
+        interface.fetch_conversation_payload.assert_called_once_with('conversation')
 
 
 class ToolDisplayTests(unittest.TestCase):

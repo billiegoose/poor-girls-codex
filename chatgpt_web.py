@@ -559,21 +559,35 @@ class ChatGPTWeb:
         )
 
     def markdown_from_assistant_snapshot(self, session: WebSession, snapshot: AssistantSnapshot) -> str | None:
-        """Recover rich text from the same assistant node validated for completion.
+        """Return the original Markdown of the assistant message accepted by ACP.
 
-        The page's `inner_text()` loses headings, code fences, hyperlinks, etc.
-        Restrict extraction to rendered Markdown content, never toolbar buttons.
-        If the ChatGPT DOM changes, ACP falls back to the verified plain text.
+        React's visible message props can contain content-reference directives rather
+        than the original text, and rendered HTML loses Markdown syntax. The
+        authenticated conversation payload retains the original content.parts.
+        Require an exact message ID on both the displayed node and the active
+        conversation branch: never substitute another assistant reply. If the
+        payload is unavailable, try the old rendered-HTML conversion instead.
         """
         if snapshot.message_id is None:
             return None
-        from acp_markdown import html_to_markdown
 
         messages = self.message_locator(session.page, 'assistant')
         for index in range(messages.count() - 1, -1, -1):
             message = messages.nth(index)
             if self.message_id(message) != snapshot.message_id:
                 continue
+
+            if self._browser is not None:
+                try:
+                    payload = self.fetch_conversation_payload(session.conversation_id)
+                    original = raw_assistant_markdown(payload, snapshot.message_id)
+                    if original is not None:
+                        return original
+                except Exception:
+                    # A failed/changed backend fetch must not prevent completion.
+                    pass
+
+            from acp_markdown import html_to_markdown
             blocks = message.locator('.markdown')
             if not blocks.count():
                 return None
@@ -2700,6 +2714,24 @@ def conversation_raw_text(message: dict[str, Any]) -> tuple[str, list[Any]]:
         return '', []
     raw_parts = list(parts)
     return ''.join(part for part in raw_parts if isinstance(part, str)), raw_parts
+
+
+def raw_assistant_markdown(payload: dict[str, Any], message_id: str) -> str | None:
+    """Original Markdown only when the requested reply is active and latest.
+
+    ChatGPT's current_node determines the visible conversation branch; finding a
+    message ID somewhere in the mapping is insufficient (regenerated replies and
+    older turns can still be present). Ignore non-text reasoning nodes and avoid
+    normalizing or re-escaping the original Markdown.
+    """
+    records = active_conversation_protocol_messages(payload)
+    if not records:
+        return None
+    latest = records[-1]
+    if latest['role'] != 'assistant' or latest['message_id'] != message_id:
+        return None
+    text = latest['text']
+    return text if text.strip() else None
 
 
 def active_conversation_protocol_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
