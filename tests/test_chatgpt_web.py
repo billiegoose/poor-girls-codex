@@ -3717,6 +3717,57 @@ class ChatGPTWebTests(unittest.TestCase):
         self.assertIsNotNone(state.terminal_response)
         self.assertEqual(state.terminal_response[0], 'Committed and pushed successfully!')
 
+    def test_terminal_survives_mangled_multiline_tool_result_from_chatgpt(self) -> None:
+        interface = web.ChatGPTWeb()
+        request = {
+            'session': 'root',
+            'calls': [{'id': 'fast-forward-and-push-main', 'tool': 'run'}],
+        }
+        # Reproduces the actual missed completion: ChatGPT escaped the fence,
+        # HTML-encoded indentation, inserted raw newlines inside JSON strings,
+        # and escaped Git output Markdown such as an asterisk.
+        delivered = (
+            '```\n[\n  {\n    "id": "fast-forward-and-push-main",\n'
+            '    "tool": "run",\n    "ok": true,\n'
+            '    "stdout": "Verified remote refs:\nmain and feature/acp match",\n'
+            '    "stderr": "From https://github.com/example/repo\n\\* branch main -> FETCH_HEAD"'
+            '\n  }\n]\n```'
+        )
+        escaped = delivered.replace('```', r'\`\`\`').replace('  ', '&#x20;')
+        self.assertTrue(interface.protocol_tool_result_matches_request(escaped, request))
+        self.assertFalse(interface.protocol_tool_result_matches_request(
+            escaped.replace('fast-forward-and-push-main', 'different-call'), request
+        ))
+        self.assertFalse(interface.protocol_tool_result_matches_request(
+            escaped.replace('"tool": "run"', '"tool": "edit"'), request
+        ))
+        page = FakePage(
+            'https' + '://chatgpt.com/c/root',
+            message_roles=['assistant', 'user', 'assistant'],
+            message_role_ids=['request', 'result', 'final'],
+            message_texts=[
+                json.dumps(request), escaped,
+                "PGC's ACP backend is officially on the main branch!",
+            ],
+        )
+        state = interface.conversation_protocol_state(web.WebSession('root', 'Root', page),
+                                                       lambda _: None)
+        self.assertFalse(state.request_pending)
+        self.assertIsNotNone(state.terminal_response)
+        self.assertIn('officially on the main branch', state.terminal_response[0])
+
+    def test_malformed_result_structure_cannot_achieve_completion(self) -> None:
+        interface = web.ChatGPTWeb()
+        request = {'session': 'root', 'id': 'important-call', 'tool': 'run'}
+        for malformed in (
+            r'```\n[{"id":"important-call","tool":"run",}]\n```',
+            '```\n[{"id":"important-call","tool":"run"}\n```',
+            '```\n[{"id":"important-call","tool":"run"}, '
+            '{"id":"extra","tool":"run"}]\n```',
+        ):
+            with self.subTest(malformed=malformed):
+                self.assertFalse(interface.protocol_tool_result_matches_request(malformed, request))
+
     def test_collapsed_tool_result_still_confirms_terminal_response(self) -> None:
         interface = web.ChatGPTWeb()
         request = (

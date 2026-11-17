@@ -862,6 +862,57 @@ class ChatGPTWeb:
         )
         return match.group(1) if match is not None else None
 
+    @staticmethod
+    def parse_delivered_tool_result(source: str) -> Any:
+        """Parse a result after ChatGPT may have mangled Markdown in JSON strings.
+
+        Normal JSON must stay authoritative. On failure, repair only string
+        contents (illegal Markdown backslash escapes and literal control chars),
+        never structural JSON. The caller still verifies every tool-call identity.
+        """
+        try:
+            return json.loads(source)
+        except json.JSONDecodeError:
+            pass
+
+        repaired: list[str] = []
+        quoted = False
+        index = 0
+        while index < len(source):
+            char = source[index]
+            if not quoted:
+                repaired.append(char)
+                if char == '"':
+                    quoted = True
+                index += 1
+                continue
+            if char == '\\':
+                escaped = source[index + 1] if index + 1 < len(source) else ''
+                valid = escaped in '"\\/bfnrt' or (
+                    escaped == 'u'
+                    and len(source) >= index + 6
+                    and all(c in '0123456789abcdefABCDEF' for c in source[index + 2:index + 6])
+                )
+                if valid:
+                    repaired.extend((char, escaped))
+                    index += 2
+                else:
+                    repaired.append('\\\\')
+                    index += 1
+                continue
+            if char == '"':
+                quoted = False
+                repaired.append(char)
+            elif ord(char) < 32:
+                repaired.append(json.dumps(char)[1:-1])
+            else:
+                repaired.append(char)
+            index += 1
+        try:
+            return json.loads(''.join(repaired))
+        except json.JSONDecodeError:
+            return None
+
     def protocol_tool_result_matches_request(self, text: str, request: Any) -> bool:
         calls = (
             request.get('calls')
@@ -889,9 +940,8 @@ class ChatGPTWeb:
             candidate_texts.append(decoded_text)
         for candidate_text in candidate_texts:
             for source in self.json_candidates_from_text(candidate_text):
-                try:
-                    payload = json.loads(source)
-                except json.JSONDecodeError:
+                payload = self.parse_delivered_tool_result(source)
+                if payload is None:
                     continue
                 results = payload if isinstance(payload, list) else [payload]
                 if len(results) != len(calls):
