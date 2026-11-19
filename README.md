@@ -213,6 +213,45 @@ The ChatGPT desktop application must be running with an ordinary conversation op
 
 PGC can run as a local ACP agent for clients such as T3 Code. In T3's **Local ACP command** provider settings, select this checkout's absolute `poor_girls_codex` launcher path and pass `acp` as its argument. PGC negotiates ACP v1 and uses the existing ChatGPT browser tool harness. See [the ACP setup guide](docs/acp.md) for details and current limitations.
 
+## Feature compatibility matrix
+
+PGC has three currently supported execution configurations. **T3 Code / ACP is a client adapter, not a third browser transport:** it uses the same Playwright/CDP `chatgpt-web` transport as the first column, but adds an ACP protocol boundary where some features are not implemented. The experimental `terminal-browser` transport currently supports `watch` mode only.
+
+**Legend:** ✅ implemented · ⚠️ partial, conditional, or experimental · ❌ not implemented · — not applicable (or managed directly by the ChatGPT UI). These are implementation-level assessments, not guarantees of successful operation with every ChatGPT or T3 release.
+
+| Feature | `watch` + `chatgpt-web` | `watch` + `terminal-browser` | T3 Code + `acp` |
+| --- | :---: | :---: | :---: |
+| Local tools (`read`, `find`, `tree`, `status`, `diff`, `edit`, `write`, `run`) | ✅ | ✅ | ✅ |
+| Multi-turn coding loop and tool-result delivery | ✅ | ✅ | ✅ |
+| Multiple conversations / sessions | ✅ | ✅ | ✅ |
+| Create ChatGPT subagents and return results to parent | ✅ | ✅ | ✅ |
+| Attach a local image to a **tool result** (`attach_image`) | ✅ | ❌ | ✅ |
+| Capture a board/monitor JPEG (`camera`, requires A.P.P.L.E.P.I.E. authorization) | ✅ | ❌ | ✅ |
+| Accept an image in an **incoming user prompt** | — | — | ❌ |
+| Accept audio or resource blocks in an incoming ACP prompt | — | — | ❌ |
+| Reload stalled ChatGPT pages and retry result delivery | ✅ | ✅ | ✅ |
+| Restart running PGC from a `restart {}` tool call | ✅ | ✅ | ❌ |
+| Resume a session after an ACP provider process restart | — | — | ⚠️ |
+| ACP `session/load` / transcript replay to the client | — | — | ❌ |
+| ACP checkpoint rollback | — | — | ❌ |
+| ACP `session/cancel` to stop generation | — | — | ⚠️ |
+| Configure thinking effort from the client (Instant / Medium / High) | — | — | ✅ |
+| Switch the underlying ChatGPT model from the client | — | — | ❌ |
+| Send tool-call progress and results to the client | — | — | ✅ |
+| Stream intermediate assistant prose to the client | — | — | ❌ |
+| Return formatted Markdown to the client | — | — | ⚠️ |
+| Use MCP servers supplied by the client | — | — | ❌ |
+| Enforce client-defined tool permissions or sandboxing | — | — | ❌ |
+
+### T3 Code / ACP compatibility notes
+
+- **Image attachments from T3 are currently rejected.** The ACP adapter accepts only `text` prompt blocks. A T3 message containing an image block fails with a protocol error before the browser turn starts. This is an **adapter limitation**, not evidence that ChatGPT or T3 itself cannot handle images. Conversely, an agent calling `attach_image {path}` during a T3 task **does** work: PGC uploads the file directly to ChatGPT with its tool result. These are two different directions of image transfer.
+- **Session resumption is not full history restoration.** Newer ACP sessions persist their identifiers and reopen their original ChatGPT conversation after the provider process restarts. T3 retains its own thread transcript; PGC does not implement `session/load`, transcript replay, or checkpoint rollback. Sessions created before persistence was implemented cannot be recovered automatically, and unresolved tool calls block unsafe resumption.
+- **Restart and cancellation differ from standalone PGC.** The `restart {}` tool is intentionally unavailable in ACP mode. ACP cancellation is best effort and cannot undo or interrupt a shell command already executing.
+- **T3 presentation is still incomplete.** Tool activity is reported through ACP updates, but assistant prose is delivered only when the response completes. Markdown reconstruction is best effort. T3-provided MCP servers and permission controls are not forwarded into the browser harness; local tools run with PGC's process permissions.
+
+For protocol-level details and troubleshooting, see [docs/acp.md](docs/acp.md). For the underlying image transport and watcher behavior, see the [image attachments](#image-attachments) and [ChatGPT web interface](#chatgpt-web-interface) sections below. When reporting a new incompatibility, distinguish **T3 → ACP prompt input**, **ChatGPT → PGC tool calls**, **PGC → ChatGPT tool results**, and **PGC → T3 ACP updates**; a feature can work in one direction while failing in another.
+
 ## Testing
 
 Poor Girl's Codex uses Python's standard-library `unittest` framework. `pytest` is not a project dependency.
